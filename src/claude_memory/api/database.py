@@ -1,74 +1,55 @@
+import logging
 import os
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 pool: asyncpg.Pool | None = None
 
 
+def run_migrations() -> None:
+    """Run Alembic migrations to latest revision."""
+    try:
+        from alembic import command
+        from alembic.config import Config
+
+        alembic_cfg = Config()
+        # Find migrations directory relative to this file or project root
+        migrations_dir = os.environ.get("ALEMBIC_MIGRATIONS_DIR", "")
+        if not migrations_dir:
+            # Check common locations
+            for candidate in [
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "migrations"),
+                os.path.join(os.getcwd(), "migrations"),
+                "/app/migrations",
+            ]:
+                if os.path.isdir(candidate):
+                    migrations_dir = candidate
+                    break
+
+        if not migrations_dir or not os.path.isdir(migrations_dir):
+            logger.warning("Alembic migrations directory not found, skipping migrations")
+            return
+
+        alembic_cfg.set_main_option("script_location", migrations_dir)
+        alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Database migrations completed successfully")
+    except Exception as e:
+        logger.warning("Failed to run Alembic migrations: %s", e)
+
+
 async def init_pool() -> asyncpg.Pool:
     global pool
+    run_migrations()
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-    async with pool.acquire() as conn:
-        # Check if table exists
-        exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'memories')"
-        )
-        if not exists:
-            await conn.execute("""
-                CREATE TABLE memories (
-                    id SERIAL PRIMARY KEY,
-                    user_id VARCHAR(100) NOT NULL DEFAULT 'default',
-                    content TEXT NOT NULL,
-                    category VARCHAR(50) DEFAULT 'facts',
-                    tags TEXT DEFAULT '',
-                    expanded_keywords TEXT DEFAULT '',
-                    importance REAL DEFAULT 0.5,
-                    is_sensitive BOOLEAN DEFAULT FALSE,
-                    vault_path TEXT DEFAULT NULL,
-                    encrypted_content BYTEA DEFAULT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    search_vector tsvector GENERATED ALWAYS AS (
-                        setweight(to_tsvector('english', coalesce(content, '')), 'A') ||
-                        setweight(to_tsvector('english', coalesce(expanded_keywords, '')), 'B') ||
-                        setweight(to_tsvector('english', coalesce(tags, '')), 'C') ||
-                        setweight(to_tsvector('english', coalesce(category, '')), 'D')
-                    ) STORED
-                )
-            """)
-        else:
-            # Migrate existing table: add new columns if missing
-            columns = [row["column_name"] for row in await conn.fetch(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = 'memories'"
-            )]
-            if "user_id" not in columns:
-                await conn.execute(
-                    "ALTER TABLE memories ADD COLUMN user_id VARCHAR(100) NOT NULL DEFAULT 'default'"
-                )
-            if "is_sensitive" not in columns:
-                await conn.execute(
-                    "ALTER TABLE memories ADD COLUMN is_sensitive BOOLEAN DEFAULT FALSE"
-                )
-            if "vault_path" not in columns:
-                await conn.execute(
-                    "ALTER TABLE memories ADD COLUMN vault_path TEXT DEFAULT NULL"
-                )
-            if "encrypted_content" not in columns:
-                await conn.execute(
-                    "ALTER TABLE memories ADD COLUMN encrypted_content BYTEA DEFAULT NULL"
-                )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_search ON memories USING GIN(search_vector)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id)"
-        )
     return pool
 
 
-async def close_pool():
+async def close_pool() -> None:
     global pool
     if pool:
         await pool.close()
