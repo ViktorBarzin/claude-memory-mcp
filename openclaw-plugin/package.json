@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw/memory-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PostgreSQL-backed shared memory plugin for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ]
+  }
+}
