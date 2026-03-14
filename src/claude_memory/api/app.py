@@ -2,13 +2,14 @@
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 
 from claude_memory.api.auth import AuthUser, get_current_user
 from claude_memory.api.database import close_pool, get_pool, init_pool
-from claude_memory.api.models import MemoryRecall, MemoryResponse, MemoryStore, SecretResponse
+from claude_memory.api.models import MemoryRecall, MemoryResponse, MemoryStore, SecretResponse, SyncResponse
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -56,6 +57,58 @@ def _redact_content(content: str) -> str:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/memories/sync", response_model=SyncResponse)
+async def sync_memories(
+    since: Optional[str] = None,
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = await get_pool()
+    server_time = datetime.now(timezone.utc).isoformat()
+
+    async with pool.acquire() as conn:
+        if since:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, category, tags, expanded_keywords, importance,
+                       is_sensitive, created_at, updated_at, deleted_at
+                FROM memories
+                WHERE user_id = $1 AND updated_at > $2::timestamptz
+                ORDER BY updated_at ASC
+                """,
+                user.user_id,
+                since,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, category, tags, expanded_keywords, importance,
+                       is_sensitive, created_at, updated_at, deleted_at
+                FROM memories
+                WHERE user_id = $1 AND deleted_at IS NULL
+                ORDER BY updated_at ASC
+                """,
+                user.user_id,
+            )
+
+    memories = []
+    for row in rows:
+        mem = {
+            "id": row["id"],
+            "content": row["content"],
+            "category": row["category"],
+            "tags": row["tags"],
+            "expanded_keywords": row["expanded_keywords"],
+            "importance": row["importance"],
+            "is_sensitive": row["is_sensitive"],
+            "created_at": row["created_at"].isoformat(),
+            "updated_at": row["updated_at"].isoformat(),
+            "deleted_at": row["deleted_at"].isoformat() if row["deleted_at"] else None,
+        }
+        memories.append(mem)
+
+    return SyncResponse(memories=memories, server_time=server_time)
 
 
 @app.post("/api/memories", response_model=MemoryResponse)
@@ -117,6 +170,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
                    created_at, updated_at
             FROM memories, plainto_tsquery('english', $2) query
             WHERE user_id = $1
+              AND deleted_at IS NULL
               AND (search_vector @@ query OR $2 = '')
               {category_filter}
             ORDER BY {order_clause}
@@ -158,14 +212,14 @@ async def list_memories(
     if category:
         query = """
             SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-            FROM memories WHERE user_id = $1 AND category = $2
+            FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2
             ORDER BY importance DESC LIMIT $3
         """
         params: list = [user.user_id, category, limit]
     else:
         query = """
             SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-            FROM memories WHERE user_id = $1
+            FROM memories WHERE user_id = $1 AND deleted_at IS NULL
             ORDER BY importance DESC LIMIT $2
         """
         params = [user.user_id, limit]
@@ -200,7 +254,7 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, vault_path, substr(content, 1, 50) AS preview FROM memories WHERE id = $1 AND user_id = $2",
+            "SELECT id, vault_path, substr(content, 1, 50) AS preview FROM memories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
             memory_id,
             user.user_id,
         )
@@ -211,7 +265,7 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
             await delete_secret(user.user_id, row["vault_path"])
 
         await conn.execute(
-            "DELETE FROM memories WHERE id = $1 AND user_id = $2",
+            "UPDATE memories SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2",
             memory_id,
             user.user_id,
         )
@@ -227,7 +281,7 @@ async def get_memory_secret(memory_id: int, user: AuthUser = Depends(get_current
         row = await conn.fetchrow(
             """
             SELECT id, content, is_sensitive, vault_path, encrypted_content
-            FROM memories WHERE id = $1 AND user_id = $2
+            FROM memories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
             """,
             memory_id,
             user.user_id,
@@ -263,7 +317,7 @@ async def migrate_secrets(user: AuthUser = Depends(get_current_user)):
         rows = await conn.fetch(
             """
             SELECT id, content FROM memories
-            WHERE user_id = $1 AND is_sensitive = FALSE
+            WHERE user_id = $1 AND is_sensitive = FALSE AND deleted_at IS NULL
             """,
             user.user_id,
         )

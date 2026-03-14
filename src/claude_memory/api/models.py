@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,3 +30,8 @@ class SecretResponse(BaseModel):
     id: int
     content: str
     source: str  # "vault", "encrypted", "plaintext"
+
+
+class SyncResponse(BaseModel):
+    memories: list[dict[str, Any]]
+    server_time: str

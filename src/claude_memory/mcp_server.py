@@ -2,9 +2,10 @@
 """
 Claude Memory MCP Server — standalone memory server with multi-user support.
 
-Supports two modes:
-  1. HTTP API mode: connects to a shared PostgreSQL-backed API server
-  2. SQLite fallback: local file-based storage when no API key is configured
+Supports three modes:
+  1. SQLite-only: local file-based storage when no API key is configured
+  2. Hybrid (default when API key set): local SQLite cache + background sync
+  3. HTTP-only (legacy): direct HTTP to API, no local cache (MEMORY_SYNC_DISABLE=1)
 
 Uses only stdlib (urllib) — no pip install required.
 """
@@ -21,14 +22,17 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-memory"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 # API configuration — support both MEMORY_* (primary) and CLAUDE_MEMORY_* (fallback) env vars
 API_BASE_URL = os.environ.get("MEMORY_API_URL") or os.environ.get("CLAUDE_MEMORY_API_URL", "http://localhost:8080")
 API_KEY = os.environ.get("MEMORY_API_KEY") or os.environ.get("CLAUDE_MEMORY_API_KEY", "")
 
-# Fallback to SQLite if API is not configured
-SQLITE_FALLBACK = not API_KEY
+# Mode detection
+SYNC_DISABLED = os.environ.get("MEMORY_SYNC_DISABLE", "") == "1"
+HYBRID_MODE = bool(API_KEY) and not SYNC_DISABLED
+HTTP_ONLY = bool(API_KEY) and SYNC_DISABLED
+SQLITE_ONLY = not API_KEY
 
 
 def _api_request(method: str, path: str, body: dict | None = None) -> dict:
@@ -54,23 +58,29 @@ def _api_request(method: str, path: str, body: dict | None = None) -> dict:
         raise RuntimeError(f"API connection error: {e.reason}") from e
 
 
-# ─── SQLite fallback (local storage when API not configured) ─────────────────
+# ─── SQLite initialization ────────────────────────────────────────────────────
+
+def _get_db_path(db_path: str | None = None) -> str:
+    """Resolve the SQLite database path."""
+    if db_path is not None:
+        return db_path
+
+    memory_home = os.path.expandvars(
+        os.path.expanduser(os.environ.get("MEMORY_HOME", "~/.claude/claude-memory"))
+    )
+    db_path = os.environ.get(
+        "MEMORY_DB",
+        os.path.join(memory_home, "memory", "memory.db"),
+    )
+    return os.path.expandvars(os.path.expanduser(db_path))
+
 
 def _init_sqlite(db_path: str | None = None):
-    """Initialize SQLite database as fallback."""
+    """Initialize SQLite database."""
     import sqlite3
     from pathlib import Path
 
-    if db_path is None:
-        memory_home = os.path.expandvars(
-            os.path.expanduser(os.environ.get("MEMORY_HOME", "~/.claude/claude-memory"))
-        )
-        db_path = os.environ.get(
-            "MEMORY_DB",
-            os.path.join(memory_home, "memory", "memory.db"),
-        )
-        db_path = os.path.expandvars(os.path.expanduser(db_path))
-
+    db_path = _get_db_path(db_path)
     Path(os.path.dirname(db_path)).mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_path, timeout=30.0)
@@ -91,6 +101,15 @@ def _init_sqlite(db_path: str | None = None):
             updated_at TEXT NOT NULL
         )
     """)
+    # Add server_id column if missing (for hybrid mode sync)
+    cursor.execute("PRAGMA table_info(memories)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    if "server_id" not in columns:
+        cursor.execute("ALTER TABLE memories ADD COLUMN server_id INTEGER")
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_server_id ON memories(server_id)"
+        )
+
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             content, category, tags, expanded_keywords,
@@ -118,7 +137,7 @@ def _init_sqlite(db_path: str | None = None):
         END
     """)
     conn.commit()
-    return conn
+    return conn, db_path
 
 
 # ─── Tool definitions ────────────────────────────────────────────────────────
@@ -229,10 +248,27 @@ class MemoryServer:
 
     def __init__(self, sqlite_db_path: str | None = None) -> None:
         self.sqlite_conn = None
-        if SQLITE_FALLBACK:
-            self.sqlite_conn = _init_sqlite(sqlite_db_path)
+        self.sync_engine = None
 
-    # ── HTTP-backed methods ──────────────────────────────────────────
+        if SQLITE_ONLY or HYBRID_MODE:
+            self.sqlite_conn, resolved_path = _init_sqlite(sqlite_db_path)
+
+            if HYBRID_MODE:
+                from claude_memory.sync import SyncEngine
+                sync_interval = int(os.environ.get("MEMORY_SYNC_INTERVAL", "60"))
+                self.sync_engine = SyncEngine(
+                    db_path=resolved_path,
+                    api_base_url=API_BASE_URL,
+                    api_key=API_KEY,
+                    sync_interval=sync_interval,
+                )
+                self.sync_engine.start()
+
+    def __del__(self) -> None:
+        if self.sync_engine:
+            self.sync_engine.stop()
+
+    # ── Tool methods ────────────────────────────────────────────────
 
     def memory_store(self, args: dict[str, Any]) -> str:
         content = args.get("content")
@@ -244,18 +280,28 @@ class MemoryServer:
         expanded_keywords = args.get("expanded_keywords", "")
         force_sensitive = bool(args.get("force_sensitive", False))
 
-        if SQLITE_FALLBACK:
-            return self._sqlite_store(content, category, tags, importance, expanded_keywords, force_sensitive)
+        if HTTP_ONLY:
+            result = _api_request("POST", "/api/memories", {
+                "content": content,
+                "category": category,
+                "tags": tags,
+                "expanded_keywords": expanded_keywords,
+                "importance": importance,
+                "force_sensitive": force_sensitive,
+            })
+            return f"Stored memory #{result['id']} in category '{result['category']}' with importance {result['importance']:.1f}"
 
-        result = _api_request("POST", "/api/memories", {
-            "content": content,
-            "category": category,
-            "tags": tags,
-            "expanded_keywords": expanded_keywords,
-            "importance": importance,
-            "force_sensitive": force_sensitive,
-        })
-        return f"Stored memory #{result['id']} in category '{result['category']}' with importance {result['importance']:.1f}"
+        # SQLite-only or Hybrid: write to local SQLite first
+        result_text = self._sqlite_store(content, category, tags, importance, expanded_keywords, force_sensitive)
+
+        if HYBRID_MODE and self.sync_engine:
+            # Extract local_id from result text
+            local_id = int(result_text.split("#")[1].split(" ")[0])
+            self.sync_engine.try_sync_store(
+                local_id, content, category, tags, expanded_keywords, importance, force_sensitive
+            )
+
+        return result_text
 
     def memory_recall(self, args: dict[str, Any]) -> str:
         context = args.get("context")
@@ -266,80 +312,102 @@ class MemoryServer:
         sort_by = args.get("sort_by", "importance")
         limit = args.get("limit", 10)
 
-        if SQLITE_FALLBACK:
-            return self._sqlite_recall(context, expanded_query, category, sort_by, limit)
+        if HTTP_ONLY:
+            result = _api_request("POST", "/api/memories/recall", {
+                "context": context,
+                "expanded_query": expanded_query,
+                "category": category,
+                "sort_by": sort_by,
+                "limit": limit,
+            })
+            rows = result.get("memories", [])
+            if not rows:
+                filter_desc = f" in category '{category}'" if category else ""
+                return f"No memories found matching: {context}{filter_desc}"
 
-        result = _api_request("POST", "/api/memories/recall", {
-            "context": context,
-            "expanded_query": expanded_query,
-            "category": category,
-            "sort_by": sort_by,
-            "limit": limit,
-        })
-        rows = result.get("memories", [])
-        if not rows:
-            filter_desc = f" in category '{category}'" if category else ""
-            return f"No memories found matching: {context}{filter_desc}"
+            sort_desc = "by relevance" if sort_by == "relevance" else "by importance"
+            filter_desc = f" in '{category}'" if category else ""
+            results = []
+            for row in rows:
+                results.append(
+                    f"#{row['id']} [{row['category']}] (importance: {row['importance']:.1f}) {row['content']}"
+                    f"\n  Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
+                )
+            return f"Found {len(rows)} memories{filter_desc} ({sort_desc}):\n\n" + "\n\n".join(results)
 
-        sort_desc = "by relevance" if sort_by == "relevance" else "by importance"
-        filter_desc = f" in '{category}'" if category else ""
-        results = []
-        for row in rows:
-            results.append(
-                f"#{row['id']} [{row['category']}] (importance: {row['importance']:.1f}) {row['content']}"
-                f"\n  Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
-            )
-        return f"Found {len(rows)} memories{filter_desc} ({sort_desc}):\n\n" + "\n\n".join(results)
+        # SQLite-only or Hybrid: always read from local cache
+        return self._sqlite_recall(context, expanded_query, category, sort_by, limit)
 
     def memory_list(self, args: dict[str, Any]) -> str:
         category = args.get("category")
         limit = args.get("limit", 20)
 
-        if SQLITE_FALLBACK:
-            return self._sqlite_list(category, limit)
+        if HTTP_ONLY:
+            params = f"?limit={limit}"
+            if category:
+                params += f"&category={category}"
+            result = _api_request("GET", f"/api/memories{params}")
+            rows = result.get("memories", [])
+            if not rows:
+                return f"No memories in category '{category}'" if category else "No memories stored yet"
 
-        params = f"?limit={limit}"
-        if category:
-            params += f"&category={category}"
-        result = _api_request("GET", f"/api/memories{params}")
-        rows = result.get("memories", [])
-        if not rows:
-            return f"No memories in category '{category}'" if category else "No memories stored yet"
+            results = []
+            for row in rows:
+                results.append(
+                    f"#{row['id']} [{row['category']}] {row['content']}"
+                    f"\n  Importance: {row['importance']:.1f} | Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
+                )
+            header = "Recent memories"
+            if category:
+                header += f" in '{category}'"
+            return header + f" ({len(rows)} shown):\n\n" + "\n\n".join(results)
 
-        results = []
-        for row in rows:
-            results.append(
-                f"#{row['id']} [{row['category']}] {row['content']}"
-                f"\n  Importance: {row['importance']:.1f} | Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
-            )
-        header = "Recent memories"
-        if category:
-            header += f" in '{category}'"
-        return header + f" ({len(rows)} shown):\n\n" + "\n\n".join(results)
+        # SQLite-only or Hybrid: always read from local cache
+        return self._sqlite_list(category, limit)
 
     def memory_delete(self, args: dict[str, Any]) -> str:
         memory_id = args.get("id")
         if memory_id is None:
             raise ValueError("id is required")
 
-        if SQLITE_FALLBACK:
-            return self._sqlite_delete(memory_id)
+        if HTTP_ONLY:
+            result = _api_request("DELETE", f"/api/memories/{memory_id}")
+            return f"Deleted memory #{result['deleted']}: {result['preview']}..."
 
-        result = _api_request("DELETE", f"/api/memories/{memory_id}")
-        return f"Deleted memory #{result['deleted']}: {result['preview']}..."
+        # SQLite-only or Hybrid: delete from local SQLite
+        # In hybrid mode, also try to sync delete to server
+        if HYBRID_MODE and self.sync_engine:
+            cursor = self.sqlite_conn.cursor()
+            cursor.execute("SELECT server_id FROM memories WHERE id = ?", (memory_id,))
+            row = cursor.fetchone()
+            server_id = row["server_id"] if row and row["server_id"] else None
+
+        result_text = self._sqlite_delete(memory_id)
+
+        if HYBRID_MODE and self.sync_engine and server_id:
+            self.sync_engine.try_sync_delete(server_id)
+
+        return result_text
 
     def secret_get(self, args: dict[str, Any]) -> str:
         memory_id = args.get("id")
         if memory_id is None:
             raise ValueError("id is required")
 
-        if SQLITE_FALLBACK:
-            return self._sqlite_secret_get(memory_id)
+        if HTTP_ONLY or HYBRID_MODE:
+            # Secrets should be fetched from API when available
+            try:
+                result = _api_request("POST", f"/api/memories/{memory_id}/secret")
+                return f"#{result['id']} [{result['category']}] {result['content']}"
+            except Exception:
+                if HYBRID_MODE:
+                    # Fall back to local SQLite
+                    return self._sqlite_secret_get(memory_id)
+                raise
 
-        result = _api_request("POST", f"/api/memories/{memory_id}/secret")
-        return f"#{result['id']} [{result['category']}] {result['content']}"
+        return self._sqlite_secret_get(memory_id)
 
-    # ── SQLite fallback methods ──────────────────────────────────────
+    # ── SQLite methods ──────────────────────────────────────────────
 
     def _sqlite_store(self, content, category, tags, importance, expanded_keywords, force_sensitive=False):
         from datetime import datetime, timezone
@@ -520,25 +588,29 @@ class MemoryServer:
         return response
 
     def run(self) -> None:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32700, "message": f"Parse error: {e}"},
-                    }),
-                    flush=True,
-                )
-                continue
-            response = self.process_message(message)
-            if response is not None:
-                print(json.dumps(response), flush=True)
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(
+                        json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {"code": -32700, "message": f"Parse error: {e}"},
+                        }),
+                        flush=True,
+                    )
+                    continue
+                response = self.process_message(message)
+                if response is not None:
+                    print(json.dumps(response), flush=True)
+        finally:
+            if self.sync_engine:
+                self.sync_engine.stop()
 
 
 def main() -> None:

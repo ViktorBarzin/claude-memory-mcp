@@ -36,6 +36,7 @@ def _make_memory_row(**overrides):
         "rank": 0.5,
         "created_at": now,
         "updated_at": now,
+        "deleted_at": None,
     }
     defaults.update(overrides)
     return MockRow(defaults)
@@ -307,3 +308,125 @@ async def test_import_memories(client):
     assert len(data) == 2
     assert data[0]["id"] == 100
     assert data[1]["id"] == 101
+
+
+# ─── Sync endpoint tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sync_full_dump_without_since(client):
+    ac, conn, app_mod = client
+    now = datetime.now(timezone.utc)
+    conn.fetch.return_value = [
+        _make_memory_row(id=1, content="mem1", deleted_at=None),
+        _make_memory_row(id=2, content="mem2", deleted_at=None),
+    ]
+
+    async with ac:
+        resp = await ac.get(
+            "/api/memories/sync",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["memories"]) == 2
+    assert "server_time" in data
+    assert data["memories"][0]["id"] == 1
+    assert data["memories"][1]["id"] == 2
+
+    # Without since param, should query non-deleted only
+    call_args = conn.fetch.call_args
+    query = call_args[0][0]
+    assert "deleted_at IS NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_sync_incremental_with_since(client):
+    ac, conn, app_mod = client
+    now = datetime.now(timezone.utc)
+    conn.fetch.return_value = [
+        _make_memory_row(id=3, content="updated mem", deleted_at=None),
+    ]
+
+    async with ac:
+        resp = await ac.get(
+            "/api/memories/sync?since=2026-03-14T10:00:00+00:00",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["memories"]) == 1
+
+    # With since param, should include updated_at filter (includes soft-deleted)
+    call_args = conn.fetch.call_args
+    query = call_args[0][0]
+    assert "updated_at >" in query
+    assert "deleted_at IS NULL" not in query
+
+
+@pytest.mark.asyncio
+async def test_sync_includes_soft_deleted_with_since(client):
+    ac, conn, app_mod = client
+    now = datetime.now(timezone.utc)
+    conn.fetch.return_value = [
+        _make_memory_row(id=5, content="deleted mem", deleted_at=now),
+    ]
+
+    async with ac:
+        resp = await ac.get(
+            "/api/memories/sync?since=2026-03-14T10:00:00+00:00",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["memories"]) == 1
+    assert data["memories"][0]["deleted_at"] is not None
+
+
+# ─── Soft delete tests ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_is_soft_delete(client):
+    """Delete should SET deleted_at, not DELETE the row."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=10, vault_path=None, preview="test content")
+    conn.execute.return_value = None
+
+    async with ac:
+        resp = await ac.delete(
+            "/api/memories/10",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+
+    # Verify the execute call uses UPDATE SET deleted_at, not DELETE
+    execute_args = conn.execute.call_args
+    query = execute_args[0][0]
+    assert "UPDATE" in query
+    assert "deleted_at" in query
+    assert "DELETE" not in query.upper().split("SET")[0]  # No DELETE before SET
+
+
+@pytest.mark.asyncio
+async def test_delete_excludes_already_deleted(client):
+    """DELETE endpoint should not find already-deleted memories."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = None  # Not found because deleted_at IS NULL filter
+
+    async with ac:
+        resp = await ac.delete(
+            "/api/memories/10",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 404
+
+    # Verify query includes deleted_at IS NULL
+    call_args = conn.fetchrow.call_args
+    query = call_args[0][0]
+    assert "deleted_at IS NULL" in query
