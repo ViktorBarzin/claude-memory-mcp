@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-memory
+  namespace: claude-memory
+  labels:
+    app: claude-memory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claude-memory
+  template:
+    metadata:
+      labels:
+        app: claude-memory
+    spec:
+      containers:
+        - name: claude-memory
+          image: viktorbarzin/claude-memory-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: claude-memory-secrets
+                  key: database-url
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: claude-memory-secrets
+                  key: api-key
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi

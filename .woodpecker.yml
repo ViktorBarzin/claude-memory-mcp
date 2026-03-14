@@ -1,0 +1,43 @@
+when:
+  - event: push
+    branch: main
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      attempts: 5
+      backoff: 10s
+
+steps:
+  - name: test
+    image: python:3.12-slim
+    commands:
+      - pip install -e ".[api,dev]"
+      - ruff check src/ tests/
+      - pytest tests/ -v --tb=short
+
+  - name: build-and-push
+    image: woodpeckerci/plugin-docker-buildx
+    depends_on:
+      - test
+    settings:
+      username: viktorbarzin
+      password:
+        from_secret: dockerhub-token
+      repo: viktorbarzin/claude-memory-mcp
+      dockerfile: docker/Dockerfile
+      context: .
+      platforms:
+        - linux/amd64
+      tags:
+        - "${CI_PIPELINE_NUMBER}"
+        - latest
+
+  - name: deploy
+    image: bitnami/kubectl:latest
+    depends_on:
+      - build-and-push
+    commands:
+      - kubectl rollout restart deployment/claude-memory -n claude-memory
+      - kubectl rollout status deployment/claude-memory -n claude-memory --timeout=120s

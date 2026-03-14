@@ -1,0 +1,46 @@
+replicaCount: 1
+
+image:
+  repository: viktorbarzin/claude-memory-mcp
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  host: claude-memory.example.com
+  tls:
+    secretName: tls-secret
+
+resources:
+  requests:
+    memory: 32Mi
+    cpu: 10m
+  limits:
+    memory: 128Mi
+
+env:
+  DATABASE_URL: ""
+  API_KEY: ""
+  # API_KEYS: '{}'
+  # VAULT_ADDR: ""
+  # VAULT_TOKEN: ""
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 30
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 3
+  periodSeconds: 10
