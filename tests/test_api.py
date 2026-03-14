@@ -316,7 +316,6 @@ async def test_import_memories(client):
 @pytest.mark.asyncio
 async def test_sync_full_dump_without_since(client):
     ac, conn, app_mod = client
-    now = datetime.now(timezone.utc)
     conn.fetch.return_value = [
         _make_memory_row(id=1, content="mem1", deleted_at=None),
         _make_memory_row(id=2, content="mem2", deleted_at=None),
@@ -344,7 +343,6 @@ async def test_sync_full_dump_without_since(client):
 @pytest.mark.asyncio
 async def test_sync_incremental_with_since(client):
     ac, conn, app_mod = client
-    now = datetime.now(timezone.utc)
     conn.fetch.return_value = [
         _make_memory_row(id=3, content="updated mem", deleted_at=None),
     ]
