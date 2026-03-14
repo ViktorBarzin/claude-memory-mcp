@@ -1,167 +1,259 @@
 # Claude Memory MCP
 
-A persistent memory layer for Claude Code that stores knowledge across sessions. Operates as an MCP (Model Context Protocol) server with optional API and database backends.
+A persistent memory layer for Claude Code that stores knowledge across sessions. Operates as an MCP (Model Context Protocol) server with optional PostgreSQL API backend and Vault integration for secrets.
 
 ## Operating Modes
 
 | Mode | Storage | Auth | Use Case |
 |------|---------|------|----------|
-| **Local** | SQLite file | None | Single user, local Claude Code |
-| **Server** | SQLite file | API key | Remote access, single user |
-| **Full** | PostgreSQL | API keys + Vault | Multi-user, team deployment |
+| **Local** | SQLite + FTS5 | None | Single user, local Claude Code |
+| **Server** | PostgreSQL via HTTP API | API key | Remote access, multi-session |
+| **Full** | PostgreSQL + Vault | API keys + Vault | Multi-user, team deployment |
 
-## Quick Start
+## Setting Up a New Agent
 
-### Local Mode (MCP stdio)
-
-Install and configure Claude Code to use the MCP server directly:
+### 1. Install the package
 
 ```bash
 pip install claude-memory-mcp
 ```
 
-Add to your Claude Code MCP config (`~/.claude/plugins/`):
+Or install from source for development:
+
+```bash
+git clone https://github.com/ViktorBarzin/claude-memory-mcp.git
+cd claude-memory-mcp
+pip install -e .
+```
+
+### 2. Choose your mode and configure
+
+#### Local Mode (SQLite, zero config)
+
+No server needed. Memories are stored in a local SQLite database.
+
+Add to your Claude Code MCP settings (`~/.claude/settings.json` or project `.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
     "memory": {
-      "command": "python",
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "claude_memory.mcp_server"]
+    }
+  }
+}
+```
+
+The database defaults to `~/.claude/claude-memory/memory/memory.db`. Override with:
+
+```json
+{
+  "env": {
+    "MEMORY_HOME": "/path/to/memory/dir"
+  }
+}
+```
+
+#### Server Mode (shared PostgreSQL API)
+
+Point the MCP server at a running API instance. This allows multiple sessions/machines to share the same memory.
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "python3",
       "args": ["-m", "claude_memory.mcp_server"],
       "env": {
-        "MEMORY_DB_PATH": "~/.claude/memory.db"
+        "MEMORY_API_URL": "https://claude-memory.example.com",
+        "MEMORY_API_KEY": "your-api-key"
       }
     }
   }
 }
 ```
 
-### Server Mode (API)
+#### Full Mode (with Vault for secrets)
 
-Run the API server with SQLite:
+Same as Server Mode but with Vault for automatic credential detection and secure storage:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "claude_memory.mcp_server"],
+      "env": {
+        "MEMORY_API_URL": "https://claude-memory.example.com",
+        "MEMORY_API_KEY": "your-api-key",
+        "VAULT_ADDR": "https://vault.example.com",
+        "VAULT_TOKEN": "your-vault-token"
+      }
+    }
+  }
+}
+```
+
+### 3. Verify it works
+
+Start a Claude Code session and test:
+
+```
+> Store a test memory: "Claude Memory MCP is working"
+> Recall memories about "Claude Memory"
+```
+
+You should see the MCP tools `memory_store`, `memory_recall`, `memory_list`, `memory_delete`, and `secret_get` available.
+
+### Environment Variable Aliases
+
+For backward compatibility, these aliases are supported:
+
+| Primary | Alias |
+|---------|-------|
+| `MEMORY_API_URL` | `CLAUDE_MEMORY_API_URL` |
+| `MEMORY_API_KEY` | `CLAUDE_MEMORY_API_KEY` |
+
+## Running the API Server
+
+### Docker Compose (recommended)
+
+```bash
+cd docker
+docker compose up -d
+```
+
+This starts the API + PostgreSQL. Vault is available as an optional profile:
+
+```bash
+docker compose --profile vault up -d
+```
+
+### Manual
 
 ```bash
 pip install claude-memory-mcp[api]
 
-export DATABASE_URL="sqlite:///./memory.db"
+export DATABASE_URL="postgresql://user:pass@localhost:5432/claude_memory"
 export API_KEY="your-secret-key"
 
+# Run migrations
+alembic upgrade head
+
+# Start server
 uvicorn claude_memory.api.app:app --host 0.0.0.0 --port 8000
-```
-
-Configure Claude Code to connect via HTTP:
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "python",
-      "args": ["-m", "claude_memory.mcp_server"],
-      "env": {
-        "MEMORY_API_URL": "http://localhost:8000",
-        "MEMORY_API_KEY": "your-secret-key"
-      }
-    }
-  }
-}
-```
-
-### Full Mode (Docker Compose)
-
-```bash
-cd docker
-docker compose up -d
-```
-
-This starts the API server with PostgreSQL. See [Docker Compose](#docker-compose) for details.
-
-## Docker Compose
-
-The dev environment includes the API server and PostgreSQL:
-
-```bash
-cd docker
-docker compose up -d
-```
-
-To include HashiCorp Vault for secret management:
-
-```bash
-docker compose --profile vault up -d
 ```
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | Database connection string | `sqlite:///./memory.db` |
+| `DATABASE_URL` | PostgreSQL connection string | Required |
 | `API_KEY` | Single-user API key | None |
 | `API_KEYS` | Multi-user JSON map `{"user": "key"}` | None |
 | `VAULT_ADDR` | Vault server address | None |
 | `VAULT_TOKEN` | Vault authentication token | None |
+| `MEMORY_ENCRYPTION_KEY` | AES-256 key (hex or passphrase) for non-Vault encryption | None |
 
 ## Multi-User Setup
 
-For team deployments, use the `API_KEYS` environment variable with a JSON mapping of usernames to API keys:
+For team deployments, use `API_KEYS` with a JSON mapping:
 
 ```bash
 export API_KEYS='{"alice": "key-alice-xxx", "bob": "key-bob-yyy"}'
 ```
 
-Each user gets isolated memory storage. The username is extracted from the API key on each request.
+Each user gets isolated memory storage — users cannot see each other's memories. Each agent/user gets their own API key in their MCP config.
 
-## Vault Integration
+### Adding a new user
 
-For production deployments, store API keys in HashiCorp Vault instead of environment variables:
+1. Generate a key: `openssl rand -base64 32`
+2. Add to `API_KEYS`: `{"existing": "...", "newuser": "generated-key"}`
+3. Restart the API server
+4. Give the new user their MCP config with their key
 
-```bash
-export VAULT_ADDR="https://vault.example.com"
-export VAULT_TOKEN="s.xxxxxxxxxxxx"
-```
+## MCP Tools
 
-The server reads API keys from the Vault KV store at `secret/claude-memory/api-keys`.
+| Tool | Description |
+|------|-------------|
+| `memory_store` | Store a fact with category, tags, importance, and expanded keywords |
+| `memory_recall` | Search memories using full-text search with expanded query terms |
+| `memory_list` | List recent memories, optionally filtered by category |
+| `memory_delete` | Delete a memory by ID |
+| `secret_get` | Retrieve the actual content of a sensitive/redacted memory |
 
 ## API Reference
 
 ### Health Check
-
 ```
 GET /health
 ```
 
 ### Store Memory
-
 ```
-POST /api/v1/memories
+POST /api/memories
 Authorization: Bearer <api-key>
-Content-Type: application/json
 
-{
-  "content": "The user prefers dark mode",
-  "tags": ["preferences", "ui"],
-  "source": "conversation"
-}
+{"content": "...", "category": "facts", "tags": "tag1,tag2", "expanded_keywords": "related terms", "importance": 0.8}
 ```
 
 ### Recall Memories
-
 ```
-GET /api/v1/memories?q=dark+mode&limit=10
+POST /api/memories/recall
 Authorization: Bearer <api-key>
+
+{"context": "search terms", "expanded_query": "additional search terms", "category": "facts", "limit": 10}
 ```
 
 ### List Memories
-
 ```
-GET /api/v1/memories?tags=preferences&limit=20
+GET /api/memories?category=facts&limit=20
 Authorization: Bearer <api-key>
 ```
 
 ### Delete Memory
-
 ```
-DELETE /api/v1/memories/{id}
+DELETE /api/memories/{id}
 Authorization: Bearer <api-key>
+```
+
+### Get Secret Content
+```
+POST /api/memories/{id}/secret
+Authorization: Bearer <api-key>
+```
+
+### Migrate Existing Secrets
+```
+POST /api/memories/migrate-secrets
+Authorization: Bearer <api-key>
+```
+
+### Bulk Import
+```
+POST /api/memories/import
+Authorization: Bearer <api-key>
+
+[{"content": "...", "category": "facts"}, ...]
+```
+
+## Database Migrations
+
+This project uses Alembic for database migrations. Migrations run automatically on API server startup.
+
+To run manually:
+```bash
+export DATABASE_URL="postgresql://user:pass@localhost:5432/claude_memory"
+alembic upgrade head
+```
+
+To create a new migration:
+```bash
+alembic revision -m "description of change"
 ```
 
 ## Kubernetes Deployment
@@ -179,7 +271,6 @@ helm install claude-memory deploy/helm/claude-memory \
 
 ```bash
 kubectl apply -f deploy/kubernetes/namespace.yaml
-# Create secret with your credentials first:
 kubectl create secret generic claude-memory-secrets \
   -n claude-memory \
   --from-literal=database-url="postgresql://user:pass@host:5432/db" \
@@ -189,34 +280,14 @@ kubectl apply -f deploy/kubernetes/
 
 ## Development
 
-### Setup
-
 ```bash
-git clone https://github.com/viktorbarzin/claude-memory-mcp.git
+git clone https://github.com/ViktorBarzin/claude-memory-mcp.git
 cd claude-memory-mcp
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[api,dev]"
-```
-
-### Running Tests
-
-```bash
 pytest tests/ -v
-```
-
-### Linting
-
-```bash
 ruff check src/ tests/
-mypy src/claude_memory/
-```
-
-### Building
-
-```bash
-pip install build
-python -m build
 ```
 
 ## License

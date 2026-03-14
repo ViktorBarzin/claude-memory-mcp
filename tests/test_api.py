@@ -136,7 +136,8 @@ async def test_recall_returns_only_user_memories(client):
         )
 
     assert resp.status_code == 200
-    results = resp.json()
+    data = resp.json()
+    results = data["memories"]
     assert len(results) == 1
     assert results[0]["content"] == "user memory"
 
@@ -160,7 +161,8 @@ async def test_recall_redacts_sensitive_memories(client):
         )
 
     assert resp.status_code == 200
-    results = resp.json()
+    data = resp.json()
+    results = data["memories"]
     assert "[SENSITIVE" in results[0]["content"]
     assert "secret_get(id=5)" in results[0]["content"]
 
@@ -180,7 +182,8 @@ async def test_list_returns_only_user_memories(client):
         )
 
     assert resp.status_code == 200
-    results = resp.json()
+    data = resp.json()
+    results = data["memories"]
     assert len(results) == 2
 
     # Verify user_id filter

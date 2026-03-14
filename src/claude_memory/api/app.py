@@ -144,7 +144,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             }
         )
 
-    return results
+    return {"memories": results}
 
 
 @app.get("/api/memories")
@@ -191,7 +191,7 @@ async def list_memories(
             }
         )
 
-    return results
+    return {"memories": results}
 
 
 @app.delete("/api/memories/{memory_id}")
