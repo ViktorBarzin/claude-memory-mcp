@@ -13,7 +13,7 @@ os.environ.pop("CLAUDE_MEMORY_API_KEY", None)
 # Add src to path so we can import without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from claude_memory.mcp_server import MemoryServer, TOOLS, SERVER_NAME, SERVER_VERSION, PROTOCOL_VERSION
+from claude_memory.mcp_server import MemoryServer, SERVER_NAME, SERVER_VERSION, PROTOCOL_VERSION
 
 
 @pytest.fixture

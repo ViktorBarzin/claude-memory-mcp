@@ -1,7 +1,6 @@
 """Tests for Vault KV v2 client with mocked urllib."""
 
 import json
-import os
 from io import BytesIO
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -100,7 +99,7 @@ class TestVaultWrite:
         mock_urlopen.return_value = mock_response
 
         client = VaultClient()
-        result = client.write("myapp/config", {"key": "value"})
+        client.write("myapp/config", {"key": "value"})
 
         # Verify the request was made with correct data
         call_args = mock_urlopen.call_args

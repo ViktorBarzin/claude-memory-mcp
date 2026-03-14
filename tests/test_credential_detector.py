@@ -1,9 +1,7 @@
 """Tests for credential detection and redaction."""
 
-import pytest
 
 from claude_memory.credential_detector import (
-    DetectedCredential,
     detect_credentials,
     is_sensitive,
     redact_credentials,

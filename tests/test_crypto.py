@@ -1,7 +1,5 @@
 """Tests for AES-256-GCM encryption module."""
 
-import hashlib
-import os
 
 import pytest
 
