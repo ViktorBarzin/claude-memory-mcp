@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-memory"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "2.0.0"
 
 # API configuration — support both MEMORY_* (primary) and CLAUDE_MEMORY_* (fallback) env vars
 API_BASE_URL = os.environ.get("MEMORY_API_URL") or os.environ.get("CLAUDE_MEMORY_API_URL", "http://localhost:8080")
@@ -72,7 +72,16 @@ def _get_db_path(db_path: str | None = None) -> str:
         "MEMORY_DB",
         os.path.join(memory_home, "memory", "memory.db"),
     )
-    return os.path.expandvars(os.path.expanduser(db_path))
+    resolved = os.path.expandvars(os.path.expanduser(db_path))
+
+    # Migration fallback: if the new path doesn't exist but legacy metaclaw path does, use that
+    if not os.path.exists(resolved):
+        legacy_home = os.path.expanduser("~/.claude/metaclaw")
+        legacy_db = os.path.join(legacy_home, "memory", "memory.db")
+        if os.path.exists(legacy_db):
+            return legacy_db
+
+    return resolved
 
 
 def _init_sqlite(db_path: str | None = None):

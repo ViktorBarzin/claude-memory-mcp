@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "claude_memory": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/src/claude_memory/mcp_server.py"],
+      "env": {
+        "MEMORY_API_URL": "${MEMORY_API_URL}",
+        "MEMORY_API_KEY": "${MEMORY_API_KEY}",
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/src"
+      }
+    }
+  }
+}

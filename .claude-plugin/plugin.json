@@ -1,0 +1,66 @@
+{
+  "name": "claude-memory",
+  "version": "1.0.0",
+  "description": "Persistent memory with semantic search, compaction survival, and auto-learning",
+  "author": { "name": "Viktor Barzin" },
+  "keywords": ["memory", "persistence", "compaction", "recall", "remember"],
+  "commands": ["./commands/"],
+  "skills": ["./skills/"],
+  "mcpServers": "./mcp/memory-mcp.json",
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre-compact-backup.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post-compact-recovery.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt-recall.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/auto-learn.py",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "mcp__.*claude_memory__memory_|mcp__.*claude_memory__secret_",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/auto-allow-memory-tools.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

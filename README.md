@@ -2,6 +2,24 @@
 
 A persistent memory layer for Claude Code that stores knowledge across sessions. Operates as an MCP (Model Context Protocol) server with optional PostgreSQL API backend, local SQLite cache with background sync, and Vault integration for secrets.
 
+## Quick Install (Claude Code Plugin)
+
+```bash
+claude plugins install github:ViktorBarzin/claude-memory-mcp
+
+# Works immediately with local SQLite (no server needed)
+# For multi-device sync, set these env vars:
+export MEMORY_API_URL="https://your-server.example.com"
+export MEMORY_API_KEY="your-api-key"
+```
+
+The plugin provides:
+- `/remember <fact>` and `/recall <query>` slash commands
+- Auto-recall hook that checks memories before each response
+- Auto-learn hook that extracts corrections and preferences after each response
+- Compaction survival (memories are re-injected after context compaction)
+- Auto-approve for all memory tool calls (no permission prompts)
+
 ## Architecture
 
 ```
@@ -332,6 +350,25 @@ kubectl create secret generic claude-memory-secrets \
   --from-literal=api-key="your-key"
 kubectl apply -f deploy/kubernetes/
 ```
+
+## Plugin Hooks
+
+When installed as a Claude Code plugin, these hooks run automatically:
+
+| Hook | Event | Description |
+|------|-------|-------------|
+| `pre-compact-backup.sh` | PreCompact | Saves top 20 memories to a marker file before context compaction |
+| `post-compact-recovery.sh` | UserPromptSubmit | Detects compaction marker and injects recovery context (one-time) |
+| `user-prompt-recall.py` | UserPromptSubmit | Instructs Claude to call `memory_recall` before responding |
+| `auto-learn.py` | Stop (async) | Uses haiku-as-judge to extract corrections/preferences from the conversation |
+| `auto-allow-memory-tools.py` | PermissionRequest | Auto-approves all memory MCP tool calls without prompting |
+
+### Debug Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `DEBUG_CLAUDE_MEMORY_HOOKS=1` | Enable debug logging to stderr for all hooks |
+| `DISABLE_CLAUDE_MEMORY_AUTO_APPROVE=1` | Disable auto-approve (prompts for each tool call) |
 
 ## Development
 
