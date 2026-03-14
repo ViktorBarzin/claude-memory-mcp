@@ -194,7 +194,7 @@ async def test_list_returns_only_user_memories(client):
 @pytest.mark.asyncio
 async def test_delete_only_user_memories(client):
     ac, conn, app_mod = client
-    conn.fetchrow.return_value = _make_memory_row(id=10, vault_path=None)
+    conn.fetchrow.return_value = _make_memory_row(id=10, vault_path=None, preview="test content")
     conn.execute.return_value = None
 
     async with ac:
@@ -204,7 +204,9 @@ async def test_delete_only_user_memories(client):
         )
 
     assert resp.status_code == 200
-    assert resp.json() == {"deleted": 10}
+    data = resp.json()
+    assert data["deleted"] == 10
+    assert "preview" in data
 
     # Verify both SELECT and DELETE include user_id
     fetchrow_args = conn.fetchrow.call_args

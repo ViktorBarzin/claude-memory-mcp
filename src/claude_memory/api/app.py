@@ -200,7 +200,7 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, vault_path FROM memories WHERE id = $1 AND user_id = $2",
+            "SELECT id, vault_path, substr(content, 1, 50) AS preview FROM memories WHERE id = $1 AND user_id = $2",
             memory_id,
             user.user_id,
         )
@@ -216,7 +216,7 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
             user.user_id,
         )
 
-    return {"deleted": memory_id}
+    return {"deleted": memory_id, "preview": row["preview"]}
 
 
 @app.post("/api/memories/{memory_id}/secret", response_model=SecretResponse)
