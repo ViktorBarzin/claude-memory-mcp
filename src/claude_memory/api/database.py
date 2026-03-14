@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -17,10 +18,8 @@ def run_migrations() -> None:
         from alembic.config import Config
 
         alembic_cfg = Config()
-        # Find migrations directory relative to this file or project root
         migrations_dir = os.environ.get("ALEMBIC_MIGRATIONS_DIR", "")
         if not migrations_dir:
-            # Check common locations
             for candidate in [
                 os.path.join(os.path.dirname(__file__), "..", "..", "..", "migrations"),
                 os.path.join(os.getcwd(), "migrations"),
@@ -43,10 +42,23 @@ def run_migrations() -> None:
 
 
 async def init_pool() -> asyncpg.Pool:
+    """Initialize connection pool with retries for database availability."""
     global pool
     run_migrations()
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-    return pool
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            logger.info("Database pool initialized successfully")
+            return pool
+        except (asyncpg.CannotConnectNowError, OSError, ConnectionRefusedError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("Database not ready (attempt %d/%d): %s. Retrying in %ds...", attempt + 1, max_retries, e, wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 async def close_pool() -> None:
