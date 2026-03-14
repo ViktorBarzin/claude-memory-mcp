@@ -349,7 +349,7 @@ async def test_sync_incremental_with_since(client):
 
     async with ac:
         resp = await ac.get(
-            "/api/memories/sync?since=2026-03-14T10:00:00+00:00",
+            "/api/memories/sync?since=2026-03-14T10:00:00Z",
             headers={"Authorization": "Bearer test-key"},
         )
 
@@ -374,7 +374,7 @@ async def test_sync_includes_soft_deleted_with_since(client):
 
     async with ac:
         resp = await ac.get(
-            "/api/memories/sync?since=2026-03-14T10:00:00+00:00",
+            "/api/memories/sync?since=2026-03-14T10:00:00Z",
             headers={"Authorization": "Bearer test-key"},
         )
 

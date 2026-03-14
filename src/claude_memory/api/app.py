@@ -69,16 +69,17 @@ async def sync_memories(
 
     async with pool.acquire() as conn:
         if since:
+            since_dt = datetime.fromisoformat(since)
             rows = await conn.fetch(
                 """
                 SELECT id, content, category, tags, expanded_keywords, importance,
                        is_sensitive, created_at, updated_at, deleted_at
                 FROM memories
-                WHERE user_id = $1 AND updated_at > $2::timestamptz
+                WHERE user_id = $1 AND updated_at > $2
                 ORDER BY updated_at ASC
                 """,
                 user.user_id,
-                since,
+                since_dt,
             )
         else:
             rows = await conn.fetch(
