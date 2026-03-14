@@ -1,14 +1,50 @@
 # Claude Memory MCP
 
-A persistent memory layer for Claude Code that stores knowledge across sessions. Operates as an MCP (Model Context Protocol) server with optional PostgreSQL API backend and Vault integration for secrets.
+A persistent memory layer for Claude Code that stores knowledge across sessions. Operates as an MCP (Model Context Protocol) server with optional PostgreSQL API backend, local SQLite cache with background sync, and Vault integration for secrets.
+
+## Architecture
+
+```
+MCP Server (per Claude session)
+┌─────────────────────────────────────────────┐
+│  Tool call (store/recall/list/delete)       │
+│         │                                   │
+│         ▼                                   │
+│  ┌─────────────┐    ┌──────────────────┐    │
+│  │ Local SQLite │◄──│  SyncEngine      │    │
+│  │ (cache+FTS5) │   │  (background     │    │
+│  │ always used  │   │   thread, 60s)   │    │
+│  └─────────────┘   └────────┬─────────┘    │
+│                              │              │
+│  ┌──────────────┐            │              │
+│  │ pending_ops  │────────────┘              │
+│  │ (offline     │   push queued writes      │
+│  │  write queue)│   pull server changes     │
+│  └──────────────┘                           │
+└──────────────────────────────────────────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │  API Server (k8s)    │
+                    │  2 replicas + PDB    │
+                    │  pod anti-affinity   │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │    PostgreSQL        │
+                    │  (authoritative)     │
+                    └──────────────────────┘
+```
+
+In **hybrid mode** (the default when an API key is set), all reads hit local SQLite for instant results. Writes go to SQLite first, then attempt a synchronous API push — if the API is down, writes queue in a `pending_ops` table and sync on the next background cycle. The server is authoritative (server-wins conflict resolution).
 
 ## Operating Modes
 
-| Mode | Storage | Auth | Use Case |
-|------|---------|------|----------|
-| **Local** | SQLite + FTS5 | None | Single user, local Claude Code |
-| **Server** | PostgreSQL via HTTP API | API key | Remote access, multi-session |
-| **Full** | PostgreSQL + Vault | API keys + Vault | Multi-user, team deployment |
+| Mode | Condition | Storage | Use Case |
+|------|-----------|---------|----------|
+| **SQLite-only** | No `MEMORY_API_KEY` | SQLite + FTS5 | Single user, local Claude Code |
+| **Hybrid** (default) | `MEMORY_API_KEY` set | Local SQLite cache + API sync | Multi-session with offline resilience |
+| **HTTP-only** (legacy) | `MEMORY_API_KEY` + `MEMORY_SYNC_DISABLE=1` | PostgreSQL via HTTP API | Direct API, no local cache |
+| **Full** | Any mode + Vault configured | Above + Vault for secrets | Multi-user, team deployment |
 
 ## Setting Up a New Agent
 
@@ -56,9 +92,9 @@ The database defaults to `~/.claude/claude-memory/memory/memory.db`. Override wi
 }
 ```
 
-#### Server Mode (shared PostgreSQL API)
+#### Hybrid Mode (recommended for shared deployments)
 
-Point the MCP server at a running API instance. This allows multiple sessions/machines to share the same memory.
+Point the MCP server at a running API instance. Memories are cached locally in SQLite for fast reads and offline resilience, and synced to the API in the background.
 
 ```json
 {
@@ -75,6 +111,8 @@ Point the MCP server at a running API instance. This allows multiple sessions/ma
   }
 }
 ```
+
+To disable local caching and use direct HTTP (legacy behavior), add `"MEMORY_SYNC_DISABLE": "1"` to `env`.
 
 #### Full Mode (with Vault for secrets)
 
@@ -158,6 +196,8 @@ uvicorn claude_memory.api.app:app --host 0.0.0.0 --port 8000
 | `VAULT_ADDR` | Vault server address | None |
 | `VAULT_TOKEN` | Vault authentication token | None |
 | `MEMORY_ENCRYPTION_KEY` | AES-256 key (hex or passphrase) for non-Vault encryption | None |
+| `MEMORY_SYNC_INTERVAL` | Seconds between background sync cycles (hybrid mode) | `60` |
+| `MEMORY_SYNC_DISABLE` | Set to `1` to disable local cache and sync (HTTP-only mode) | None |
 
 ## Multi-User Setup
 
@@ -215,11 +255,21 @@ GET /api/memories?category=facts&limit=20
 Authorization: Bearer <api-key>
 ```
 
-### Delete Memory
+### Delete Memory (soft delete)
 ```
 DELETE /api/memories/{id}
 Authorization: Bearer <api-key>
 ```
+
+Sets `deleted_at` on the record rather than removing it, so sync clients can detect deletions.
+
+### Sync Memories
+```
+GET /api/memories/sync?since=2026-03-14T10:00:00+00:00
+Authorization: Bearer <api-key>
+```
+
+Returns all memories changed since the given timestamp (including soft-deleted ones). Without `since`, returns a full dump of non-deleted memories. Used by the SyncEngine for incremental sync.
 
 ### Get Secret Content
 ```
@@ -257,6 +307,11 @@ alembic revision -m "description of change"
 ```
 
 ## Kubernetes Deployment
+
+The API server is designed for high availability:
+- **2 replicas** with pod anti-affinity (spread across nodes)
+- **PodDisruptionBudget** (`min_available: 1`) prevents both pods going down during voluntary disruptions
+- **Startup probe** gives 60s for initial DB connection before the pod is killed
 
 ### Helm
 
