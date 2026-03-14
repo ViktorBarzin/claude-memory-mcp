@@ -87,14 +87,7 @@ class SyncEngine:
         return self._last_sync_success
 
     def start(self) -> None:
-        """Run initial sync (blocking), then start background thread."""
-        try:
-            self._sync_once()
-            self._last_sync_success = True
-        except Exception:
-            logger.warning("Initial sync failed, starting in offline mode")
-            self._last_sync_success = False
-
+        """Start background sync thread (non-blocking)."""
         self._thread = threading.Thread(target=self._sync_loop, daemon=True)
         self._thread.start()
 

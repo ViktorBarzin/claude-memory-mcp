@@ -600,19 +600,11 @@ class MemoryServer:
         try:
             for line in sys.stdin:
                 line = line.strip()
-                if not line:
+                if not line or line.startswith("Content-Length:"):
                     continue
                 try:
                     message = json.loads(line)
-                except json.JSONDecodeError as e:
-                    print(
-                        json.dumps({
-                            "jsonrpc": "2.0",
-                            "id": None,
-                            "error": {"code": -32700, "message": f"Parse error: {e}"},
-                        }),
-                        flush=True,
-                    )
+                except json.JSONDecodeError:
                     continue
                 response = self.process_message(message)
                 if response is not None:
@@ -623,6 +615,11 @@ class MemoryServer:
 
 
 def main() -> None:
+    # Suppress all stderr output — MCP clients (e.g. Claude Code) may treat
+    # any stderr as a fatal error and refuse to load the server.
+    sys.stderr = open(os.devnull, "w")
+    logging.disable(logging.CRITICAL)
+
     server = MemoryServer()
     server.run()
 
