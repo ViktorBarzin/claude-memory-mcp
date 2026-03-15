@@ -69,7 +69,7 @@ async def sync_memories(
 
     async with pool.acquire() as conn:
         if since:
-            since_dt = datetime.fromisoformat(since)
+            since_dt = datetime.fromisoformat(since.replace(' ', '+'))
             rows = await conn.fetch(
                 """
                 SELECT id, content, category, tags, expanded_keywords, importance,
