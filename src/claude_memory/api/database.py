@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
