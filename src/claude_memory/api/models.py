@@ -3,8 +3,11 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+MAX_MEMORY_CHARS = 800
+
+
 class MemoryStore(BaseModel):
-    content: str
+    content: str = Field(..., max_length=MAX_MEMORY_CHARS)
     category: str = "facts"
     tags: str = ""
     expanded_keywords: str = ""

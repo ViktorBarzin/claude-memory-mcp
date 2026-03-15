@@ -60,7 +60,7 @@ Your job: determine if any of these learning events occurred:
 4. FACT — user shared a durable fact about themselves, their team, tools, or environment
 
 If ANY learning event occurred, return JSON:
-{{"events": [{{"type": "correction|preference|decision|fact", "content": "concise fact to remember (one sentence)", "importance": 0.7, "tags": "comma,separated,tags", "expanded_keywords": "space-separated semantically related search terms for recall (minimum 5 words)", "supersedes": null}}]}}
+{{"events": [{{"type": "correction|preference|decision|fact", "content": "concise fact to remember (1-2 sentences, max 300 chars)", "importance": 0.7, "tags": "comma,separated,tags", "expanded_keywords": "space-separated semantically related search terms for recall (minimum 5 words)", "supersedes": null}}]}}
 
 If NO learning event occurred, return:
 {{"events": []}}
@@ -69,6 +69,8 @@ Rules:
 - Only extract DURABLE facts, not transient task details ("fix this file", "run tests")
 - Corrections are highest value (0.8-0.9)
 - Be conservative — false negatives are better than false positives
+- ONE topic per event. If multiple topics, create separate events.
+- Keep each event's content under 300 characters (1-2 sentences). Include the "why" not just the "what".
 - "supersedes" should be a search query to find the old outdated memory, or null
 - Return ONLY valid JSON, no other text"""
 
@@ -88,7 +90,7 @@ Extract any DURABLE knowledge worth remembering across sessions. Look for:
 7. **OPERATIONAL KNOWLEDGE** — service-specific learnings, config gotchas, resource requirements (importance: 0.7-0.8)
 
 Return JSON:
-{{"events": [{{"type": "correction|preference|decision|fact|debugging|workaround|operational", "content": "concise knowledge to remember (1-3 sentences max)", "importance": 0.7, "tags": "comma,separated,relevant,tags", "expanded_keywords": "space-separated semantically related search terms for recall (minimum 5 words)", "supersedes": null}}]}}
+{{"events": [{{"type": "correction|preference|decision|fact|debugging|workaround|operational", "content": "concise knowledge (1-3 sentences, max 500 chars, ONE topic per event)", "importance": 0.7, "tags": "comma,separated,relevant,tags", "expanded_keywords": "space-separated semantically related search terms for recall (minimum 5 words)", "supersedes": null}}]}}
 
 If NO durable knowledge was found, return:
 {{"events": []}}
@@ -97,8 +99,9 @@ Rules:
 - Only extract DURABLE knowledge, not transient task context ("reading file X", "running command Y")
 - Don't extract things that are obvious from the codebase (file paths, function names)
 - DO extract: "X doesn't work because Y — use Z instead", "service A needs B config", "always do X before Y"
-- Merge related learnings into single events rather than splitting into tiny fragments
-- If a debugging session revealed the root cause of an issue, capture the error→cause→fix chain
+- ONE topic per event — never combine unrelated learnings into a single event
+- Keep each event's content between 100-500 characters. Include the WHY, not just the WHAT.
+- If a debugging session revealed the root cause, capture the error→cause→fix chain as ONE event
 - "supersedes" should be a search query to find an old outdated memory this replaces, or null
 - Maximum 5 events per extraction — prioritize by importance
 - Return ONLY valid JSON, no other text"""
