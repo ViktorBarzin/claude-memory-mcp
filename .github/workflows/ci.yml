@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[api,dev]"
       - run: ruff check src/ tests/
-      - run: mypy src/claude_memory/ || true
+      - run: mypy src/claude_memory/
       - run: pytest tests/ -v --tb=short
 
   build:

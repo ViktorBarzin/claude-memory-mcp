@@ -3,7 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, AsyncGenerator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_pool()
     yield
     await close_pool()
@@ -55,7 +55,7 @@ def _redact_content(content: str) -> str:
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
@@ -63,7 +63,7 @@ async def health():
 async def sync_memories(
     since: Optional[str] = None,
     user: AuthUser = Depends(get_current_user),
-):
+) -> SyncResponse:
     pool = await get_pool()
     server_time = datetime.now(timezone.utc).isoformat()
 
@@ -113,7 +113,7 @@ async def sync_memories(
 
 
 @app.post("/api/memories", response_model=MemoryResponse)
-async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_user)):
+async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_user)) -> MemoryResponse:
     pool = await get_pool()
     is_sensitive = body.force_sensitive or _detect_sensitive(body.content)
 
@@ -146,7 +146,7 @@ async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_u
 
 
 @app.post("/api/memories/recall")
-async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_current_user)):
+async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     pool = await get_pool()
 
     query_text = f"{body.context} {body.expanded_query}".strip()
@@ -161,7 +161,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
         order_clause = "created_at DESC"
 
     category_filter = ""
-    params: list = [user.user_id, query_text, body.limit]
+    params: list[Any] = [user.user_id, query_text, body.limit]
     if body.category:
         category_filter = "AND category = $4"
         params.append(body.category)
@@ -190,7 +190,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             words = query_text.split()
             if len(words) > 1:
                 or_tsquery = " | ".join(w for w in words if w)
-                or_params: list = [user.user_id, or_tsquery, body.limit]
+                or_params: list[Any] = [user.user_id, or_tsquery, body.limit]
                 or_cat_filter = ""
                 if body.category:
                     or_cat_filter = "AND category = $4"
@@ -241,7 +241,7 @@ async def list_memories(
     category: Optional[str] = None,
     limit: int = 50,
     user: AuthUser = Depends(get_current_user),
-):
+) -> dict[str, Any]:
     pool = await get_pool()
 
     if category:
@@ -250,7 +250,7 @@ async def list_memories(
             FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2
             ORDER BY importance DESC LIMIT $3
         """
-        params: list = [user.user_id, category, limit]
+        params: list[Any] = [user.user_id, category, limit]
     else:
         query = """
             SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
@@ -284,7 +284,7 @@ async def list_memories(
 
 
 @app.delete("/api/memories/{memory_id}")
-async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_user)):
+async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
@@ -311,7 +311,7 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
 
 
 @app.post("/api/memories/{memory_id}/secret", response_model=SecretResponse)
-async def get_memory_secret(memory_id: int, user: AuthUser = Depends(get_current_user)):
+async def get_memory_secret(memory_id: int, user: AuthUser = Depends(get_current_user)) -> SecretResponse:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
@@ -346,7 +346,7 @@ async def get_memory_secret(memory_id: int, user: AuthUser = Depends(get_current
 
 
 @app.post("/api/memories/migrate-secrets")
-async def migrate_secrets(user: AuthUser = Depends(get_current_user)):
+async def migrate_secrets(user: AuthUser = Depends(get_current_user)) -> dict[str, int]:
     pool = await get_pool()
     migrated = 0
 
@@ -388,7 +388,7 @@ async def migrate_secrets(user: AuthUser = Depends(get_current_user)):
 @app.post("/api/memories/import")
 async def import_memories(
     memories: list[MemoryStore], user: AuthUser = Depends(get_current_user)
-):
+) -> list[MemoryResponse]:
     pool = await get_pool()
     imported = []
 

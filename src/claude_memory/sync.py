@@ -10,6 +10,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,7 +118,7 @@ class SyncEngine:
         self._push_pending_ops()
         self._pull_changes()
 
-    def _api_request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _api_request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         """Make an HTTP request to the memory API."""
         url = f"{self.api_base_url}{path}"
         data = json.dumps(body).encode() if body else None
@@ -131,7 +132,8 @@ class SyncEngine:
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
+            result: dict[str, Any] = json.loads(resp.read().decode())
+            return result
 
     def _push_pending_ops(self) -> None:
         """Push queued operations to the API server."""

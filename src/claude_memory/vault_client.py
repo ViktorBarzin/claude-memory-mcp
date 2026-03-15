@@ -50,7 +50,8 @@ class VaultClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode())
+                result: dict[str, Any] = json.loads(resp.read().decode())
+                return result
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return {}
@@ -79,6 +80,7 @@ class VaultClient:
         """List secrets at a path."""
         try:
             resp = self._request("LIST", f"/v1/{self.mount}/metadata/{path}")
-            return resp.get("data", {}).get("keys", [])
+            keys: list[str] = resp.get("data", {}).get("keys", [])
+            return keys
         except RuntimeError:
             return []
