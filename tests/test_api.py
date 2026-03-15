@@ -216,7 +216,7 @@ async def test_delete_only_user_memories(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_nonexistent_memory_returns_404(client):
+async def test_delete_nonexistent_memory_is_idempotent(client):
     ac, conn, app_mod = client
     conn.fetchrow.return_value = None
 
@@ -226,7 +226,9 @@ async def test_delete_nonexistent_memory_returns_404(client):
             headers={"Authorization": "Bearer test-key"},
         )
 
-    assert resp.status_code == 404
+    # Idempotent: returns 200 even if already deleted (prevents retry loops)
+    assert resp.status_code == 200
+    assert resp.json()["preview"] == "[already deleted]"
 
 
 @pytest.mark.asyncio
@@ -412,7 +414,7 @@ async def test_delete_is_soft_delete(client):
 
 @pytest.mark.asyncio
 async def test_delete_excludes_already_deleted(client):
-    """DELETE endpoint should not find already-deleted memories."""
+    """DELETE endpoint filters by deleted_at IS NULL and returns idempotent 200."""
     ac, conn, app_mod = client
     conn.fetchrow.return_value = None  # Not found because deleted_at IS NULL filter
 
@@ -422,7 +424,9 @@ async def test_delete_excludes_already_deleted(client):
             headers={"Authorization": "Bearer test-key"},
         )
 
-    assert resp.status_code == 404
+    # Idempotent: returns 200 even if already soft-deleted
+    assert resp.status_code == 200
+    assert resp.json()["preview"] == "[already deleted]"
 
     # Verify query includes deleted_at IS NULL
     call_args = conn.fetchrow.call_args
