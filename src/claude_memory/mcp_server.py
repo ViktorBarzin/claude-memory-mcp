@@ -448,8 +448,8 @@ class MemoryServer:
         )
 
         base_select = (
-            f"SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
-            f"FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
+            "SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
+            "FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
         )
         cursor = self.sqlite_conn.cursor()
         try:
