@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,7 +162,7 @@ class SyncEngine:
                     if server_id:
                         try:
                             self._api_request("DELETE", f"/api/memories/{server_id}")
-                        except RuntimeError as e:
+                        except (RuntimeError, urllib.error.HTTPError) as e:
                             if "404" in str(e):
                                 pass  # Already deleted on server
                             else:
@@ -181,7 +182,7 @@ class SyncEngine:
         params = ""
         ts = self.last_sync_ts
         if ts:
-            params = f"?since={ts}"
+            params = f"?since={urllib.parse.quote(ts, safe='')}"
 
         result = self._api_request("GET", f"/api/memories/sync{params}")
         memories = result.get("memories", [])
@@ -321,6 +322,11 @@ class SyncEngine:
         try:
             self._api_request("DELETE", f"/api/memories/{server_id}")
             return True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return True  # Already deleted on server — not an error
+            self.enqueue_delete(server_id)
+            return False
         except Exception:
             self.enqueue_delete(server_id)
             return False
