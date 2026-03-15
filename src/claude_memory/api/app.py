@@ -260,7 +260,9 @@ async def delete_memory(memory_id: int, user: AuthUser = Depends(get_current_use
             user.user_id,
         )
         if not row:
-            raise HTTPException(status_code=404, detail="Memory not found")
+            # Idempotent: return success even if already deleted
+            # Prevents old clients without 404-handling from infinite retry loops
+            return {"deleted": memory_id, "preview": "[already deleted]"}
 
         if row["vault_path"]:
             await delete_secret(user.user_id, row["vault_path"])
