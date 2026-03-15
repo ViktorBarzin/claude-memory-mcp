@@ -1,7 +1,12 @@
 when:
-  - event: manual
+  - event: [manual, push]
 
 steps:
+  - name: check-vars
+    image: alpine
+    commands:
+      - "[ -n \"$IMAGE_TAG\" ] || (echo 'IMAGE_TAG not set, skipping deploy'; exit 78)"
+
   - name: deploy
     image: bitnami/kubectl:1.32
     commands:
