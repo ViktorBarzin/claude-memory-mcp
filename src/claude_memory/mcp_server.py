@@ -13,6 +13,7 @@ Uses only stdlib (urllib) — no pip install required.
 import json
 import logging
 import os
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -35,7 +36,7 @@ HTTP_ONLY = bool(API_KEY) and SYNC_DISABLED
 SQLITE_ONLY = not API_KEY
 
 
-def _api_request(method: str, path: str, body: dict | None = None) -> dict:
+def _api_request(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """Make an HTTP request to the memory API."""
     url = f"{API_BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
@@ -50,7 +51,8 @@ def _api_request(method: str, path: str, body: dict | None = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
+            result: dict[str, Any] = json.loads(resp.read().decode())
+            return result
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else str(e)
         raise RuntimeError(f"API error {e.code}: {error_body}") from e
@@ -84,9 +86,8 @@ def _get_db_path(db_path: str | None = None) -> str:
     return resolved
 
 
-def _init_sqlite(db_path: str | None = None):
+def _init_sqlite(db_path: str | None = None) -> tuple[sqlite3.Connection, str]:
     """Initialize SQLite database."""
-    import sqlite3
     from pathlib import Path
 
     db_path = _get_db_path(db_path)
@@ -256,8 +257,8 @@ class MemoryServer:
     """MCP server for persistent memory management."""
 
     def __init__(self, sqlite_db_path: str | None = None) -> None:
-        self.sqlite_conn = None
-        self.sync_engine = None
+        self.sqlite_conn: sqlite3.Connection | None = None
+        self.sync_engine: Any = None
 
         if SQLITE_ONLY or HYBRID_MODE:
             self.sqlite_conn, resolved_path = _init_sqlite(sqlite_db_path)
@@ -385,7 +386,8 @@ class MemoryServer:
 
         # SQLite-only or Hybrid: delete from local SQLite
         # In hybrid mode, also try to sync delete to server
-        if HYBRID_MODE and self.sync_engine:
+        server_id: int | None = None
+        if HYBRID_MODE and self.sync_engine and self.sqlite_conn:
             cursor = self.sqlite_conn.cursor()
             cursor.execute("SELECT server_id FROM memories WHERE id = ?", (memory_id,))
             row = cursor.fetchone()
@@ -418,9 +420,10 @@ class MemoryServer:
 
     # ── SQLite methods ──────────────────────────────────────────────
 
-    def _sqlite_store(self, content, category, tags, importance, expanded_keywords, force_sensitive=False):
+    def _sqlite_store(self, content: str, category: str, tags: str, importance: float, expanded_keywords: str, force_sensitive: bool = False) -> str:
         from datetime import datetime, timezone
 
+        assert self.sqlite_conn is not None
         now = datetime.now(timezone.utc).isoformat()
         is_sensitive = 1 if force_sensitive else 0
         cursor = self.sqlite_conn.cursor()
@@ -431,9 +434,8 @@ class MemoryServer:
         self.sqlite_conn.commit()
         return f"Stored memory #{cursor.lastrowid} in category '{category}' with importance {importance:.1f}"
 
-    def _sqlite_recall(self, context, expanded_query, category, sort_by, limit):
-        import sqlite3
-
+    def _sqlite_recall(self, context: str, expanded_query: str, category: str | None, sort_by: str, limit: int) -> str:
+        assert self.sqlite_conn is not None
         all_terms = f"{context} {expanded_query}".strip()
         words = [w.replace(chr(34), "") for w in all_terms.split() if w]
         and_query = " AND ".join(f'"{w}"' for w in words)
@@ -452,6 +454,7 @@ class MemoryServer:
             "FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
         )
         cursor = self.sqlite_conn.cursor()
+        rows: list[Any] = []
         try:
             # Try AND first for precise matches, fall back to OR for broader results
             cat_filter = "AND m.category = ?" if category else ""
@@ -494,7 +497,8 @@ class MemoryServer:
             + "\n\n".join(results)
         )
 
-    def _sqlite_list(self, category, limit):
+    def _sqlite_list(self, category: str | None, limit: int) -> str:
+        assert self.sqlite_conn is not None
         cursor = self.sqlite_conn.cursor()
         if category:
             cursor.execute(
@@ -521,7 +525,8 @@ class MemoryServer:
         header = "Recent memories" + (f" in '{category}'" if category else "")
         return header + f" ({len(rows)} shown):\n\n" + "\n\n".join(results)
 
-    def _sqlite_delete(self, memory_id):
+    def _sqlite_delete(self, memory_id: int) -> str:
+        assert self.sqlite_conn is not None
         cursor = self.sqlite_conn.cursor()
         cursor.execute("SELECT id, content FROM memories WHERE id = ?", (memory_id,))
         row = cursor.fetchone()
@@ -532,7 +537,8 @@ class MemoryServer:
         self.sqlite_conn.commit()
         return f"Deleted memory #{memory_id}: {preview}..."
 
-    def _sqlite_secret_get(self, memory_id):
+    def _sqlite_secret_get(self, memory_id: int) -> str:
+        assert self.sqlite_conn is not None
         cursor = self.sqlite_conn.cursor()
         cursor.execute(
             "SELECT id, content, category, is_sensitive FROM memories WHERE id = ?",
@@ -558,8 +564,8 @@ class MemoryServer:
         return {"tools": TOOLS}
 
     def handle_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
+        tool_name: str = params.get("name", "")
+        arguments: dict[str, Any] = params.get("arguments", {})
         try:
             handler = {
                 "memory_store": self.memory_store,
