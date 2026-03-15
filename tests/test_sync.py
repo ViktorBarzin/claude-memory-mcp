@@ -287,7 +287,8 @@ class TestPullChanges:
             engine._pull_changes()
 
         call_args = mock_api.call_args
-        assert "since=2026-03-14T10:00:00+00:00" in call_args[0][1]
+        from urllib.parse import unquote
+        assert "since=2026-03-14T10:00:00+00:00" in unquote(call_args[0][1])
 
 
 class TestTrySyncStore:
