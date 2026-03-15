@@ -39,5 +39,5 @@ steps:
     depends_on:
       - build-and-push
     commands:
-      - kubectl rollout restart deployment/claude-memory -n claude-memory
+      - kubectl set image deployment/claude-memory claude-memory=viktorbarzin/claude-memory-mcp:${CI_PIPELINE_NUMBER} -n claude-memory
       - kubectl rollout status deployment/claude-memory -n claude-memory --timeout=120s
