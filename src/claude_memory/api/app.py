@@ -151,10 +151,13 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
 
     query_text = f"{body.context} {body.expanded_query}".strip()
 
-    order_clause = "ts_rank(search_vector, query) DESC"
+    # Hybrid scoring: blend ts_rank relevance (0-1) with importance (0-1)
+    hybrid_score = "(ts_rank(search_vector, query) * 0.7 + importance * 0.3)"
     if body.sort_by == "importance":
-        order_clause = "importance DESC, ts_rank(search_vector, query) DESC"
-    elif body.sort_by == "recency":
+        hybrid_score = "(ts_rank(search_vector, query) * 0.4 + importance * 0.6)"
+
+    order_clause = f"{hybrid_score} DESC"
+    if body.sort_by == "recency":
         order_clause = "created_at DESC"
 
     category_filter = ""
@@ -164,6 +167,8 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
         params.append(body.category)
 
     async with pool.acquire() as conn:
+        # Try AND-match first (plainto_tsquery ANDs by default), fall back to
+        # OR-match via individual word disjunction for broader results
         rows = await conn.fetch(
             f"""
             SELECT id, content, category, tags, importance, is_sensitive,
@@ -179,6 +184,35 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             """,
             *params,
         )
+
+        # If AND-match returned too few results, broaden to OR-match
+        if len(rows) < body.limit and query_text:
+            words = query_text.split()
+            if len(words) > 1:
+                or_tsquery = " | ".join(w for w in words if w)
+                or_params: list = [user.user_id, or_tsquery, body.limit]
+                or_cat_filter = ""
+                if body.category:
+                    or_cat_filter = "AND category = $4"
+                    or_params.append(body.category)
+                seen_ids = {r["id"] for r in rows}
+                or_rows = await conn.fetch(
+                    f"""
+                    SELECT id, content, category, tags, importance, is_sensitive,
+                           ts_rank(search_vector, query) AS rank,
+                           created_at, updated_at
+                    FROM memories, to_tsquery('english', $2) query
+                    WHERE user_id = $1
+                      AND deleted_at IS NULL
+                      AND search_vector @@ query
+                      {or_cat_filter}
+                    ORDER BY {order_clause}
+                    LIMIT $3
+                    """,
+                    *or_params,
+                )
+                rows = list(rows) + [r for r in or_rows if r["id"] not in seen_ids]
+                rows = rows[:body.limit]
 
     results = []
     for row in rows:

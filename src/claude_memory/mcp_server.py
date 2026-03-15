@@ -435,30 +435,35 @@ class MemoryServer:
         import sqlite3
 
         all_terms = f"{context} {expanded_query}".strip()
-        words = all_terms.split()
-        fts_query = " OR ".join(f'"{w.replace(chr(34), "")}"' for w in words if w)
+        words = [w.replace(chr(34), "") for w in all_terms.split() if w]
+        and_query = " AND ".join(f'"{w}"' for w in words)
+        or_query = " OR ".join(f'"{w}"' for w in words)
+
+        # Hybrid scoring: blend BM25 relevance with importance
+        # bm25() returns negative values (lower = better match), so negate it
         order = (
-            "bm25(memories_fts), m.importance DESC"
+            "(-bm25(memories_fts) * 0.7 + m.importance * 0.3) DESC"
             if sort_by == "relevance"
-            else "m.importance DESC, m.created_at DESC"
+            else "(-bm25(memories_fts) * 0.4 + m.importance * 0.6) DESC"
+        )
+
+        base_select = (
+            f"SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
+            f"FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
         )
         cursor = self.sqlite_conn.cursor()
         try:
-            if category:
+            # Try AND first for precise matches, fall back to OR for broader results
+            cat_filter = "AND m.category = ?" if category else ""
+            for fts_query in (and_query, or_query):
+                params = [fts_query, category, limit] if category else [fts_query, limit]
                 cursor.execute(
-                    f"SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
-                    f"FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
-                    f"WHERE memories_fts MATCH ? AND m.category = ? ORDER BY {order} LIMIT ?",
-                    (fts_query, category, limit),
+                    f"{base_select}WHERE memories_fts MATCH ? {cat_filter} ORDER BY {order} LIMIT ?",
+                    tuple(p for p in params if p is not None),
                 )
-            else:
-                cursor.execute(
-                    f"SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
-                    f"FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
-                    f"WHERE memories_fts MATCH ? ORDER BY {order} LIMIT ?",
-                    (fts_query, limit),
-                )
-            rows = cursor.fetchall()
+                rows = cursor.fetchall()
+                if rows:
+                    break
         except sqlite3.OperationalError:
             like = f"%{context}%"
             if category:
