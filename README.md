@@ -44,6 +44,7 @@ Claude has direct access to these tools during conversation:
 | `memory_list` | List recent memories, optionally filtered by category |
 | `memory_delete` | Delete a memory by ID |
 | `secret_get` | Retrieve the decrypted content of a sensitive memory |
+| `memory_count` | Get memory counts by category and sync status diagnostics |
 
 ### Memory Categories
 Memories are organized into: `facts`, `preferences`, `projects`, `people`, `decisions`
@@ -63,6 +64,7 @@ Claude Code Session
 │  │ compaction       │        │ memory_list        │  │
 │  │ auto-approve     │        │ memory_delete      │  │
 │  └──────────────────┘        │ secret_get         │  │
+│                              │ memory_count       │  │
 │                              └─────────┬──────────┘  │
 │                                        │             │
 │              ┌─────────────────────────┼──────────┐  │
@@ -88,6 +90,17 @@ Claude Code Session
                      │  (authoritative)      │
                      └──────────────────────┘
 ```
+
+### Sync Resilience
+
+The SyncEngine is designed to handle failures gracefully:
+
+- **Decoupled push/pull** — push failures never block pull. Remote changes from other agents always flow in.
+- **Auth failure detection** — on 401/403, the engine sets an auth-failed flag, logs a clear warning, and degrades to SQLite-only mode. A periodic health check detects when auth is restored.
+- **Startup full resync** — on MCP server start, a full cache replacement runs to catch drift from other agents, deleted records, and schema changes.
+- **Periodic full resync** — every ~10 minutes, a full resync replaces incremental sync to catch any drift.
+- **Retry cap** — individual pending ops are retried up to 5 times, then permanently skipped to prevent queue buildup.
+- **Orphan reconciliation** — local records that never synced are deduplicated against server content before push.
 
 ## Search Algorithm
 
@@ -258,7 +271,7 @@ export MEMORY_API_KEY="your-api-key"
 
 ### Option 2: Manual MCP Config
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude.json` under `mcpServers`:
 
 ```json
 {
@@ -266,8 +279,9 @@ Add to `~/.claude/settings.json`:
     "claude_memory": {
       "type": "stdio",
       "command": "python3",
-      "args": ["-m", "claude_memory.mcp_server"],
+      "args": ["/path/to/claude-memory-mcp/src/claude_memory/mcp_server.py"],
       "env": {
+        "PYTHONPATH": "/path/to/claude-memory-mcp/src",
         "MEMORY_API_URL": "https://your-server.example.com",
         "MEMORY_API_KEY": "your-api-key"
       }
@@ -276,7 +290,7 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-Omit the `env` block for SQLite-only mode. Requires `pip install claude-memory-mcp`.
+Omit `MEMORY_API_URL` and `MEMORY_API_KEY` for SQLite-only mode.
 
 ### Verify
 
@@ -394,7 +408,7 @@ The auto-learn hook runs asynchronously after each Claude response. It operates 
 
 **Judge fallback chain:** Claude CLI (haiku model) → local Ollama (qwen2.5:3b/llama3.2:3b/gemma2:2b/phi3:mini) → heuristic pattern matching (keyword-based extraction from user messages).
 
-Extracted events are deduplicated via SHA-256 content hashing. Each event is stored to both the MCP memory database and a `~/.claude/projects/<project>/memory/auto-learned.md` markdown file.
+Extracted events are deduplicated via SHA-256 content hashing. Each event is stored to the MCP memory database.
 
 ### Debug
 
@@ -422,7 +436,8 @@ In hybrid mode, a `SyncEngine` runs in a daemon thread with its own SQLite conne
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check |
+| `/health` | GET | Health check (unauthenticated) |
+| `/api/auth-check` | GET | Validate API key without side effects |
 | `/api/memories` | POST | Store a memory |
 | `/api/memories` | GET | List memories (`?category=facts&limit=20`) |
 | `/api/memories/recall` | POST | Search memories by context and expanded query |
@@ -463,6 +478,8 @@ Aliases `CLAUDE_MEMORY_API_URL` and `CLAUDE_MEMORY_API_KEY` are also supported.
 
 ## Database Migrations
 
+### PostgreSQL (API Server)
+
 Migrations run automatically on API server startup. To run manually:
 
 ```bash
@@ -477,7 +494,23 @@ Three migrations:
 
 All migrations are idempotent (check column/table existence before altering).
 
+### SQLite (MCP Client)
+
+SQLite schema is versioned via `PRAGMA user_version` and migrated automatically on startup. Current version: **2**.
+
+| Version | Migration |
+|---------|-----------|
+| 1 | Add `server_id` column to `memories` table |
+| 2 | Add `retry_count` column to `pending_ops` table |
+
 ## Development
+
+### Prerequisites
+
+- Python 3.11+
+- For API server tests: `httpx`, `pytest-asyncio`
+
+### Quick Start
 
 ```bash
 git clone https://github.com/ViktorBarzin/claude-memory-mcp.git
@@ -485,12 +518,65 @@ cd claude-memory-mcp
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[api,dev]"
+```
+
+### Running Tests
+
+```bash
+# All tests
 pytest tests/ -v
+
+# Individual test suites
+pytest tests/test_sync.py -v          # SyncEngine (client-side sync resilience)
+pytest tests/test_mcp_server.py -v    # MCP server (SQLite, tools, protocol)
+pytest tests/test_api.py -v           # API server (FastAPI endpoints)
+
+# Linting
 ruff check src/ tests/
 mypy src/claude_memory/ --strict
 ```
 
 The MCP server itself (`mcp_server.py` and `sync.py`) uses **stdlib only** — no pip install needed on the client side. The `[api]` extra adds FastAPI, asyncpg, uvicorn, etc. for the server.
+
+### Test Structure
+
+| File | Tests | What it covers |
+|------|-------|---------------|
+| `test_sync.py` | SyncEngine unit tests | Push/pull, auth failure handling, retry caps, full resync, orphan reconciliation, decoupled push/pull, diagnostics |
+| `test_mcp_server.py` | MCP server unit tests | SQLite CRUD, FTS search, tool dispatch, MCP protocol, memory_count, schema migration |
+| `test_api.py` | API server integration tests | All REST endpoints, auth, user isolation, soft delete, sync, secrets, import |
+| `test_auth.py` | Auth module tests | Single/multi-user auth, key mapping |
+| `test_credential_detector.py` | Credential detection | Pattern matching for secrets |
+| `test_crypto.py` | Encryption tests | AES-256 encrypt/decrypt |
+| `test_vault_client.py` | Vault integration | Secret storage/retrieval |
+
+### Project Structure
+
+```
+claude-memory-mcp/
+├── src/claude_memory/
+│   ├── mcp_server.py          # MCP server entry point (stdio NDJSON)
+│   ├── sync.py                # Background sync engine (SQLite ↔ API)
+│   ├── credential_detector.py # Sensitive content detection
+│   └── api/
+│       ├── app.py             # FastAPI application
+│       ├── auth.py            # API key authentication
+│       ├── database.py        # asyncpg connection pool
+│       ├── models.py          # Pydantic models
+│       └── vault_service.py   # HashiCorp Vault integration
+├── tests/                     # pytest test suite
+├── hooks/                     # Claude Code hooks (auto-recall, auto-learn, etc.)
+├── docker/                    # Docker Compose for API server + PostgreSQL
+├── deploy/                    # Kubernetes manifests and Helm chart
+└── pyproject.toml             # Package config (hatchling)
+```
+
+### Key Design Decisions
+
+- **stdlib-only MCP server**: The MCP server (`mcp_server.py`, `sync.py`) uses only Python stdlib — no pip install required for the client side. This ensures it works in any Claude Code environment without dependency management.
+- **NDJSON transport**: Claude Code uses NDJSON (one JSON per line) for stdio MCP, not Content-Length framing.
+- **Non-blocking startup**: MCP server startup must complete in ~15s or Claude Code times out. All network calls are deferred to background threads.
+- **Suppress stderr**: Any stderr output during MCP startup causes Claude Code to reject the server.
 
 ## License
 

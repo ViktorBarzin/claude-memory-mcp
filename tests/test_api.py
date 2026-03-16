@@ -100,6 +100,20 @@ async def test_health_endpoint_no_auth(client):
 
 
 @pytest.mark.asyncio
+async def test_auth_check_endpoint(client):
+    ac, conn, app_mod = client
+    async with ac:
+        resp = await ac.get(
+            "/api/auth-check",
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["user_id"] == "testuser"
+
+
+@pytest.mark.asyncio
 async def test_store_memory_creates_record_with_user_id(client):
     ac, conn, app_mod = client
     conn.fetchrow.return_value = _make_memory_row(id=42, category="facts", importance=0.7)

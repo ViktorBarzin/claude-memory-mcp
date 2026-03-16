@@ -12,7 +12,7 @@ haiku to detect learnings worth persisting:
 Features:
   - Multi-turn context window (last 5 exchanges by default)
   - State tracking to avoid duplicate extraction
-  - Writes to memory API/SQLite AND auto-memory markdown files
+  - Writes to memory API/SQLite only
   - Throttled deep extraction: full window every ~5 turns, single-turn otherwise
 
 Runs with async: true — does NOT block the user.
@@ -252,36 +252,6 @@ def _store_via_sqlite(content, category, tags, importance, expanded_keywords):
     conn.close()
 
 
-def _append_to_auto_memory(content: str, event_type: str) -> None:
-    """Append a learning to the auto-memory markdown file for the current project."""
-    # Find the project memory directory based on CWD
-    cwd = os.getcwd()
-    # Claude Code stores project memory at ~/.claude/projects/<escaped-path>/memory/
-    escaped = cwd.replace("/", "-")
-    if escaped.startswith("-"):
-        escaped = escaped[1:]  # Remove leading dash
-    memory_dir = Path.home() / ".claude" / "projects" / f"-{escaped}" / "memory"
-
-    if not memory_dir.exists():
-        # Try without the leading dash
-        memory_dir = Path.home() / ".claude" / "projects" / escaped / "memory"
-
-    if not memory_dir.exists():
-        return
-
-    auto_learn_file = memory_dir / "auto-learned.md"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    header = "# Auto-Learned Knowledge\n\nAutomatically extracted by the auto-learn hook. Review periodically and promote valuable entries to MEMORY.md.\n\n"
-
-    if not auto_learn_file.exists():
-        auto_learn_file.write_text(header)
-
-    # Append the new learning
-    with open(auto_learn_file, "a") as f:
-        f.write(f"- [{now}] **{event_type}**: {content}\n")
-
-
 def _parse_llm_response(response_text: str) -> list[dict]:
     """Parse LLM response text into events list."""
     response_text = response_text.strip()
@@ -482,12 +452,6 @@ def _store_events(events: list[dict], extracted_hashes: list[str]) -> list[str]:
                 _store_via_api(content, category, tags, importance, expanded_keywords)
             else:
                 _store_via_sqlite(content, category, tags, importance, expanded_keywords)
-        except Exception:
-            pass
-
-        # Also append to auto-memory markdown
-        try:
-            _append_to_auto_memory(content, event_type)
         except Exception:
             pass
 

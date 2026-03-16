@@ -59,6 +59,12 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/auth-check")
+async def auth_check(user: AuthUser = Depends(get_current_user)) -> dict[str, str]:
+    """Validate API key without doing any real work."""
+    return {"status": "ok", "user_id": user.user_id}
+
+
 @app.get("/api/memories/sync", response_model=SyncResponse)
 async def sync_memories(
     since: Optional[str] = None,

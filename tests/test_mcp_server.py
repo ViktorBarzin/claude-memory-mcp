@@ -238,9 +238,9 @@ class TestMCPProtocol:
     def test_handle_tools_list(self, server):
         result = server.handle_tools_list({})
         tools = result["tools"]
-        assert len(tools) == 5
+        assert len(tools) == 6
         names = {t["name"] for t in tools}
-        assert names == {"memory_store", "memory_recall", "memory_list", "memory_delete", "secret_get"}
+        assert names == {"memory_store", "memory_recall", "memory_list", "memory_delete", "secret_get", "memory_count"}
 
     def test_handle_tools_call_store(self, server):
         result = server.handle_tools_call({
@@ -291,7 +291,7 @@ class TestProcessMessage:
             "params": {},
         })
         assert "result" in response
-        assert len(response["result"]["tools"]) == 5
+        assert len(response["result"]["tools"]) == 6
 
     def test_tools_call(self, server):
         response = server.process_message({
@@ -340,3 +340,71 @@ class TestProcessMessage:
         parsed = json.loads(serialized)
         assert parsed["jsonrpc"] == "2.0"
         assert parsed["id"] == 5
+
+
+class TestMemoryCount:
+    def test_count_empty(self, server):
+        result = server.memory_count({})
+        assert "0" in result
+
+    def test_count_after_store(self, server):
+        server.memory_store({
+            "content": "test memory",
+            "expanded_keywords": "test memory keywords data",
+        })
+        result = server.memory_count({})
+        assert "1" in result
+        assert "facts" in result
+
+    def test_count_multiple_categories(self, server):
+        server.memory_store({
+            "content": "a fact",
+            "category": "facts",
+            "expanded_keywords": "fact test data words",
+        })
+        server.memory_store({
+            "content": "a preference",
+            "category": "preferences",
+            "expanded_keywords": "preference test data words",
+        })
+        result = server.memory_count({})
+        assert "facts: 1" in result
+        assert "preferences: 1" in result
+
+    def test_count_via_tools_call(self, server):
+        result = server.handle_tools_call({
+            "name": "memory_count",
+            "arguments": {},
+        })
+        assert not result.get("isError", False)
+        assert "0" in result["content"][0]["text"]
+
+
+class TestSchemaMigration:
+    def test_schema_version_set(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        srv = MemoryServer(sqlite_db_path=db_path)
+        cursor = srv.sqlite_conn.cursor()
+        version = cursor.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 2
+        srv.sqlite_conn.close()
+
+    def test_migration_idempotent(self, tmp_path):
+        """Running _init_sqlite twice should not error."""
+        from claude_memory.mcp_server import _init_sqlite
+        db_path = str(tmp_path / "test.db")
+        conn1, _ = _init_sqlite(db_path)
+        conn1.close()
+        conn2, _ = _init_sqlite(db_path)
+        version = conn2.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 2
+        conn2.close()
+
+    def test_server_id_column_exists(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        srv = MemoryServer(sqlite_db_path=db_path)
+        cursor = srv.sqlite_conn.cursor()
+        cursor.execute("PRAGMA table_info(memories)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        assert "server_id" in columns
+        srv.sqlite_conn.close()

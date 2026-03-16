@@ -86,6 +86,41 @@ def _get_db_path(db_path: str | None = None) -> str:
     return resolved
 
 
+SCHEMA_VERSION = 2
+
+
+def _migrate_sqlite(conn: sqlite3.Connection) -> None:
+    """Version-based SQLite schema migrations."""
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current < 1:
+        # Add server_id column for hybrid mode sync
+        cursor = conn.execute("PRAGMA table_info(memories)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if "server_id" not in columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN server_id INTEGER")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_server_id ON memories(server_id)"
+            )
+    if current < 2:
+        # Ensure pending_ops has retry_count (sync.py also handles this, but belt-and-suspenders)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                retry_count INTEGER DEFAULT 0
+            )
+        """)
+        # Add retry_count if pending_ops already exists without it
+        cursor = conn.execute("PRAGMA table_info(pending_ops)")
+        po_columns = {row["name"] for row in cursor.fetchall()}
+        if "retry_count" not in po_columns:
+            conn.execute("ALTER TABLE pending_ops ADD COLUMN retry_count INTEGER DEFAULT 0")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
 def _init_sqlite(db_path: str | None = None) -> tuple[sqlite3.Connection, str]:
     """Initialize SQLite database."""
     from pathlib import Path
@@ -111,14 +146,8 @@ def _init_sqlite(db_path: str | None = None) -> tuple[sqlite3.Connection, str]:
             updated_at TEXT NOT NULL
         )
     """)
-    # Add server_id column if missing (for hybrid mode sync)
-    cursor.execute("PRAGMA table_info(memories)")
-    columns = {row["name"] for row in cursor.fetchall()}
-    if "server_id" not in columns:
-        cursor.execute("ALTER TABLE memories ADD COLUMN server_id INTEGER")
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_server_id ON memories(server_id)"
-        )
+    # Version-based schema migrations
+    _migrate_sqlite(conn)
 
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -248,6 +277,14 @@ TOOLS = [
                 "id": {"type": "integer", "description": "The ID of the sensitive memory to retrieve"},
             },
             "required": ["id"],
+        },
+    },
+    {
+        "name": "memory_count",
+        "description": "Get memory counts by category from local cache and sync status. Useful for diagnostics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
 ]
@@ -418,6 +455,32 @@ class MemoryServer:
 
         return self._sqlite_secret_get(memory_id)
 
+    def memory_count(self, args: dict[str, Any]) -> str:
+        if self.sync_engine:
+            counts = self.sync_engine.get_counts()
+            lines = [f"Local memories: {counts['total']}"]
+            for cat, n in counts["by_category"].items():
+                lines.append(f"  {cat}: {n}")
+            lines.append(f"Orphans (no server_id): {counts['orphans_no_server_id']}")
+            lines.append(f"Pending ops: {counts['pending_ops']}")
+            lines.append(f"Last sync: {counts['last_sync_ts'] or 'never'}")
+            lines.append(f"Auth failed: {counts['auth_failed']}")
+            lines.append(f"Last sync success: {counts['last_sync_success']}")
+            return "\n".join(lines)
+
+        if self.sqlite_conn:
+            cursor = self.sqlite_conn.cursor()
+            cursor.execute("SELECT COUNT(*) as c FROM memories")
+            total = cursor.fetchone()["c"]
+            cursor.execute("SELECT category, COUNT(*) as c FROM memories GROUP BY category ORDER BY c DESC")
+            by_cat = cursor.fetchall()
+            lines = [f"Local memories (SQLite-only): {total}"]
+            for row in by_cat:
+                lines.append(f"  {row['category']}: {row['c']}")
+            return "\n".join(lines)
+
+        return "No storage available"
+
     # ── SQLite methods ──────────────────────────────────────────────
 
     def _sqlite_store(self, content: str, category: str, tags: str, importance: float, expanded_keywords: str, force_sensitive: bool = False) -> str:
@@ -573,6 +636,7 @@ class MemoryServer:
                 "memory_list": self.memory_list,
                 "memory_delete": self.memory_delete,
                 "secret_get": self.secret_get,
+                "memory_count": self.memory_count,
             }.get(tool_name)
             if handler is None:
                 return {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True}
