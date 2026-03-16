@@ -8,7 +8,7 @@ steps:
       - "[ -n \"$IMAGE_TAG\" ] || (echo 'IMAGE_TAG not set, skipping deploy'; exit 78)"
 
   - name: deploy
-    image: bitnami/kubectl:1.32
+    image: bitnami/kubectl:latest
     commands:
       - "kubectl set image deployment/claude-memory claude-memory=${IMAGE_NAME}:${IMAGE_TAG} -n claude-memory"
       - "kubectl rollout status deployment/claude-memory -n claude-memory --timeout=300s"
