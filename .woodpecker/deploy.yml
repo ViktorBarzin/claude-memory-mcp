@@ -10,8 +10,8 @@ steps:
   - name: deploy
     image: bitnami/kubectl:1.32
     commands:
-      - kubectl set image deployment/claude-memory claude-memory=${IMAGE_NAME}:${IMAGE_TAG} -n claude-memory
-      - kubectl rollout status deployment/claude-memory -n claude-memory --timeout=300s
+      - "kubectl set image deployment/claude-memory claude-memory=${IMAGE_NAME}:${IMAGE_TAG} -n claude-memory"
+      - "kubectl rollout status deployment/claude-memory -n claude-memory --timeout=300s"
 
   - name: notify
     image: woodpeckerci/plugin-slack

@@ -58,7 +58,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-              "https://ci.viktorbarzin.me/api/repos/ViktorBarzin/claude-memory-mcp/pipelines" \
+              "https://ci.viktorbarzin.me/api/repos/78/pipelines" \
               -H "Authorization: Bearer ${{ secrets.WOODPECKER_TOKEN }}" \
               -H "Content-Type: application/json" \
               -d '{"branch":"main","variables":{"IMAGE_TAG":"${{ needs.build.outputs.image_tag }}","IMAGE_NAME":"viktorbarzin/${{ env.IMAGE_NAME }}"}}')
