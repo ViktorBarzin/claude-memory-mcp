@@ -1,5 +1,5 @@
 when:
-  - event: manual
+  - event: deployment
 
 clone:
   git:
