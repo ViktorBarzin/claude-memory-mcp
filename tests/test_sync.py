@@ -505,7 +505,7 @@ class TestRetryCount:
         engine._conn.commit()
 
         with patch.object(engine, "_api_request") as mock_api:
-            result = engine._push_pending_ops()
+            engine._push_pending_ops()
 
         # Op should be deleted (skipped), API never called
         cursor = engine._conn.execute("SELECT COUNT(*) as cnt FROM pending_ops")
