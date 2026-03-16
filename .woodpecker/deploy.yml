@@ -13,11 +13,3 @@ steps:
       - "kubectl set image deployment/claude-memory claude-memory=${IMAGE_NAME}:${IMAGE_TAG} -n claude-memory"
       - "kubectl rollout status deployment/claude-memory -n claude-memory --timeout=300s"
 
-  - name: notify
-    image: woodpeckerci/plugin-slack
-    settings:
-      webhook:
-        from_secret: slack-webhook-url
-      channel: general
-    when:
-      - status: [success, failure]
