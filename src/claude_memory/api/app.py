@@ -610,13 +610,14 @@ async def secret_get(key: str) -> str:
 
 # Auth middleware for /mcp/* routes
 class MCPAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
         if request.url.path.startswith("/mcp"):
             auth = request.headers.get("authorization", "")
             token = auth.removeprefix("Bearer ").strip()
             if not _resolve_user_from_token(token):
                 return Response(content="Unauthorized", status_code=401)
-        return await call_next(request)
+        response: Response = await call_next(request)
+        return response
 
 
 app.add_middleware(MCPAuthMiddleware)
