@@ -141,6 +141,44 @@ function graphComponent() {
 
       node.append('title').text(d => d.content ? d.content.substring(0, 60) : '');
 
+      // Node labels for high-importance memories
+      const labels = g.append('g')
+        .selectAll('text')
+        .data(nodes.filter(d => d.importance >= 0.7))
+        .join('text')
+        .attr('font-size', '10px')
+        .attr('fill', '#c4b8a8')
+        .attr('font-family', "'JetBrains Mono', monospace")
+        .attr('pointer-events', 'none')
+        .text(d => d.content ? d.content.substring(0, 25) + '\u2026' : '');
+
+      // Legend (appended to svg, not g, so it stays fixed during zoom/pan)
+      const legend = svg.append('g')
+        .attr('class', 'graph-legend')
+        .attr('transform', 'translate(16, 16)');
+
+      const cats = Object.entries(categoryColors);
+      cats.forEach(([cat, color], i) => {
+        const row = legend.append('g').attr('transform', `translate(0, ${i * 22})`);
+        row.append('circle').attr('r', 6).attr('cx', 6).attr('cy', 6).attr('fill', color);
+        row.append('text').attr('x', 18).attr('y', 10)
+          .attr('fill', '#c4b8a8')
+          .attr('font-size', '12px')
+          .attr('font-family', "'JetBrains Mono', monospace")
+          .text(cat);
+      });
+
+      // Semi-transparent background behind legend
+      const legendBBox = legend.node().getBBox();
+      legend.insert('rect', ':first-child')
+        .attr('x', legendBBox.x - 8)
+        .attr('y', legendBBox.y - 8)
+        .attr('width', legendBBox.width + 16)
+        .attr('height', legendBBox.height + 16)
+        .attr('rx', 6)
+        .attr('fill', '#1a1613')
+        .attr('fill-opacity', 0.85);
+
       simulation.on('tick', () => {
         link
           .attr('x1', d => d.source.x)
@@ -150,6 +188,9 @@ function graphComponent() {
         node
           .attr('cx', d => d.x)
           .attr('cy', d => d.y);
+        labels
+          .attr('x', d => d.x + 8 + d.importance * 15)
+          .attr('y', d => d.y + 4);
       });
     },
 

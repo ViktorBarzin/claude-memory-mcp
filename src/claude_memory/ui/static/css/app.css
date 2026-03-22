@@ -280,7 +280,7 @@ textarea.input-field {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: 8px;
-  min-height: 500px;
+  height: calc(100vh - 180px);
 }
 
 .graph-container svg {

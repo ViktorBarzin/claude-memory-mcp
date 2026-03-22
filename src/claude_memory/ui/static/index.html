@@ -479,11 +479,11 @@
           <span x-show="loading" class="spinner ml-2"></span>
         </div>
 
-        <div class="flex gap-4">
-          <div class="flex-1 graph-container" x-ref="graphContainer"></div>
+        <div class="relative">
+          <div class="graph-container" x-ref="graphContainer"></div>
 
           <template x-if="selectedNode">
-            <div class="node-detail w-80 shrink-0">
+            <div class="node-detail" style="position:absolute; top:1rem; right:1rem; width:20rem; z-index:10;">
               <div class="flex items-center gap-2 mb-2">
                 <span class="text-xs" style="color: var(--text-muted); font-family: 'JetBrains Mono', monospace">#<span x-text="selectedNode.id"></span></span>
                 <span class="badge badge-category" x-text="selectedNode.category"></span>
