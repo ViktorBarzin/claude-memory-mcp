@@ -45,6 +45,15 @@ Claude has direct access to these tools during conversation:
 | `memory_delete` | Delete a memory by ID |
 | `secret_get` | Retrieve the decrypted content of a sensitive memory |
 | `memory_count` | Get memory counts by category and sync status diagnostics |
+| `memory_share` | Share a memory with another user (read or write access) |
+| `memory_unshare` | Revoke sharing of a memory from a user |
+| `memory_share_tag` | Share all memories with a tag (live rule — future memories included) |
+| `memory_unshare_tag` | Revoke tag-based sharing |
+| `memory_update` | Update an existing memory's content, tags, or importance |
+| `memory_shared_with_me` | List memories others have shared with you |
+| `memory_my_shares` | List all sharing rules you've created |
+
+Sharing tools require an API connection (not available in SQLite-only mode).
 
 ### Memory Categories
 Memories are organized into: `facts`, `preferences`, `projects`, `people`, `decisions`
@@ -356,7 +365,24 @@ For team deployments, use `API_KEYS` with a JSON mapping:
 export API_KEYS='{"alice": "key-alice-xxx", "bob": "key-bob-yyy"}'
 ```
 
-Each user gets isolated memory storage. Users cannot see each other's memories.
+Each user gets isolated memory storage by default. Users can selectively share memories with each other.
+
+### Memory Sharing
+
+Users can share individual memories or entire tags with other users:
+
+```
+You: "share memory #42 with bob as read-only"
+You: "share all memories tagged 'infra' with alice with write access"
+```
+
+**Individual shares** grant access to a specific memory. **Tag shares** are live rules — any future memory with that tag is automatically visible to the target user.
+
+**Permission levels:**
+- `read` — can see the memory in recall results
+- `write` — can also update the memory's content, tags, and importance
+
+Only the owner can delete a memory, even if others have write access. Shared memories appear in `memory_recall` results with `shared_by` and `share_permission` fields.
 
 **Adding a user:**
 1. Generate a key: `openssl rand -base64 32`
@@ -441,7 +467,14 @@ In hybrid mode, a `SyncEngine` runs in a daemon thread with its own SQLite conne
 | `/api/memories` | POST | Store a memory |
 | `/api/memories` | GET | List memories (`?category=facts&limit=20`) |
 | `/api/memories/recall` | POST | Search memories by context and expanded query |
-| `/api/memories/{id}` | DELETE | Soft-delete a memory |
+| `/api/memories/{id}` | PUT | Update a memory (owner or write-shared user) |
+| `/api/memories/{id}` | DELETE | Soft-delete a memory (owner only) |
+| `/api/memories/{id}/share` | POST | Share a memory with a user |
+| `/api/memories/{id}/share/{user_id}` | DELETE | Revoke sharing from a user |
+| `/api/memories/share-tag` | POST | Share all memories with a tag |
+| `/api/memories/share-tag` | DELETE | Revoke tag-based sharing |
+| `/api/memories/shared-with-me` | GET | List memories shared with current user |
+| `/api/memories/my-shares` | GET | List sharing rules created by current user |
 | `/api/memories/sync` | GET | Incremental sync (`?since=ISO-timestamp`) |
 | `/api/memories/{id}/secret` | POST | Get decrypted sensitive memory content |
 | `/api/memories/migrate-secrets` | POST | Re-encrypt existing secrets with current Vault config |
@@ -487,10 +520,11 @@ export DATABASE_URL="postgresql://user:pass@localhost:5432/claude_memory"
 alembic upgrade head
 ```
 
-Three migrations:
+Four migrations:
 1. `001` — Creates `memories` table with generated `tsvector` column and GIN index
 2. `002` — Adds `user_id` (multi-user), `is_sensitive`, `vault_path`, `encrypted_content`
 3. `003` — Adds `deleted_at` (soft delete) and `updated_at` index for incremental sync
+4. `004` — Adds `memory_shares` and `tag_shares` tables for multi-user sharing
 
 All migrations are idempotent (check column/table existence before altering).
 
@@ -563,6 +597,7 @@ claude-memory-mcp/
 │       ├── auth.py            # API key authentication
 │       ├── database.py        # asyncpg connection pool
 │       ├── models.py          # Pydantic models
+│       ├── permissions.py     # Sharing permission checks
 │       └── vault_service.py   # HashiCorp Vault integration
 ├── tests/                     # pytest test suite
 ├── hooks/                     # Claude Code hooks (auto-recall, auto-learn, etc.)
