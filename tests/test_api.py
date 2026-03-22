@@ -37,6 +37,8 @@ def _make_memory_row(**overrides):
         "created_at": now,
         "updated_at": now,
         "deleted_at": None,
+        "shared_by": None,
+        "share_permission": None,
     }
     defaults.update(overrides)
     return MockRow(defaults)
@@ -139,8 +141,12 @@ async def test_store_memory_creates_record_with_user_id(client):
 @pytest.mark.asyncio
 async def test_recall_returns_only_user_memories(client):
     ac, conn, app_mod = client
-    conn.fetch.return_value = [
-        _make_memory_row(id=1, content="user memory", is_sensitive=False),
+    # recall calls fetch 3 times: own, shared, tag-shared; plus OR-fallback if < limit
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1, content="user memory", is_sensitive=False)],  # own
+        [],  # individually shared
+        [],  # tag-shared
+        [],  # OR-match fallback
     ]
 
     async with ac:
@@ -164,8 +170,10 @@ async def test_recall_returns_only_user_memories(client):
 @pytest.mark.asyncio
 async def test_recall_redacts_sensitive_memories(client):
     ac, conn, app_mod = client
-    conn.fetch.return_value = [
-        _make_memory_row(id=5, content="[REDACTED]", is_sensitive=True),
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=5, content="[REDACTED]", is_sensitive=True)],  # own
+        [],  # individually shared
+        [],  # tag-shared
     ]
 
     async with ac:
