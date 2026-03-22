@@ -18,7 +18,7 @@ function graphComponent() {
         this.memories = memData.memories;
         this.categories = catData.categories;
         this.categories.forEach(c => this.selectedCategories[c] = true);
-        this.$nextTick(() => this.render());
+        setTimeout(() => this.render(), 100);
       } catch (e) {
         console.error('Failed to load graph data:', e);
       }
@@ -45,7 +45,7 @@ function graphComponent() {
       const memories = this.getFilteredMemories().slice(0, 300);
       if (memories.length === 0) return;
 
-      const width = container.clientWidth;
+      const width = container.clientWidth || container.parentElement?.clientWidth || 800;
       const height = container.clientHeight || 500;
 
       // Build nodes and tag-based edges
