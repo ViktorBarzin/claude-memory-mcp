@@ -15,9 +15,17 @@ function memoriesBrowser() {
     sharesExpanded: null,
     sharesData: [],
     deleteConfirm: null,
+    // Add memory
+    showAddForm: false,
+    addForm: { content: '', category: 'facts', tags: '', importance: 0.5 },
+    // Share memory
+    allUsers: [],
+    showShareForm: null,
+    shareForm: { user: '', permission: 'read' },
+    shareUserFilter: '',
 
     async init() {
-      await Promise.all([this.loadMemories(), this.loadShared(), this.loadCategories()]);
+      await Promise.all([this.loadMemories(), this.loadShared(), this.loadCategories(), this.loadUsers()]);
     },
 
     async loadCategories() {
@@ -25,6 +33,13 @@ function memoriesBrowser() {
         const data = await api.get('/api/categories');
         this.categories = data.categories;
       } catch (e) { console.error('Failed to load categories:', e); }
+    },
+
+    async loadUsers() {
+      try {
+        const data = await api.get('/api/users');
+        this.allUsers = data.users;
+      } catch (e) { console.error('Failed to load users:', e); }
     },
 
     async loadMemories() {
@@ -68,6 +83,7 @@ function memoriesBrowser() {
       this.expandedId = this.expandedId === id ? null : id;
       this.editingId = null;
       this.sharesExpanded = null;
+      this.showShareForm = null;
     },
 
     startEdit(mem) {
@@ -123,6 +139,72 @@ function memoriesBrowser() {
         this.sharesData = data.memory_shares.filter(s => s.memory_id === memId);
         this.sharesExpanded = memId;
       } catch (e) { console.error('Failed to load shares:', e); }
+    },
+
+    // Add memory
+    resetAddForm() {
+      this.addForm = { content: '', category: 'facts', tags: '', importance: 0.5 };
+      this.showAddForm = false;
+    },
+
+    get addFormCharCount() {
+      return (this.addForm.content || '').length;
+    },
+
+    async addMemory() {
+      if (!this.addForm.content.trim()) return;
+      try {
+        await api.post('/api/memories', {
+          content: this.addForm.content,
+          category: this.addForm.category,
+          tags: this.addForm.tags,
+          importance: parseFloat(this.addForm.importance),
+        });
+        this.resetAddForm();
+        this.offset = 0;
+        await Promise.all([this.loadMemories(), this.loadCategories()]);
+      } catch (e) {
+        alert('Failed to add memory: ' + e.message);
+      }
+    },
+
+    // Share memory
+    openShareForm(memId) {
+      this.showShareForm = memId;
+      this.shareForm = { user: '', permission: 'read' };
+      this.shareUserFilter = '';
+    },
+
+    closeShareForm() {
+      this.showShareForm = null;
+    },
+
+    get filteredUsers() {
+      const q = this.shareForm.user.toLowerCase();
+      if (!q) return this.allUsers.slice(0, 10);
+      return this.allUsers.filter(u => u.toLowerCase().includes(q));
+    },
+
+    selectShareUser(user) {
+      this.shareForm.user = user;
+    },
+
+    async shareMemory(memId) {
+      if (!this.shareForm.user.trim()) return;
+      try {
+        await api.post(`/api/memories/${memId}/share`, {
+          shared_with: this.shareForm.user,
+          permission: this.shareForm.permission,
+        });
+        this.closeShareForm();
+        // Refresh shares if expanded
+        if (this.sharesExpanded === memId) {
+          await this.toggleShares(memId);
+          await this.toggleShares(memId);
+        }
+      } catch (e) {
+        alert('Share failed: ' + e.message);
+      }
     },
 
     preview(content, len = 100) {

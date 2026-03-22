@@ -82,7 +82,7 @@ function graphComponent() {
       });
 
       const categoryColors = {};
-      const palette = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#ec4899', '#8b5cf6', '#14b8a6', '#f97316', '#64748b'];
+      const palette = ['#d4a04a', '#7a8b6f', '#c4785a', '#8b7355', '#6b8e8e', '#b8860b', '#9aad82', '#d4764a', '#7a6b55', '#5f8a8a'];
       this.categories.forEach((c, i) => categoryColors[c] = palette[i % palette.length]);
 
       const svg = d3.select(container)
@@ -110,8 +110,8 @@ function graphComponent() {
         .selectAll('line')
         .data(links)
         .join('line')
-        .attr('stroke', '#334155')
-        .attr('stroke-opacity', 0.4)
+        .attr('stroke', '#3a3228')
+        .attr('stroke-opacity', 0.5)
         .attr('stroke-width', 1);
 
       const node = g.append('g')
@@ -119,8 +119,8 @@ function graphComponent() {
         .data(nodes)
         .join('circle')
         .attr('r', d => 5 + d.importance * 15)
-        .attr('fill', d => categoryColors[d.category] || '#64748b')
-        .attr('stroke', '#1e293b')
+        .attr('fill', d => categoryColors[d.category] || '#8b7355')
+        .attr('stroke', '#252019')
         .attr('stroke-width', 1.5)
         .attr('cursor', 'pointer')
         .on('click', (event, d) => {

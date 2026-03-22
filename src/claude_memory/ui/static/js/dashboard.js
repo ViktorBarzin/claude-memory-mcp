@@ -9,7 +9,7 @@ function dashboardComponent() {
       this.loading = true;
       try {
         this.stats = await api.get('/api/stats');
-        this.$nextTick(() => this.renderCharts());
+        setTimeout(() => this.renderCharts(), 50);
       } catch (e) {
         console.error('Failed to load stats:', e);
       }
@@ -36,13 +36,13 @@ function dashboardComponent() {
         type: 'doughnut',
         data: {
           labels,
-          datasets: [{ data, backgroundColor: colors, borderColor: '#1e293b', borderWidth: 2 }],
+          datasets: [{ data, backgroundColor: colors, borderColor: '#252019', borderWidth: 2 }],
         },
         options: {
           responsive: true,
           maintainAspectRatio: false,
           plugins: {
-            legend: { position: 'bottom', labels: { color: '#94a3b8', padding: 12 } },
+            legend: { position: 'bottom', labels: { color: '#c4b8a8', padding: 12 } },
           },
         },
       });
@@ -63,7 +63,7 @@ function dashboardComponent() {
           datasets: [{
             label: 'Memories',
             data,
-            backgroundColor: '#6366f1',
+            backgroundColor: '#d4a04a',
             borderRadius: 4,
           }],
         },
@@ -71,8 +71,8 @@ function dashboardComponent() {
           responsive: true,
           maintainAspectRatio: false,
           scales: {
-            x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
-            y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' }, beginAtZero: true },
+            x: { ticks: { color: '#c4b8a8' }, grid: { color: '#3a3228' } },
+            y: { ticks: { color: '#c4b8a8' }, grid: { color: '#3a3228' }, beginAtZero: true },
           },
           plugins: { legend: { display: false } },
         },
@@ -97,16 +97,16 @@ function dashboardComponent() {
             {
               label: 'Created',
               data: created,
-              borderColor: '#22c55e',
-              backgroundColor: 'rgba(34,197,94,0.1)',
+              borderColor: '#7a8b6f',
+              backgroundColor: 'rgba(122,139,111,0.1)',
               fill: true,
               tension: 0.3,
             },
             {
               label: 'Updated',
               data: updated,
-              borderColor: '#f59e0b',
-              backgroundColor: 'rgba(245,158,11,0.1)',
+              borderColor: '#d4a04a',
+              backgroundColor: 'rgba(212,160,74,0.1)',
               fill: true,
               tension: 0.3,
             },
@@ -116,10 +116,10 @@ function dashboardComponent() {
           responsive: true,
           maintainAspectRatio: false,
           scales: {
-            x: { ticks: { color: '#94a3b8', maxTicksLimit: 10 }, grid: { color: '#334155' } },
-            y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' }, beginAtZero: true },
+            x: { ticks: { color: '#c4b8a8', maxTicksLimit: 10 }, grid: { color: '#3a3228' } },
+            y: { ticks: { color: '#c4b8a8' }, grid: { color: '#3a3228' }, beginAtZero: true },
           },
-          plugins: { legend: { labels: { color: '#94a3b8' } } },
+          plugins: { legend: { labels: { color: '#c4b8a8' } } },
         },
       });
     },
@@ -128,8 +128,8 @@ function dashboardComponent() {
 
 function generateColors(count) {
   const palette = [
-    '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4',
-    '#ec4899', '#8b5cf6', '#14b8a6', '#f97316', '#64748b',
+    '#d4a04a', '#7a8b6f', '#c4785a', '#8b7355', '#6b8e8e',
+    '#b8860b', '#9aad82', '#d4764a', '#7a6b55', '#5f8a8a',
   ];
   const result = [];
   for (let i = 0; i < count; i++) result.push(palette[i % palette.length]);

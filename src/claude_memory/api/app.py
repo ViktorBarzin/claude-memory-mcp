@@ -85,6 +85,13 @@ async def auth_check(user: AuthUser = Depends(get_current_user)) -> dict[str, st
     return {"status": "ok", "user_id": user.user_id}
 
 
+@app.get("/api/users")
+async def list_users(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Return list of known user IDs (excluding current user) for sharing typeahead."""
+    all_users = sorted(set(_key_to_user.values()))
+    return {"users": [u for u in all_users if u != user.user_id]}
+
+
 @app.get("/api/memories/sync", response_model=SyncResponse)
 async def sync_memories(
     since: Optional[str] = None,
