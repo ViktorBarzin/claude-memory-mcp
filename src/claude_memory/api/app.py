@@ -913,7 +913,7 @@ async def memory_recall(context: str, expanded_query: str = "",
 
         # Also fetch shared memories (individual + tag-based)
         shared_rows = await conn.fetch(
-            f"""
+            """
             SELECT DISTINCT ON (m.id) m.id, m.content, m.category, m.tags, m.importance,
                    m.is_sensitive, ts_rank(m.search_vector, query) AS rank,
                    m.created_at, m.updated_at, m.user_id AS shared_by
