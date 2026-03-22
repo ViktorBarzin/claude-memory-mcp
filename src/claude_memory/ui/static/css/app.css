@@ -285,6 +285,8 @@ textarea.input-field {
 
 .graph-container svg {
   display: block;
+  width: 100%;
+  height: 100%;
 }
 
 /* Node detail panel */

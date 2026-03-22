@@ -46,7 +46,7 @@ function graphComponent() {
       if (memories.length === 0) return;
 
       const width = container.clientWidth || container.parentElement?.clientWidth || 800;
-      const height = container.clientHeight || 500;
+      const height = Math.max(container.clientHeight, window.innerHeight - 180);
 
       // Build nodes and tag-based edges
       const nodes = memories.map(m => ({
