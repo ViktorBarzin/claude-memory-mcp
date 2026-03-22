@@ -1,6 +1,6 @@
 """Permission checking for shared memories."""
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 
 
 async def check_memory_permission(
