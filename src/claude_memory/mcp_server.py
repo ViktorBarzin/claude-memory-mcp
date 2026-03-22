@@ -289,6 +289,101 @@ TOOLS = [
     },
 ]
 
+# Sharing tools — only available in HTTP_ONLY or HYBRID modes (require API server)
+SHARING_TOOLS = [
+    {
+        "name": "memory_share",
+        "description": "Share a specific memory with another user, granting read or read+write access.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Memory ID to share"},
+                "shared_with": {"type": "string", "description": "User ID to share with"},
+                "permission": {
+                    "type": "string",
+                    "enum": ["read", "write"],
+                    "description": "Permission level",
+                    "default": "read",
+                },
+            },
+            "required": ["id", "shared_with"],
+        },
+    },
+    {
+        "name": "memory_unshare",
+        "description": "Revoke sharing of a memory from a user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Memory ID to unshare"},
+                "shared_with": {"type": "string", "description": "User ID to revoke access from"},
+            },
+            "required": ["id", "shared_with"],
+        },
+    },
+    {
+        "name": "memory_share_tag",
+        "description": "Share all memories with a given tag with another user. Future memories with this tag are automatically shared.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string", "description": "Tag to share"},
+                "shared_with": {"type": "string", "description": "User ID to share with"},
+                "permission": {
+                    "type": "string",
+                    "enum": ["read", "write"],
+                    "description": "Permission level",
+                    "default": "read",
+                },
+            },
+            "required": ["tag", "shared_with"],
+        },
+    },
+    {
+        "name": "memory_unshare_tag",
+        "description": "Revoke tag-based sharing from a user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string", "description": "Tag to unshare"},
+                "shared_with": {"type": "string", "description": "User ID to revoke access from"},
+            },
+            "required": ["tag", "shared_with"],
+        },
+    },
+    {
+        "name": "memory_update",
+        "description": "Update an existing memory's content, tags, importance, or keywords. Requires write permission if shared.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Memory ID to update"},
+                "content": {"type": "string", "description": "New content (optional)"},
+                "tags": {"type": "string", "description": "New tags (optional)"},
+                "importance": {"type": "number", "description": "New importance 0.0-1.0 (optional)", "minimum": 0.0, "maximum": 1.0},
+                "expanded_keywords": {"type": "string", "description": "New expanded keywords (optional)"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "memory_shared_with_me",
+        "description": "List all memories that other users have shared with you.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "memory_my_shares",
+        "description": "List all sharing rules you've created (both individual memory shares and tag shares).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+]
+
 
 class MemoryServer:
     """MCP server for persistent memory management."""
@@ -481,6 +576,107 @@ class MemoryServer:
 
         return "No storage available"
 
+    # ── Sharing tools (API-only) ───────────────────────────────────
+
+    def _require_api(self) -> None:
+        if SQLITE_ONLY:
+            raise ValueError("Sharing requires an API connection. Set MEMORY_API_KEY to enable.")
+
+    def memory_share(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        memory_id = args.get("id")
+        shared_with = args.get("shared_with")
+        permission = args.get("permission", "read")
+        if not memory_id or not shared_with:
+            raise ValueError("id and shared_with are required")
+        result = _api_request("POST", f"/api/memories/{memory_id}/share", {
+            "shared_with": shared_with,
+            "permission": permission,
+        })
+        return f"Shared memory #{result['shared']} with {result['with']} (permission: {result['permission']})"
+
+    def memory_unshare(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        memory_id = args.get("id")
+        shared_with = args.get("shared_with")
+        if not memory_id or not shared_with:
+            raise ValueError("id and shared_with are required")
+        result = _api_request("DELETE", f"/api/memories/{memory_id}/share/{shared_with}")
+        return f"Revoked sharing of memory #{result['unshared']} from {result['from']}"
+
+    def memory_share_tag(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        tag = args.get("tag")
+        shared_with = args.get("shared_with")
+        permission = args.get("permission", "read")
+        if not tag or not shared_with:
+            raise ValueError("tag and shared_with are required")
+        result = _api_request("POST", "/api/memories/share-tag", {
+            "tag": tag,
+            "shared_with": shared_with,
+            "permission": permission,
+        })
+        return f"Shared tag '{result['shared_tag']}' with {result['with']} (permission: {result['permission']})"
+
+    def memory_unshare_tag(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        tag = args.get("tag")
+        shared_with = args.get("shared_with")
+        if not tag or not shared_with:
+            raise ValueError("tag and shared_with are required")
+        _api_request("DELETE", "/api/memories/share-tag", {
+            "tag": tag,
+            "shared_with": shared_with,
+        })
+        return f"Revoked tag sharing of '{tag}' from {shared_with}"
+
+    def memory_update(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        memory_id = args.get("id")
+        if not memory_id:
+            raise ValueError("id is required")
+        body: dict[str, Any] = {}
+        for field in ("content", "tags", "importance", "expanded_keywords"):
+            if args.get(field) is not None:
+                body[field] = args[field]
+        if not body:
+            raise ValueError("At least one field to update is required")
+        _api_request("PUT", f"/api/memories/{memory_id}", body)
+        return f"Updated memory #{memory_id}"
+
+    def memory_shared_with_me(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        result = _api_request("GET", "/api/memories/shared-with-me")
+        memories = result.get("memories", [])
+        if not memories:
+            return "No memories have been shared with you"
+        lines = []
+        for m in memories:
+            content = m["content"]
+            lines.append(
+                f"#{m['id']} [{m['category']}] (from: {m['shared_by']}, {m['permission']}) {content}"
+                f"\n  Tags: {m.get('tags') or 'none'}"
+            )
+        return f"Memories shared with you ({len(memories)}):\n\n" + "\n\n".join(lines)
+
+    def memory_my_shares(self, args: dict[str, Any]) -> str:
+        self._require_api()
+        result = _api_request("GET", "/api/memories/my-shares")
+        mem_shares = result.get("memory_shares", [])
+        tag_shares = result.get("tag_shares", [])
+        if not mem_shares and not tag_shares:
+            return "You haven't shared any memories or tags"
+        lines = []
+        if mem_shares:
+            lines.append(f"Memory shares ({len(mem_shares)}):")
+            for s in mem_shares:
+                lines.append(f"  #{s['memory_id']} -> {s['shared_with']} ({s['permission']}): {s['preview']}")
+        if tag_shares:
+            lines.append(f"Tag shares ({len(tag_shares)}):")
+            for s in tag_shares:
+                lines.append(f"  tag '{s['tag']}' -> {s['shared_with']} ({s['permission']})")
+        return "\n".join(lines)
+
     # ── SQLite methods ──────────────────────────────────────────────
 
     def _sqlite_store(self, content: str, category: str, tags: str, importance: float, expanded_keywords: str, force_sensitive: bool = False) -> str:
@@ -624,7 +820,10 @@ class MemoryServer:
         }
 
     def handle_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
-        return {"tools": TOOLS}
+        tools = list(TOOLS)
+        if not SQLITE_ONLY:
+            tools.extend(SHARING_TOOLS)
+        return {"tools": tools}
 
     def handle_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         tool_name: str = params.get("name", "")
@@ -637,6 +836,13 @@ class MemoryServer:
                 "memory_delete": self.memory_delete,
                 "secret_get": self.secret_get,
                 "memory_count": self.memory_count,
+                "memory_share": self.memory_share,
+                "memory_unshare": self.memory_unshare,
+                "memory_share_tag": self.memory_share_tag,
+                "memory_unshare_tag": self.memory_unshare_tag,
+                "memory_update": self.memory_update,
+                "memory_shared_with_me": self.memory_shared_with_me,
+                "memory_my_shares": self.memory_my_shares,
             }.get(tool_name)
             if handler is None:
                 return {"content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}], "isError": True}
