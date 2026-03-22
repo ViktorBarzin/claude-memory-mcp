@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
@@ -55,9 +55,9 @@ _CACHE_BUST = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
 async def ui_root() -> Response:
     """Serve the UI single-page app with cache-busted static assets."""
     html = (UI_DIR / "index.html").read_text()
-    html = html.replace("/static/js/", f"/static/js/").replace(
-        '.js"', f'.js?v={_CACHE_BUST}"'
-    ).replace('.css"', f'.css?v={_CACHE_BUST}"')
+    html = html.replace('.js"', f'.js?v={_CACHE_BUST}"').replace(
+        '.css"', f'.css?v={_CACHE_BUST}"'
+    )
     return Response(content=html, media_type="text/html")
 
 
