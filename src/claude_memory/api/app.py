@@ -335,30 +335,39 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
 @app.get("/api/memories")
 async def list_memories(
     category: Optional[str] = None,
+    tag: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     user: AuthUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     pool = await get_pool()
 
+    # Build WHERE clauses dynamically
+    where_clauses = ["user_id = $1", "deleted_at IS NULL"]
+    count_params: list[Any] = [user.user_id]
+    param_idx = 2
+
     if category:
-        count_query = "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2"
-        count_params: list[Any] = [user.user_id, category]
-        query = """
-            SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-            FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2
-            ORDER BY importance DESC LIMIT $3 OFFSET $4
-        """
-        params: list[Any] = [user.user_id, category, limit, offset]
-    else:
-        count_query = "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL"
-        count_params = [user.user_id]
-        query = """
-            SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-            FROM memories WHERE user_id = $1 AND deleted_at IS NULL
-            ORDER BY importance DESC LIMIT $2 OFFSET $3
-        """
-        params = [user.user_id, limit, offset]
+        where_clauses.append(f"category = ${param_idx}")
+        count_params.append(category)
+        param_idx += 1
+
+    if tag:
+        where_clauses.append(
+            f"${param_idx} = ANY(SELECT trim(t) FROM unnest(string_to_array(tags, ',')) AS t)"
+        )
+        count_params.append(tag)
+        param_idx += 1
+
+    where = " AND ".join(where_clauses)
+    count_query = f"SELECT COUNT(*) FROM memories WHERE {where}"
+
+    params: list[Any] = [*count_params, limit, offset]
+    query = f"""
+        SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
+        FROM memories WHERE {where}
+        ORDER BY importance DESC LIMIT ${param_idx} OFFSET ${param_idx + 1}
+    """
 
     async with pool.acquire() as conn:
         total = await conn.fetchval(count_query, *count_params)
@@ -395,6 +404,24 @@ async def list_categories(user: AuthUser = Depends(get_current_user)) -> dict[st
             user.user_id,
         )
     return {"categories": [r["category"] for r in rows]}
+
+
+@app.get("/api/tags")
+async def list_tags(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Return all distinct tags with memory counts for the current user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT trim(t) as tag, COUNT(*) as count
+            FROM memories, unnest(string_to_array(tags, ',')) AS t
+            WHERE user_id = $1 AND deleted_at IS NULL AND tags != '' AND tags IS NOT NULL
+            GROUP BY trim(t)
+            ORDER BY count DESC
+            """,
+            user.user_id,
+        )
+    return {"tags": [{"tag": r["tag"], "count": r["count"]} for r in rows]}
 
 
 @app.get("/api/stats")
