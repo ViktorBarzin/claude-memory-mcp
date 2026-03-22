@@ -45,7 +45,7 @@ UI_DIR = pathlib.Path(__file__).parent.parent / "ui" / "static"
 
 
 @app.get("/")
-async def ui_root():
+async def ui_root() -> FileResponse:
     """Serve the UI single-page app."""
     return FileResponse(UI_DIR / "index.html")
 
