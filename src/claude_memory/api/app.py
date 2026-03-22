@@ -2,12 +2,14 @@
 
 import json
 import logging
+import pathlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -38,6 +40,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="Claude Memory API", lifespan=lifespan)
+
+UI_DIR = pathlib.Path(__file__).parent.parent / "ui" / "static"
+
+
+@app.get("/")
+async def ui_root():
+    """Serve the UI single-page app."""
+    return FileResponse(UI_DIR / "index.html")
 
 
 def _detect_sensitive(content: str) -> bool:
@@ -315,26 +325,32 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
 async def list_memories(
     category: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     user: AuthUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     pool = await get_pool()
 
     if category:
+        count_query = "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2"
+        count_params: list[Any] = [user.user_id, category]
         query = """
             SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
             FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2
-            ORDER BY importance DESC LIMIT $3
+            ORDER BY importance DESC LIMIT $3 OFFSET $4
         """
-        params: list[Any] = [user.user_id, category, limit]
+        params: list[Any] = [user.user_id, category, limit, offset]
     else:
+        count_query = "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL"
+        count_params = [user.user_id]
         query = """
             SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
             FROM memories WHERE user_id = $1 AND deleted_at IS NULL
-            ORDER BY importance DESC LIMIT $2
+            ORDER BY importance DESC LIMIT $2 OFFSET $3
         """
-        params = [user.user_id, limit]
+        params = [user.user_id, limit, offset]
 
     async with pool.acquire() as conn:
+        total = await conn.fetchval(count_query, *count_params)
         rows = await conn.fetch(query, *params)
 
     results = []
@@ -355,7 +371,89 @@ async def list_memories(
             }
         )
 
-    return {"memories": results}
+    return {"memories": results, "total": total}
+
+
+@app.get("/api/categories")
+async def list_categories(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Return distinct category values for the current user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT category FROM memories WHERE user_id = $1 AND deleted_at IS NULL ORDER BY category",
+            user.user_id,
+        )
+    return {"categories": [r["category"] for r in rows]}
+
+
+@app.get("/api/stats")
+async def get_stats(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Aggregated stats for the dashboard."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL",
+            user.user_id,
+        )
+
+        cat_rows = await conn.fetch(
+            "SELECT category, COUNT(*) AS cnt FROM memories WHERE user_id = $1 AND deleted_at IS NULL GROUP BY category ORDER BY cnt DESC",
+            user.user_id,
+        )
+        by_category = {r["category"]: r["cnt"] for r in cat_rows}
+
+        imp_rows = await conn.fetch(
+            """
+            SELECT
+                CASE
+                    WHEN importance < 0.2 THEN '0.0-0.2'
+                    WHEN importance < 0.4 THEN '0.2-0.4'
+                    WHEN importance < 0.6 THEN '0.4-0.6'
+                    WHEN importance < 0.8 THEN '0.6-0.8'
+                    ELSE '0.8-1.0'
+                END AS bucket,
+                COUNT(*) AS cnt
+            FROM memories WHERE user_id = $1 AND deleted_at IS NULL
+            GROUP BY bucket ORDER BY bucket
+            """,
+            user.user_id,
+        )
+        by_importance = {r["bucket"]: r["cnt"] for r in imp_rows}
+
+        activity_rows = await conn.fetch(
+            """
+            SELECT d::date AS date,
+                   COUNT(*) FILTER (WHERE created_at::date = d::date) AS created,
+                   COUNT(*) FILTER (WHERE updated_at::date = d::date AND updated_at > created_at + interval '1 second') AS updated
+            FROM memories,
+                 generate_series(CURRENT_DATE - interval '29 days', CURRENT_DATE, '1 day') AS d
+            WHERE user_id = $1 AND deleted_at IS NULL
+              AND (created_at::date = d::date OR (updated_at::date = d::date AND updated_at > created_at + interval '1 second'))
+            GROUP BY d::date ORDER BY d::date
+            """,
+            user.user_id,
+        )
+        recent_activity = [
+            {"date": r["date"].isoformat(), "created": r["created"], "updated": r["updated"]}
+            for r in activity_rows
+        ]
+
+        shared_by_me = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_shares WHERE owner_id = $1",
+            user.user_id,
+        )
+        shared_with_me = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_shares WHERE shared_with = $1",
+            user.user_id,
+        )
+
+    return {
+        "total_memories": total,
+        "by_category": by_category,
+        "by_importance": by_importance,
+        "recent_activity": recent_activity,
+        "sharing_stats": {"shared_by_me": shared_by_me, "shared_with_me": shared_with_me},
+    }
 
 
 @app.delete("/api/memories/{memory_id}")
@@ -1032,6 +1130,9 @@ class HandleSSE:
                 read_stream, write_stream, mcp_server._mcp_server.create_initialization_options()
             )
 
+
+# Static files for UI (before MCP mount)
+app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
 
 # Client connects to /mcp/sse, posts to /mcp/messages/
 app.router.routes.insert(0, Mount("/mcp", routes=[

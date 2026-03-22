@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Memory</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/memories.js"></script>
+  <script src="/static/js/search.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+  <script src="/static/js/graph.js"></script>
+</head>
+<body class="min-h-screen">
+
+  <!-- Login Modal -->
+  <template x-if="!$store.app.authenticated" x-data>
+    <div class="login-backdrop">
+      <div class="login-card">
+        <h2 class="text-xl font-bold mb-1">Claude Memory</h2>
+        <p class="text-sm text-slate-400 mb-6">Enter your API key to continue</p>
+        <form @submit.prevent="$store.app.login()">
+          <input
+            type="password"
+            class="input-field mb-3"
+            placeholder="API Key"
+            x-model="$store.app.loginKey"
+            autofocus
+          >
+          <template x-if="$store.app.loginError">
+            <p class="text-red-400 text-sm mb-3" x-text="$store.app.loginError"></p>
+          </template>
+          <button type="submit" class="btn btn-primary w-full" :disabled="$store.app.loginLoading">
+            <span x-show="!$store.app.loginLoading">Sign In</span>
+            <span x-show="$store.app.loginLoading" class="flex items-center justify-center gap-2">
+              <span class="spinner"></span> Authenticating...
+            </span>
+          </button>
+        </form>
+      </div>
+    </div>
+  </template>
+
+  <!-- Main App -->
+  <template x-if="$store.app.authenticated" x-data>
+    <div class="max-w-7xl mx-auto px-4 py-6">
+
+      <!-- Header -->
+      <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center gap-3">
+          <h1 class="text-xl font-bold">Claude Memory</h1>
+          <span class="text-sm text-slate-400">|</span>
+          <span class="text-sm text-slate-400" x-text="$store.app.userId"></span>
+        </div>
+        <button @click="$store.app.logout()" class="btn btn-ghost text-sm">Logout</button>
+      </div>
+
+      <!-- Tab Navigation -->
+      <div class="flex gap-1 mb-6 bg-slate-800/50 p-1 rounded-lg w-fit">
+        <button
+          class="tab-btn"
+          :class="{ active: $store.app.activeTab === 'memories' }"
+          @click="$store.app.switchTab('memories')"
+        >Memories</button>
+        <button
+          class="tab-btn"
+          :class="{ active: $store.app.activeTab === 'search' }"
+          @click="$store.app.switchTab('search')"
+        >Search</button>
+        <button
+          class="tab-btn"
+          :class="{ active: $store.app.activeTab === 'graph' }"
+          @click="$store.app.switchTab('graph')"
+        >Graph</button>
+        <button
+          class="tab-btn"
+          :class="{ active: $store.app.activeTab === 'dashboard' }"
+          @click="$store.app.switchTab('dashboard')"
+        >Dashboard</button>
+      </div>
+
+      <!-- Tab: Memories -->
+      <div x-show="$store.app.activeTab === 'memories'" x-data="memoriesBrowser()" x-init="init()">
+
+        <!-- Filters -->
+        <div class="flex items-center gap-3 mb-4">
+          <select class="input-field" style="width:auto" x-model="selectedCategory" @change="filterByCategory()">
+            <option value="">All categories</option>
+            <template x-for="cat in categories" :key="cat">
+              <option :value="cat" x-text="cat"></option>
+            </template>
+          </select>
+          <span class="text-sm text-slate-400">
+            <span x-text="memories.length"></span> / <span x-text="total"></span> memories
+          </span>
+          <span x-show="loading" class="spinner"></span>
+        </div>
+
+        <!-- My Memories -->
+        <div class="section-title">My Memories</div>
+        <div class="space-y-2 mb-6">
+          <template x-for="mem in memories" :key="mem.id">
+            <div class="memory-card" @click="toggle(mem.id)">
+              <!-- Collapsed -->
+              <div class="flex items-start justify-between gap-3">
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="text-xs text-slate-500">#<span x-text="mem.id"></span></span>
+                    <span class="badge badge-category" x-text="mem.category"></span>
+                    <template x-if="mem.is_sensitive">
+                      <span class="badge badge-sensitive">SENSITIVE</span>
+                    </template>
+                  </div>
+                  <p class="text-sm" x-show="expandedId !== mem.id" x-text="preview(mem.content)"></p>
+                </div>
+                <div class="flex flex-col items-end gap-1 shrink-0">
+                  <span class="text-xs text-slate-500" x-text="relativeTime(mem.updated_at)"></span>
+                  <div class="importance-bar w-16">
+                    <div class="importance-fill" :style="`width: ${mem.importance * 100}%`"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Tags -->
+              <div class="mt-1" x-show="mem.tags">
+                <template x-for="tag in (mem.tags || '').split(',').map(t => t.trim()).filter(Boolean)" :key="tag">
+                  <span class="tag-pill" x-text="tag"></span>
+                </template>
+              </div>
+
+              <!-- Expanded -->
+              <div x-show="expandedId === mem.id" @click.stop class="mt-3 pt-3 border-t border-slate-700">
+                <!-- View mode -->
+                <template x-if="editingId !== mem.id">
+                  <div>
+                    <p class="text-sm whitespace-pre-wrap mb-3" x-text="mem.content"></p>
+                    <div class="text-xs text-slate-500 mb-3">
+                      Created: <span x-text="new Date(mem.created_at).toLocaleString()"></span>
+                      &middot; Updated: <span x-text="new Date(mem.updated_at).toLocaleString()"></span>
+                      &middot; Importance: <span x-text="mem.importance"></span>
+                    </div>
+                    <div class="flex gap-2">
+                      <button class="btn btn-ghost text-xs" @click.stop="startEdit(mem)" x-show="!mem.is_sensitive">Edit</button>
+                      <button class="btn btn-ghost text-xs" @click.stop="toggleShares(mem.id)">Shares</button>
+                      <button class="btn text-xs" style="color: var(--danger)" @click.stop="confirmDelete(mem.id)">Delete</button>
+                    </div>
+                    <!-- Delete confirmation -->
+                    <div x-show="deleteConfirm === mem.id" class="mt-2 p-2 rounded bg-red-900/30 border border-red-800 text-sm">
+                      Delete this memory?
+                      <button class="btn btn-danger text-xs ml-2" @click.stop="doDelete(mem.id)">Confirm</button>
+                      <button class="btn btn-ghost text-xs ml-1" @click.stop="deleteConfirm = null">Cancel</button>
+                    </div>
+                    <!-- Shares info -->
+                    <div x-show="sharesExpanded === mem.id" class="mt-2">
+                      <template x-if="sharesData.length === 0">
+                        <p class="text-xs text-slate-500">Not shared with anyone</p>
+                      </template>
+                      <template x-for="s in sharesData" :key="s.shared_with">
+                        <div class="text-xs text-slate-400">
+                          Shared with <span class="text-slate-200" x-text="s.shared_with"></span>
+                          <span class="badge" :class="s.permission === 'write' ? 'badge-write' : 'badge-read'" x-text="s.permission"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
+                <!-- Edit mode -->
+                <template x-if="editingId === mem.id">
+                  <div>
+                    <textarea class="input-field mb-2" x-model="editForm.content" rows="4"></textarea>
+                    <div class="flex items-center gap-3 mb-2">
+                      <label class="text-xs text-slate-400">Tags:</label>
+                      <input type="text" class="input-field" x-model="editForm.tags" placeholder="tag1, tag2">
+                    </div>
+                    <div class="flex items-center gap-3 mb-3">
+                      <label class="text-xs text-slate-400">Importance:</label>
+                      <input type="range" min="0" max="1" step="0.1" x-model="editForm.importance" class="flex-1">
+                      <span class="text-xs text-slate-400" x-text="editForm.importance"></span>
+                    </div>
+                    <div class="flex gap-2">
+                      <button class="btn btn-primary text-xs" @click.stop="saveEdit(mem.id)">Save</button>
+                      <button class="btn btn-ghost text-xs" @click.stop="cancelEdit()">Cancel</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Load more -->
+        <div x-show="hasMore" class="text-center mb-8">
+          <button class="btn btn-ghost" @click="loadMore()" :disabled="loading">
+            <span x-show="!loading">Load More</span>
+            <span x-show="loading" class="spinner"></span>
+          </button>
+        </div>
+
+        <!-- Shared With Me -->
+        <template x-if="sharedMemories.length > 0">
+          <div>
+            <div class="section-title">Shared With Me</div>
+            <div class="space-y-2">
+              <template x-for="mem in sharedMemories" :key="mem.id">
+                <div class="memory-card" @click="toggle('s' + mem.id)">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="flex-1 min-w-0">
+                      <div class="flex items-center gap-2 mb-1">
+                        <span class="text-xs text-slate-500">#<span x-text="mem.id"></span></span>
+                        <span class="badge badge-category" x-text="mem.category"></span>
+                        <span class="badge" :class="mem.permission === 'write' ? 'badge-write' : 'badge-read'" x-text="mem.permission"></span>
+                        <span class="shared-indicator">
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                          <span x-text="mem.shared_by"></span>
+                        </span>
+                      </div>
+                      <p class="text-sm" x-show="expandedId !== 's' + mem.id" x-text="preview(mem.content)"></p>
+                    </div>
+                    <div class="flex flex-col items-end gap-1 shrink-0">
+                      <span class="text-xs text-slate-500" x-text="relativeTime(mem.updated_at)"></span>
+                      <div class="importance-bar w-16">
+                        <div class="importance-fill" :style="`width: ${mem.importance * 100}%`"></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="mt-1" x-show="mem.tags">
+                    <template x-for="tag in (mem.tags || '').split(',').map(t => t.trim()).filter(Boolean)" :key="tag">
+                      <span class="tag-pill" x-text="tag"></span>
+                    </template>
+                  </div>
+                  <div x-show="expandedId === 's' + mem.id" @click.stop class="mt-3 pt-3 border-t border-slate-700">
+                    <p class="text-sm whitespace-pre-wrap mb-2" x-text="mem.content"></p>
+                    <div class="text-xs text-slate-500">
+                      Created: <span x-text="new Date(mem.created_at).toLocaleString()"></span>
+                      &middot; Updated: <span x-text="new Date(mem.updated_at).toLocaleString()"></span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Tab: Search -->
+      <div x-show="$store.app.activeTab === 'search'" x-data="searchComponent()" x-init="init()">
+        <div class="flex flex-wrap gap-3 mb-4">
+          <input
+            type="text"
+            class="input-field flex-1"
+            style="min-width: 200px"
+            placeholder="Search memories..."
+            x-model="query"
+            @input="onInput()"
+          >
+          <select class="input-field" style="width:auto" x-model="category" @change="doSearch()">
+            <option value="">All categories</option>
+            <template x-for="cat in categories" :key="cat">
+              <option :value="cat" x-text="cat"></option>
+            </template>
+          </select>
+          <select class="input-field" style="width:auto" x-model="sortBy" @change="doSearch()">
+            <option value="importance">Importance</option>
+            <option value="relevance">Relevance</option>
+            <option value="recency">Recency</option>
+          </select>
+        </div>
+
+        <span x-show="loading" class="spinner"></span>
+
+        <div class="space-y-2">
+          <template x-for="mem in results" :key="mem.id">
+            <div class="memory-card" @click="toggle(mem.id)">
+              <div class="flex items-start justify-between gap-3">
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="text-xs text-slate-500">#<span x-text="mem.id"></span></span>
+                    <span class="badge badge-category" x-text="mem.category"></span>
+                    <template x-if="mem.is_sensitive">
+                      <span class="badge badge-sensitive">SENSITIVE</span>
+                    </template>
+                    <template x-if="mem.shared_by">
+                      <span class="shared-indicator">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                        <span x-text="mem.shared_by"></span>
+                      </span>
+                    </template>
+                  </div>
+                  <p class="text-sm" x-show="expandedId !== mem.id" x-text="preview(mem.content)"></p>
+                </div>
+                <div class="flex flex-col items-end gap-1 shrink-0">
+                  <span class="text-xs text-slate-500" x-text="relativeTime(mem.updated_at)"></span>
+                  <div class="importance-bar w-16">
+                    <div class="importance-fill" :style="`width: ${mem.importance * 100}%`"></div>
+                  </div>
+                  <span class="text-xs text-indigo-400" x-text="'rank: ' + (mem.rank || 0).toFixed(2)"></span>
+                </div>
+              </div>
+              <div class="mt-1" x-show="mem.tags">
+                <template x-for="tag in (mem.tags || '').split(',').map(t => t.trim()).filter(Boolean)" :key="tag">
+                  <span class="tag-pill" x-text="tag"></span>
+                </template>
+              </div>
+              <!-- Expanded -->
+              <div x-show="expandedId === mem.id" @click.stop class="mt-3 pt-3 border-t border-slate-700">
+                <p class="text-sm whitespace-pre-wrap mb-2" x-text="mem.content"></p>
+                <div class="text-xs text-slate-500">
+                  Created: <span x-text="new Date(mem.created_at).toLocaleString()"></span>
+                  &middot; Updated: <span x-text="new Date(mem.updated_at).toLocaleString()"></span>
+                  <template x-if="mem.share_permission">
+                    <span> &middot; Permission: <span class="badge" :class="mem.share_permission === 'write' ? 'badge-write' : 'badge-read'" x-text="mem.share_permission"></span></span>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <p x-show="query && !loading && results.length === 0" class="text-sm text-slate-500 mt-4">No results found</p>
+      </div>
+
+      <!-- Tab: Graph -->
+      <div x-show="$store.app.activeTab === 'graph'" x-data="graphComponent()" x-init="$watch('$store.app.activeTab', v => { if (v === 'graph' && memories.length === 0) init(); })">
+        <div class="flex flex-wrap gap-2 mb-4">
+          <template x-for="cat in categories" :key="cat">
+            <label class="flex items-center gap-1 text-sm cursor-pointer">
+              <input type="checkbox" :checked="selectedCategories[cat]" @change="toggleCategory(cat)">
+              <span x-text="cat"></span>
+            </label>
+          </template>
+          <span x-show="loading" class="spinner ml-2"></span>
+        </div>
+
+        <div class="flex gap-4">
+          <div class="flex-1 graph-container" x-ref="graphContainer"></div>
+
+          <template x-if="selectedNode">
+            <div class="node-detail w-80 shrink-0">
+              <div class="flex items-center gap-2 mb-2">
+                <span class="text-xs text-slate-500">#<span x-text="selectedNode.id"></span></span>
+                <span class="badge badge-category" x-text="selectedNode.category"></span>
+                <template x-if="selectedNode.is_sensitive">
+                  <span class="badge badge-sensitive">SENSITIVE</span>
+                </template>
+              </div>
+              <p class="text-sm whitespace-pre-wrap mb-3" x-text="preview(selectedNode.content)"></p>
+              <div class="mb-2" x-show="selectedNode.tags">
+                <template x-for="tag in (selectedNode.tags || '').split(',').map(t => t.trim()).filter(Boolean)" :key="tag">
+                  <span class="tag-pill" x-text="tag"></span>
+                </template>
+              </div>
+              <div class="importance-bar w-full mb-2">
+                <div class="importance-fill" :style="`width: ${selectedNode.importance * 100}%`"></div>
+              </div>
+              <span class="text-xs text-slate-500">Importance: <span x-text="selectedNode.importance"></span></span>
+              <button class="btn btn-ghost text-xs mt-3 block" @click="selectedNode = null">Close</button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Tab: Dashboard -->
+      <div x-show="$store.app.activeTab === 'dashboard'" x-data="dashboardComponent()" x-init="$watch('$store.app.activeTab', v => { if (v === 'dashboard' && !stats) init(); })">
+        <span x-show="loading" class="spinner"></span>
+
+        <template x-if="stats">
+          <div>
+            <!-- Summary cards -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+              <div class="stat-card">
+                <div class="stat-value" x-text="stats.total_memories"></div>
+                <div class="stat-label">Total Memories</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" x-text="Object.keys(stats.by_category).length"></div>
+                <div class="stat-label">Categories</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" x-text="stats.sharing_stats.shared_by_me"></div>
+                <div class="stat-label">Shared by Me</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value" x-text="stats.sharing_stats.shared_with_me"></div>
+                <div class="stat-label">Shared with Me</div>
+              </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              <div class="chart-container">
+                <div class="section-title">Categories</div>
+                <div style="height: 280px">
+                  <canvas x-ref="categoryChart"></canvas>
+                </div>
+              </div>
+              <div class="chart-container">
+                <div class="section-title">Importance Distribution</div>
+                <div style="height: 280px">
+                  <canvas x-ref="importanceChart"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <div class="chart-container">
+              <div class="section-title">Activity (Last 30 Days)</div>
+              <div style="height: 250px">
+                <canvas x-ref="activityChart"></canvas>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+    </div>
+  </template>
+
+</body>
+</html>
