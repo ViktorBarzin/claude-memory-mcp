@@ -468,7 +468,7 @@
       </div>
 
       <!-- Tab: Graph -->
-      <div x-show="$store.app.activeTab === 'graph'" x-data="graphComponent()" x-init="$watch('$store.app.activeTab', v => { if (v === 'graph') { if (memories.length === 0) init(); else setTimeout(() => render(), 100); } })">
+      <div x-show="$store.app.activeTab === 'graph'" x-data="graphComponent()" x-init="$watch('$store.app.activeTab', v => { if (v === 'graph') { if (memories.length === 0) init(); else setTimeout(() => render(), 100); } })" style="margin-left: calc(-50vw + 50%); margin-right: calc(-50vw + 50%); width: 100vw; padding: 0 1rem;">
         <div class="flex flex-wrap gap-2 mb-4">
           <template x-for="cat in categories" :key="cat">
             <label class="flex items-center gap-1 text-sm cursor-pointer" style="color: var(--text-secondary)">
