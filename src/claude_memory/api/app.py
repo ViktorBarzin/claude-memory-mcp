@@ -454,7 +454,12 @@ async def get_stats(user: AuthUser = Depends(get_current_user)) -> dict[str, Any
             user.user_id,
         )
         shared_with_me = await conn.fetchval(
-            "SELECT COUNT(*) FROM memory_shares WHERE shared_with = $1",
+            """SELECT COUNT(DISTINCT m.id) FROM memories m
+               WHERE m.deleted_at IS NULL AND (
+                 EXISTS (SELECT 1 FROM memory_shares ms WHERE ms.memory_id = m.id AND ms.shared_with = $1)
+                 OR EXISTS (SELECT 1 FROM tag_shares ts WHERE ts.owner_id = m.user_id AND ts.shared_with = $1
+                   AND EXISTS (SELECT 1 FROM unnest(string_to_array(m.tags, ',')) t WHERE trim(t) = ts.tag))
+               )""",
             user.user_id,
         )
 
@@ -465,6 +470,41 @@ async def get_stats(user: AuthUser = Depends(get_current_user)) -> dict[str, Any
         "recent_activity": recent_activity,
         "sharing_stats": {"shared_by_me": shared_by_me, "shared_with_me": shared_with_me},
     }
+
+
+# NOTE: Literal-path routes (share-tag, shared-with-me, my-shares) must be
+# registered before parameterized routes ({memory_id}) to prevent FastAPI
+# from matching the literal segment as a path parameter.
+
+
+@app.post("/api/memories/share-tag")
+async def share_tag(body: ShareTag, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    pool = await get_pool()
+    if body.shared_with == user.user_id:
+        raise HTTPException(status_code=400, detail="Cannot share with yourself")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO tag_shares (owner_id, tag, shared_with, permission)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (owner_id, tag, shared_with)
+            DO UPDATE SET permission = EXCLUDED.permission
+            """,
+            user.user_id, body.tag, body.shared_with, body.permission,
+        )
+    return {"shared_tag": body.tag, "with": body.shared_with, "permission": body.permission}
+
+
+@app.delete("/api/memories/share-tag")
+async def unshare_tag(body: UnshareTag, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM tag_shares WHERE owner_id = $1 AND tag = $2 AND shared_with = $3",
+            user.user_id, body.tag, body.shared_with,
+        )
+    return {"unshared_tag": body.tag, "from": body.shared_with}
 
 
 @app.delete("/api/memories/{memory_id}")
@@ -663,36 +703,6 @@ async def unshare_memory(memory_id: int, target_user: str, user: AuthUser = Depe
             memory_id, target_user,
         )
     return {"unshared": memory_id, "from": target_user}
-
-
-@app.post("/api/memories/share-tag")
-async def share_tag(body: ShareTag, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    pool = await get_pool()
-    if body.shared_with == user.user_id:
-        raise HTTPException(status_code=400, detail="Cannot share with yourself")
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO tag_shares (owner_id, tag, shared_with, permission)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (owner_id, tag, shared_with)
-            DO UPDATE SET permission = EXCLUDED.permission
-            """,
-            user.user_id, body.tag, body.shared_with, body.permission,
-        )
-    return {"shared_tag": body.tag, "with": body.shared_with, "permission": body.permission}
-
-
-@app.delete("/api/memories/share-tag")
-async def unshare_tag(body: UnshareTag, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM tag_shares WHERE owner_id = $1 AND tag = $2 AND shared_with = $3",
-            user.user_id, body.tag, body.shared_with,
-        )
-    return {"unshared_tag": body.tag, "from": body.shared_with}
 
 
 @app.get("/api/memories/shared-with-me")

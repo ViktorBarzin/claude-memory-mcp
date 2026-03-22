@@ -454,3 +454,220 @@ async def test_delete_excludes_already_deleted(client):
     call_args = conn.fetchrow.call_args
     query = call_args[0][0]
     assert "deleted_at IS NULL" in query
+
+
+# ─── Sharing endpoint tests ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_share_memory_creates_record(client):
+    """POST /api/memories/{id}/share creates a sharing record."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=10, user_id="testuser")
+    conn.execute.return_value = None
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/10/share",
+            json={"shared_with": "otheruser", "permission": "read"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["shared"] == 10
+    assert data["with"] == "otheruser"
+    assert data["permission"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_share_memory_nonexistent_returns_404(client):
+    """POST /api/memories/{id}/share returns 404 for non-existent memory."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = None
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/999/share",
+            json={"shared_with": "otheruser", "permission": "read"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unshare_memory(client):
+    """DELETE /api/memories/{id}/share/{user} removes sharing."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=10, user_id="testuser")
+    conn.execute.return_value = None
+
+    async with ac:
+        resp = await ac.delete(
+            "/api/memories/10/share/otheruser",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_share_tag_creates_record(client):
+    """POST /api/memories/share-tag creates a tag sharing record."""
+    ac, conn, app_mod = client
+    conn.execute.return_value = None
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/share-tag",
+            json={"tag": "python", "shared_with": "otheruser", "permission": "read"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["shared_tag"] == "python"
+    assert data["with"] == "otheruser"
+    assert data["permission"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_unshare_tag(client):
+    """DELETE /api/memories/share-tag removes tag sharing."""
+    ac, conn, app_mod = client
+    conn.execute.return_value = None
+
+    async with ac:
+        resp = await ac.request(
+            "DELETE",
+            "/api/memories/share-tag",
+            json={"tag": "python", "shared_with": "otheruser"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["unshared_tag"] == "python"
+
+
+@pytest.mark.asyncio
+async def test_shared_with_me_returns_shared_memories(client):
+    """GET /api/memories/shared-with-me returns individually and tag-shared memories."""
+    ac, conn, app_mod = client
+    # Mock conn.fetch called twice: individual shares, then tag shares
+    # Need to include permission field for the sharing queries
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1, content="shared memory", user_id="owner1", shared_by="owner1", permission="read")],  # individual
+        [_make_memory_row(id=2, content="tag shared", user_id="owner2", shared_by="owner2", permission="write")],  # tag-shared
+    ]
+
+    async with ac:
+        resp = await ac.get(
+            "/api/memories/shared-with-me",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["memories"]) == 2
+    assert data["memories"][0]["id"] == 1
+    assert data["memories"][1]["id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_my_shares_returns_outgoing_shares(client):
+    """GET /api/memories/my-shares returns outgoing memory and tag shares."""
+    ac, conn, app_mod = client
+    now = datetime.now(timezone.utc)
+    # Mock conn.fetch called twice: memory_shares, then tag_shares
+    conn.fetch.side_effect = [
+        [MockRow({"memory_id": 1, "shared_with": "user1", "permission": "read", "preview": "memory preview", "created_at": now})],  # memory_shares
+        [MockRow({"tag": "python", "shared_with": "user2", "permission": "write", "created_at": now})],  # tag_shares
+    ]
+
+    async with ac:
+        resp = await ac.get(
+            "/api/memories/my-shares",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["memory_shares"]) == 1
+    assert len(data["tag_shares"]) == 1
+    assert data["memory_shares"][0]["memory_id"] == 1
+    assert data["tag_shares"][0]["tag"] == "python"
+
+
+@pytest.mark.asyncio
+async def test_recall_includes_shared_memories(client):
+    """POST /api/memories/recall includes shared memories with shared_by field."""
+    ac, conn, app_mod = client
+    # recall calls fetch multiple times: own, shared, tag-shared, OR-fallback
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1, content="own memory", user_id="testuser", shared_by=None)],  # own
+        [_make_memory_row(id=2, content="shared memory", user_id="owner1", shared_by="owner1")],  # shared
+        [_make_memory_row(id=3, content="tag shared", user_id="owner2", shared_by="owner2")],  # tag-shared
+        [],  # OR-fallback
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "test query"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    results = data["memories"]
+    assert len(results) == 3
+    # Check that shared_by field appears in shared memories
+    assert results[0]["shared_by"] is None
+    assert results[1]["shared_by"] == "owner1"
+    assert results[2]["shared_by"] == "owner2"
+
+
+@pytest.mark.asyncio
+async def test_update_shared_memory_with_write_permission(client):
+    """PUT /api/memories/{id} succeeds when user has write permission."""
+    ac, conn, app_mod = client
+
+    # Mock check_memory_permission to return (True, "owner")
+    async def mock_check_permission(conn, memory_id, user_id, perm):
+        return (True, "owner")
+
+    with patch("claude_memory.api.app.check_memory_permission", side_effect=mock_check_permission):
+        conn.execute.return_value = None
+
+        async with ac:
+            resp = await ac.put(
+                "/api/memories/10",
+                json={"content": "updated content"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["updated"] == 10
+
+
+@pytest.mark.asyncio
+async def test_update_shared_memory_without_write_fails(client):
+    """PUT /api/memories/{id} returns 403 when user lacks write permission."""
+    ac, conn, app_mod = client
+
+    # Mock check_memory_permission to return (False, "owner")
+    async def mock_check_permission(conn, memory_id, user_id, perm):
+        return (False, "owner")
+
+    with patch("claude_memory.api.app.check_memory_permission", side_effect=mock_check_permission):
+        async with ac:
+            resp = await ac.put(
+                "/api/memories/10",
+                json={"content": "updated content"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 403

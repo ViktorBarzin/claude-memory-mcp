@@ -63,8 +63,12 @@ const api = {
     return this.fetch(url, { method: 'PUT', body: JSON.stringify(data) });
   },
 
-  del(url) {
-    return this.fetch(url, { method: 'DELETE' });
+  del(url, data) {
+    const options = { method: 'DELETE' };
+    if (data) {
+      options.body = JSON.stringify(data);
+    }
+    return this.fetch(url, options);
   },
 
   async login(key) {

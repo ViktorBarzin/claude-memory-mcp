@@ -23,9 +23,15 @@ function memoriesBrowser() {
     showShareForm: null,
     shareForm: { user: '', permission: 'read' },
     shareUserFilter: '',
+    // Tag shares
+    tagShares: [],
+    showTagShareForm: false,
+    tagShareForm: { tag: '', user: '', permission: 'read' },
+    tagShareUserFilter: '',
+    errorMsg: '',
 
     async init() {
-      await Promise.all([this.loadMemories(), this.loadShared(), this.loadCategories(), this.loadUsers()]);
+      await Promise.all([this.loadMemories(), this.loadShared(), this.loadCategories(), this.loadUsers(), this.loadTagShares()]);
     },
 
     async loadCategories() {
@@ -100,6 +106,7 @@ function memoriesBrowser() {
     },
 
     async saveEdit(id) {
+      this.errorMsg = '';
       try {
         await api.put(`/api/memories/${id}`, {
           content: this.editForm.content,
@@ -110,7 +117,7 @@ function memoriesBrowser() {
         this.offset = 0;
         await this.loadMemories();
       } catch (e) {
-        alert('Save failed: ' + e.message);
+        this.errorMsg = 'Save failed: ' + e.message;
       }
     },
 
@@ -119,13 +126,14 @@ function memoriesBrowser() {
     },
 
     async doDelete(id) {
+      this.errorMsg = '';
       try {
         await api.del(`/api/memories/${id}`);
         this.deleteConfirm = null;
         this.offset = 0;
         await this.loadMemories();
       } catch (e) {
-        alert('Delete failed: ' + e.message);
+        this.errorMsg = 'Delete failed: ' + e.message;
       }
     },
 
@@ -153,6 +161,7 @@ function memoriesBrowser() {
 
     async addMemory() {
       if (!this.addForm.content.trim()) return;
+      this.errorMsg = '';
       try {
         await api.post('/api/memories', {
           content: this.addForm.content,
@@ -164,7 +173,7 @@ function memoriesBrowser() {
         this.offset = 0;
         await Promise.all([this.loadMemories(), this.loadCategories()]);
       } catch (e) {
-        alert('Failed to add memory: ' + e.message);
+        this.errorMsg = 'Failed to add memory: ' + e.message;
       }
     },
 
@@ -191,6 +200,7 @@ function memoriesBrowser() {
 
     async shareMemory(memId) {
       if (!this.shareForm.user.trim()) return;
+      this.errorMsg = '';
       try {
         await api.post(`/api/memories/${memId}/share`, {
           shared_with: this.shareForm.user,
@@ -203,7 +213,51 @@ function memoriesBrowser() {
           await this.toggleShares(memId);
         }
       } catch (e) {
-        alert('Share failed: ' + e.message);
+        this.errorMsg = 'Share failed: ' + e.message;
+      }
+    },
+
+    async loadTagShares() {
+      try {
+        const data = await api.get('/api/memories/my-shares');
+        this.tagShares = data.tag_shares || [];
+      } catch (e) { console.error('Failed to load tag shares:', e); }
+    },
+
+    get filteredTagShareUsers() {
+      const q = this.tagShareForm.user.toLowerCase();
+      if (!q) return this.allUsers.slice(0, 10);
+      return this.allUsers.filter(u => u.toLowerCase().includes(q));
+    },
+
+    selectTagShareUser(user) {
+      this.tagShareForm.user = user;
+    },
+
+    async addTagShare() {
+      if (!this.tagShareForm.tag.trim() || !this.tagShareForm.user.trim()) return;
+      this.errorMsg = '';
+      try {
+        await api.post('/api/memories/share-tag', {
+          tag: this.tagShareForm.tag,
+          shared_with: this.tagShareForm.user,
+          permission: this.tagShareForm.permission,
+        });
+        this.tagShareForm = { tag: '', user: '', permission: 'read' };
+        this.showTagShareForm = false;
+        await this.loadTagShares();
+      } catch (e) {
+        this.errorMsg = 'Failed to share tag: ' + e.message;
+      }
+    },
+
+    async removeTagShare(tag, sharedWith) {
+      this.errorMsg = '';
+      try {
+        await api.del('/api/memories/share-tag', { tag, shared_with: sharedWith });
+        await this.loadTagShares();
+      } catch (e) {
+        this.errorMsg = 'Failed to remove tag share: ' + e.message;
       }
     },
 

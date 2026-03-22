@@ -43,3 +43,4 @@ docker/pgdata/
 # Database
 *.db
 *.sqlite3
+.hypothesis/

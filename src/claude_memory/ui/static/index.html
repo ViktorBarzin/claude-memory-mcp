@@ -158,6 +158,11 @@
           </div>
         </div>
 
+        <!-- Error message -->
+        <template x-if="errorMsg">
+          <p class="text-sm mb-4" style="color: var(--danger)" x-text="errorMsg"></p>
+        </template>
+
         <!-- My Memories -->
         <div class="section-title">My Memories</div>
         <div class="space-y-2 mb-6">
@@ -325,6 +330,64 @@
             </div>
           </div>
         </template>
+
+        <!-- Tag Shares -->
+        <div class="mt-6">
+          <div class="flex items-center gap-3 mb-3">
+            <div class="section-title" style="margin-bottom:0">Tag Shares</div>
+            <button class="btn btn-ghost text-xs" @click="showTagShareForm = !showTagShareForm">
+              <span x-show="!showTagShareForm">+ Share Tag</span>
+              <span x-show="showTagShareForm">Cancel</span>
+            </button>
+          </div>
+
+          <!-- Tag Share Form -->
+          <div x-show="showTagShareForm" class="add-form-container mb-4">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+              <div>
+                <label class="section-title">Tag</label>
+                <input type="text" class="input-field" x-model="tagShareForm.tag" placeholder="tag name">
+              </div>
+              <div class="relative">
+                <label class="section-title">User</label>
+                <input type="text" class="input-field" x-model="tagShareForm.user" placeholder="Username" @input="tagShareUserFilter = tagShareForm.user" @focus="tagShareUserFilter = tagShareForm.user">
+                <div x-show="tagShareForm.user && filteredTagShareUsers.length > 0" class="typeahead-dropdown">
+                  <template x-for="u in filteredTagShareUsers" :key="u">
+                    <div class="typeahead-item" @click="selectTagShareUser(u)" x-text="u"></div>
+                  </template>
+                </div>
+              </div>
+              <div>
+                <label class="section-title">Permission</label>
+                <select class="input-field" x-model="tagShareForm.permission">
+                  <option value="read">Read</option>
+                  <option value="write">Write</option>
+                </select>
+              </div>
+            </div>
+            <button class="btn btn-primary text-sm" @click="addTagShare()" :disabled="!tagShareForm.tag.trim() || !tagShareForm.user.trim()">Share Tag</button>
+          </div>
+
+          <!-- Existing Tag Shares -->
+          <template x-if="tagShares.length > 0">
+            <div class="space-y-2">
+              <template x-for="ts in tagShares" :key="ts.tag + ts.shared_with">
+                <div class="memory-card flex items-center justify-between">
+                  <div class="flex items-center gap-2">
+                    <span class="tag-pill" x-text="ts.tag"></span>
+                    <span class="text-sm" style="color: var(--text-secondary)">shared with</span>
+                    <span class="text-sm" style="color: var(--text-primary)" x-text="ts.shared_with"></span>
+                    <span class="badge" :class="ts.permission === 'write' ? 'badge-write' : 'badge-read'" x-text="ts.permission"></span>
+                  </div>
+                  <button class="btn text-xs" style="color: var(--danger)" @click="removeTagShare(ts.tag, ts.shared_with)">Remove</button>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="tagShares.length === 0 && !showTagShareForm">
+            <p class="text-sm" style="color: var(--text-muted)">No tag shares yet</p>
+          </template>
+        </div>
       </div>
 
       <!-- Tab: Search -->

@@ -9,8 +9,8 @@ MAX_MEMORY_CHARS = 800
 class MemoryStore(BaseModel):
     content: str = Field(..., max_length=MAX_MEMORY_CHARS)
     category: str = "facts"
-    tags: str = ""
-    expanded_keywords: str = ""
+    tags: str = Field(default="", max_length=500)
+    expanded_keywords: str = Field(default="", max_length=500)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
     force_sensitive: bool = False
 
@@ -19,8 +19,8 @@ class MemoryRecall(BaseModel):
     context: str
     expanded_query: str = ""
     category: Optional[str] = None
-    sort_by: str = "importance"
-    limit: int = 10
+    sort_by: Literal["importance", "relevance", "recency"] = "importance"
+    limit: int = Field(default=10, ge=1, le=500)
 
 
 class MemoryResponse(BaseModel):
