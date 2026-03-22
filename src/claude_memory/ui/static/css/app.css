@@ -289,6 +289,60 @@ textarea.input-field {
   height: 100%;
 }
 
+/* Fullscreen toggle button */
+.fullscreen-toggle-btn {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  z-index: 11;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fullscreen-toggle-btn:hover {
+  color: var(--accent);
+  border-color: var(--border-accent);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+/* Graph fullscreen mode */
+.graph-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 50 !important;
+  background: var(--bg-primary) !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+}
+
+.graph-fullscreen .graph-container {
+  height: 100vh !important;
+  border-radius: 0;
+  border: none;
+}
+
+.graph-fullscreen .flex.flex-wrap.gap-2.mb-4 {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 11;
+  background: var(--bg-primary);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  opacity: 0.9;
+}
+
 /* Node detail panel */
 .node-detail {
   background: var(--bg-secondary);

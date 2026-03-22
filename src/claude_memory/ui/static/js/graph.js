@@ -7,6 +7,7 @@ function graphComponent() {
     loading: false,
     selectedNode: null,
     simulation: null,
+    isFullscreen: false,
 
     async init() {
       this.loading = true;
@@ -192,6 +193,24 @@ function graphComponent() {
           .attr('x', d => d.x + 8 + d.importance * 15)
           .attr('y', d => d.y + 4);
       });
+    },
+
+    toggleFullscreen() {
+      this.isFullscreen = !this.isFullscreen;
+      const wrapper = this.$el.closest('[x-show="$store.app.activeTab === \'graph\'"]');
+      if (wrapper) {
+        wrapper.classList.toggle('graph-fullscreen', this.isFullscreen);
+      }
+      if (this.isFullscreen) {
+        this._escHandler = (e) => { if (e.key === 'Escape') this.toggleFullscreen(); };
+        document.addEventListener('keydown', this._escHandler);
+      } else {
+        if (this._escHandler) {
+          document.removeEventListener('keydown', this._escHandler);
+          this._escHandler = null;
+        }
+      }
+      setTimeout(() => this.render(), 50);
     },
 
     preview(content, len = 200) {
