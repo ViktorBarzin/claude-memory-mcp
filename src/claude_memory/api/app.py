@@ -1,8 +1,10 @@
 """Claude Memory API -- shared persistent memory with PostgreSQL full-text search."""
 
+import hashlib
 import json
 import logging
 import pathlib
+import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -46,12 +48,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Claude Memory API", lifespan=lifespan)
 
 UI_DIR = pathlib.Path(__file__).parent.parent / "ui" / "static"
+_CACHE_BUST = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
 
 
 @app.get("/")
-async def ui_root() -> FileResponse:
-    """Serve the UI single-page app."""
-    return FileResponse(UI_DIR / "index.html")
+async def ui_root() -> Response:
+    """Serve the UI single-page app with cache-busted static assets."""
+    html = (UI_DIR / "index.html").read_text()
+    html = html.replace("/static/js/", f"/static/js/").replace(
+        '.js"', f'.js?v={_CACHE_BUST}"'
+    ).replace('.css"', f'.css?v={_CACHE_BUST}"')
+    return Response(content=html, media_type="text/html")
 
 
 def _detect_sensitive(content: str) -> bool:
