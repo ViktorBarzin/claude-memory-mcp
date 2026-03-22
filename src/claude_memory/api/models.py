@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -38,3 +38,26 @@ class SecretResponse(BaseModel):
 class SyncResponse(BaseModel):
     memories: list[dict[str, Any]]
     server_time: str
+
+
+class ShareMemory(BaseModel):
+    shared_with: str = Field(..., min_length=1, max_length=100)
+    permission: Literal["read", "write"] = "read"
+
+
+class ShareTag(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=100)
+    shared_with: str = Field(..., min_length=1, max_length=100)
+    permission: Literal["read", "write"] = "read"
+
+
+class UnshareTag(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=100)
+    shared_with: str = Field(..., min_length=1, max_length=100)
+
+
+class MemoryUpdate(BaseModel):
+    content: Optional[str] = Field(None, max_length=MAX_MEMORY_CHARS)
+    tags: Optional[str] = None
+    importance: Optional[float] = Field(None, ge=0.0, le=1.0)
+    expanded_keywords: Optional[str] = None
