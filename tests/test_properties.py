@@ -29,15 +29,12 @@ def test_roundtrip_memory_store(mem):
     assert restored.tags == mem.tags
 
 
-@given(content=st.text(min_size=801, max_size=1000))
+@given(content=st.text(min_size=801, max_size=2000))
 @settings(max_examples=20)
-def test_content_over_max_rejected(content):
-    """Content exceeding 800 chars is rejected."""
-    try:
-        MemoryStore(content=content)
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
-        pass
+def test_content_over_500_accepted(content):
+    """Content over 500 chars is accepted by the model (auto-split happens server-side)."""
+    mem = MemoryStore(content=content)
+    assert len(mem.content) > 500
 
 
 @given(importance=st.floats().filter(lambda x: x < 0.0 or x > 1.0).filter(lambda x: x == x))  # exclude NaN

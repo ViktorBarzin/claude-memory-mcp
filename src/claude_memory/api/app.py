@@ -834,29 +834,64 @@ def _resolve_user_from_token(token: str) -> str | None:
 mcp_server = FastMCP("claude-memory")
 
 
+MAX_MEMORY_CHARS = 500
+
+
+def _split_content(text: str, max_chars: int = MAX_MEMORY_CHARS) -> list[str]:
+    """Split text into chunks on paragraph boundaries, each <= max_chars."""
+    if len(text) <= max_chars:
+        return [text]
+    paragraphs = text.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        candidate = f"{current}\n\n{para}".strip() if current else para
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # If a single paragraph exceeds max_chars, hard-split it
+            while len(para) > max_chars:
+                chunks.append(para[:max_chars])
+                para = para[max_chars:]
+            current = para
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 @mcp_server.tool()
 async def memory_store(content: str, category: str = "facts", tags: str = "",
                        expanded_keywords: str = "", importance: float = 0.5) -> str:
-    """Store a new memory."""
+    """Store a new memory. Content over 500 chars is auto-split into multiple memories."""
     pool = await get_pool()
     user_id = _current_user.get()
-    is_sensitive = _detect_sensitive(content)
-    stored_content = content if not is_sensitive else _redact_content(content)
+    chunks = _split_content(content)
 
+    created_ids = []
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO memories (user_id, content, category, tags, expanded_keywords, importance, is_sensitive)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
-               RETURNING id""",
-            user_id, stored_content, category, tags, expanded_keywords, importance, is_sensitive,
-        )
-        memory_id = row["id"]
+        for i, chunk in enumerate(chunks):
+            is_sensitive = _detect_sensitive(chunk)
+            stored = chunk if not is_sensitive else _redact_content(chunk)
+            chunk_tags = f"{tags},part-{i + 1}-of-{len(chunks)}" if len(chunks) > 1 else tags
 
-        if is_sensitive and is_vault_configured():
-            vault_path = await store_secret(user_id, memory_id, content)
-            await conn.execute("UPDATE memories SET vault_path = $1 WHERE id = $2", vault_path, memory_id)
+            row = await conn.fetchrow(
+                """INSERT INTO memories (user_id, content, category, tags, expanded_keywords, importance, is_sensitive)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING id""",
+                user_id, stored, category, chunk_tags, expanded_keywords, importance, is_sensitive,
+            )
+            memory_id = row["id"]
+            created_ids.append(memory_id)
 
-    return json.dumps({"id": memory_id, "category": category, "importance": importance})
+            if is_sensitive and is_vault_configured():
+                vault_path = await store_secret(user_id, memory_id, chunk)
+                await conn.execute("UPDATE memories SET vault_path = $1 WHERE id = $2", vault_path, memory_id)
+
+    if len(created_ids) == 1:
+        return json.dumps({"id": created_ids[0], "category": category, "importance": importance})
+    return json.dumps({"ids": created_ids, "parts": len(created_ids), "category": category, "importance": importance})
 
 
 @mcp_server.tool()

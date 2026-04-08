@@ -3,11 +3,8 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-MAX_MEMORY_CHARS = 800
-
-
 class MemoryStore(BaseModel):
-    content: str = Field(..., max_length=MAX_MEMORY_CHARS)
+    content: str
     category: str = "facts"
     tags: str = Field(default="", max_length=500)
     expanded_keywords: str = Field(default="", max_length=500)
@@ -57,7 +54,7 @@ class UnshareTag(BaseModel):
 
 
 class MemoryUpdate(BaseModel):
-    content: Optional[str] = Field(None, max_length=MAX_MEMORY_CHARS)
+    content: Optional[str] = None
     tags: Optional[str] = None
     importance: Optional[float] = Field(None, ge=0.0, le=1.0)
     expanded_keywords: Optional[str] = None
