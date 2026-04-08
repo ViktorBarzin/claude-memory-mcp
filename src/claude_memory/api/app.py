@@ -901,8 +901,39 @@ async def memory_recall(context: str, expanded_query: str = "",
             *params,
         )
 
+        all_rows = list(rows)
+
+        # If AND-match returned too few results, broaden to OR-match
+        if len(all_rows) < limit and query_text:
+            words = query_text.split()
+            if len(words) > 1:
+                or_tsquery = " | ".join(w for w in words if w)
+                or_params: list[Any] = [user_id, or_tsquery, limit]
+                or_cat_filter = ""
+                if category:
+                    or_cat_filter = "AND category = $4"
+                    or_params.append(category)
+                seen_ids = {r["id"] for r in all_rows}
+                or_rows = await conn.fetch(
+                    f"""
+                    SELECT id, content, category, tags, importance, is_sensitive,
+                           ts_rank(search_vector, query) AS rank, created_at, updated_at,
+                           user_id AS owner,
+                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
+                    FROM memories, to_tsquery('english', $2) query
+                    WHERE deleted_at IS NULL
+                      AND search_vector @@ query
+                      {or_cat_filter}
+                    ORDER BY {order_clause}
+                    LIMIT $3
+                    """,
+                    *or_params,
+                )
+                all_rows = all_rows + [r for r in or_rows if r["id"] not in seen_ids]
+                all_rows = all_rows[:limit]
+
     results = []
-    for row in rows:
+    for row in all_rows:
         c = row["content"]
         if row["is_sensitive"]:
             c = f"[SENSITIVE - use secret_get(id={row['id']})]"
