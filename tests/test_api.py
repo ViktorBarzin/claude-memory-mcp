@@ -37,6 +37,7 @@ def _make_memory_row(**overrides):
         "created_at": now,
         "updated_at": now,
         "deleted_at": None,
+        "owner": "testuser",
         "shared_by": None,
         "share_permission": None,
     }
@@ -139,14 +140,11 @@ async def test_store_memory_creates_record_with_user_id(client):
 
 
 @pytest.mark.asyncio
-async def test_recall_returns_only_user_memories(client):
+async def test_recall_returns_all_memories(client):
     ac, conn, app_mod = client
-    # recall calls fetch 3 times: own, shared, tag-shared; plus OR-fallback if < limit
-    conn.fetch.side_effect = [
-        [_make_memory_row(id=1, content="user memory", is_sensitive=False)],  # own
-        [],  # individually shared
-        [],  # tag-shared
-        [],  # OR-match fallback
+    # recall now runs a single query (all memories are public)
+    conn.fetch.return_value = [
+        _make_memory_row(id=1, content="user memory", is_sensitive=False, owner="testuser", shared_by=None),
     ]
 
     async with ac:
@@ -161,19 +159,14 @@ async def test_recall_returns_only_user_memories(client):
     results = data["memories"]
     assert len(results) == 1
     assert results[0]["content"] == "user memory"
-
-    # Verify query includes user_id filter
-    call_args = conn.fetch.call_args
-    assert call_args[0][1] == "testuser"
+    assert results[0]["owner"] == "testuser"
 
 
 @pytest.mark.asyncio
 async def test_recall_redacts_sensitive_memories(client):
     ac, conn, app_mod = client
-    conn.fetch.side_effect = [
-        [_make_memory_row(id=5, content="[REDACTED]", is_sensitive=True)],  # own
-        [],  # individually shared
-        [],  # tag-shared
+    conn.fetch.return_value = [
+        _make_memory_row(id=5, content="[REDACTED]", is_sensitive=True, owner="testuser", shared_by=None),
     ]
 
     async with ac:
@@ -191,11 +184,11 @@ async def test_recall_redacts_sensitive_memories(client):
 
 
 @pytest.mark.asyncio
-async def test_list_returns_only_user_memories(client):
+async def test_list_returns_all_memories(client):
     ac, conn, app_mod = client
     conn.fetch.return_value = [
-        _make_memory_row(id=1, content="mem1"),
-        _make_memory_row(id=2, content="mem2"),
+        _make_memory_row(id=1, content="mem1", owner="testuser"),
+        _make_memory_row(id=2, content="mem2", owner="otheruser"),
     ]
 
     async with ac:
@@ -208,10 +201,8 @@ async def test_list_returns_only_user_memories(client):
     data = resp.json()
     results = data["memories"]
     assert len(results) == 2
-
-    # Verify user_id filter
-    call_args = conn.fetch.call_args
-    assert call_args[0][1] == "testuser"
+    assert results[0]["owner"] == "testuser"
+    assert results[1]["owner"] == "otheruser"
 
 
 @pytest.mark.asyncio
@@ -601,15 +592,14 @@ async def test_my_shares_returns_outgoing_shares(client):
 
 
 @pytest.mark.asyncio
-async def test_recall_includes_shared_memories(client):
-    """POST /api/memories/recall includes shared memories with shared_by field."""
+async def test_recall_includes_all_users_memories(client):
+    """POST /api/memories/recall returns all users' memories with owner field."""
     ac, conn, app_mod = client
-    # recall calls fetch multiple times: own, shared, tag-shared, OR-fallback
-    conn.fetch.side_effect = [
-        [_make_memory_row(id=1, content="own memory", user_id="testuser", shared_by=None)],  # own
-        [_make_memory_row(id=2, content="shared memory", user_id="owner1", shared_by="owner1")],  # shared
-        [_make_memory_row(id=3, content="tag shared", user_id="owner2", shared_by="owner2")],  # tag-shared
-        [],  # OR-fallback
+    # Single query returns all memories (public by default)
+    conn.fetch.return_value = [
+        _make_memory_row(id=1, content="own memory", owner="testuser", shared_by=None),
+        _make_memory_row(id=2, content="other memory", owner="owner1", shared_by="owner1"),
+        _make_memory_row(id=3, content="another memory", owner="owner2", shared_by="owner2"),
     ]
 
     async with ac:
@@ -623,10 +613,10 @@ async def test_recall_includes_shared_memories(client):
     data = resp.json()
     results = data["memories"]
     assert len(results) == 3
-    # Check that shared_by field appears in shared memories
+    assert results[0]["owner"] == "testuser"
     assert results[0]["shared_by"] is None
+    assert results[1]["owner"] == "owner1"
     assert results[1]["shared_by"] == "owner1"
-    assert results[2]["shared_by"] == "owner2"
 
 
 @pytest.mark.asyncio

@@ -213,16 +213,15 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
         params.append(body.category)
 
     async with pool.acquire() as conn:
-        # Own memories (AND-match)
+        # All memories (public by default) — AND-match
         rows = await conn.fetch(
             f"""
             SELECT id, content, category, tags, importance, is_sensitive,
                    ts_rank(search_vector, query) AS rank,
-                   created_at, updated_at,
-                   NULL::text AS shared_by, NULL::text AS share_permission
+                   created_at, updated_at, user_id AS owner,
+                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
             FROM memories, plainto_tsquery('english', $2) query
-            WHERE user_id = $1
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
               AND (search_vector @@ query OR $2 = '')
               {category_filter}
             ORDER BY {order_clause}
@@ -231,64 +230,9 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             *params,
         )
 
-        # Individually shared memories
-        shared_rows = await conn.fetch(
-            f"""
-            SELECT m.id, m.content, m.category, m.tags, m.importance, m.is_sensitive,
-                   ts_rank(m.search_vector, query) AS rank,
-                   m.created_at, m.updated_at,
-                   m.user_id AS shared_by, ms.permission AS share_permission
-            FROM memories m
-            JOIN memory_shares ms ON ms.memory_id = m.id,
-                 plainto_tsquery('english', $2) query
-            WHERE ms.shared_with = $1
-              AND m.deleted_at IS NULL
-              AND (m.search_vector @@ query OR $2 = '')
-              {category_filter}
-            ORDER BY {order_clause}
-            LIMIT $3
-            """,
-            *params,
-        )
+        all_rows = list(rows)
 
-        # Tag-shared memories
-        tag_shared_rows = await conn.fetch(
-            f"""
-            SELECT DISTINCT ON (m.id)
-                   m.id, m.content, m.category, m.tags, m.importance, m.is_sensitive,
-                   ts_rank(m.search_vector, query) AS rank,
-                   m.created_at, m.updated_at,
-                   m.user_id AS shared_by, ts.permission AS share_permission
-            FROM memories m
-            JOIN tag_shares ts ON ts.owner_id = m.user_id,
-                 plainto_tsquery('english', $2) query
-            WHERE ts.shared_with = $1
-              AND m.deleted_at IS NULL
-              AND (m.search_vector @@ query OR $2 = '')
-              AND EXISTS (
-                SELECT 1 FROM unnest(string_to_array(m.tags, ',')) t
-                WHERE trim(t) = ts.tag
-              )
-              {category_filter}
-            ORDER BY m.id
-            LIMIT $3
-            """,
-            *params,
-        )
-
-        # Merge and deduplicate
-        seen_ids: set[int] = set()
-        all_rows = []
-        for row in list(rows) + list(shared_rows) + list(tag_shared_rows):
-            if row["id"] not in seen_ids:
-                seen_ids.add(row["id"])
-                all_rows.append(row)
-
-        # Sort merged results by importance desc and trim
-        all_rows.sort(key=lambda r: r["importance"], reverse=True)
-        all_rows = all_rows[:body.limit]
-
-        # If AND-match returned too few results, broaden to OR-match (own memories only)
+        # If AND-match returned too few results, broaden to OR-match
         if len(all_rows) < body.limit and query_text:
             words = query_text.split()
             if len(words) > 1:
@@ -298,15 +242,15 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
                 if body.category:
                     or_cat_filter = "AND category = $4"
                     or_params.append(body.category)
+                seen_ids = {r["id"] for r in all_rows}
                 or_rows = await conn.fetch(
                     f"""
                     SELECT id, content, category, tags, importance, is_sensitive,
                            ts_rank(search_vector, query) AS rank,
-                           created_at, updated_at,
-                           NULL::text AS shared_by, NULL::text AS share_permission
+                           created_at, updated_at, user_id AS owner,
+                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
                     FROM memories, to_tsquery('english', $2) query
-                    WHERE user_id = $1
-                      AND deleted_at IS NULL
+                    WHERE deleted_at IS NULL
                       AND search_vector @@ query
                       {or_cat_filter}
                     ORDER BY {order_clause}
@@ -331,10 +275,10 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
                 "importance": row["importance"],
                 "is_sensitive": row["is_sensitive"],
                 "rank": float(row["rank"]),
+                "owner": row["owner"],
                 "created_at": row["created_at"].isoformat(),
                 "updated_at": row["updated_at"].isoformat(),
                 "shared_by": row["shared_by"],
-                "share_permission": row["share_permission"],
             }
         )
 
@@ -351,10 +295,10 @@ async def list_memories(
 ) -> dict[str, Any]:
     pool = await get_pool()
 
-    # Build WHERE clauses dynamically
-    where_clauses = ["user_id = $1", "deleted_at IS NULL"]
-    count_params: list[Any] = [user.user_id]
-    param_idx = 2
+    # Build WHERE clauses dynamically — all memories are public
+    where_clauses = ["deleted_at IS NULL"]
+    count_params: list[Any] = []
+    param_idx = 1
 
     if category:
         where_clauses.append(f"category = ${param_idx}")
@@ -373,7 +317,7 @@ async def list_memories(
 
     params: list[Any] = [*count_params, limit, offset]
     query = f"""
-        SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
+        SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at, user_id AS owner
         FROM memories WHERE {where}
         ORDER BY importance DESC LIMIT ${param_idx} OFFSET ${param_idx + 1}
     """
@@ -395,6 +339,7 @@ async def list_memories(
                 "tags": row["tags"],
                 "importance": row["importance"],
                 "is_sensitive": row["is_sensitive"],
+                "owner": row["owner"],
                 "created_at": row["created_at"].isoformat(),
                 "updated_at": row["updated_at"].isoformat(),
             }
@@ -405,30 +350,28 @@ async def list_memories(
 
 @app.get("/api/categories")
 async def list_categories(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    """Return distinct category values for the current user."""
+    """Return distinct category values across all users."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT DISTINCT category FROM memories WHERE user_id = $1 AND deleted_at IS NULL ORDER BY category",
-            user.user_id,
+            "SELECT DISTINCT category FROM memories WHERE deleted_at IS NULL ORDER BY category",
         )
     return {"categories": [r["category"] for r in rows]}
 
 
 @app.get("/api/tags")
 async def list_tags(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    """Return all distinct tags with memory counts for the current user."""
+    """Return all distinct tags with memory counts across all users."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT trim(t) as tag, COUNT(*) as count
             FROM memories, unnest(string_to_array(tags, ',')) AS t
-            WHERE user_id = $1 AND deleted_at IS NULL AND tags != '' AND tags IS NOT NULL
+            WHERE deleted_at IS NULL AND tags != '' AND tags IS NOT NULL
             GROUP BY trim(t)
             ORDER BY count DESC
             """,
-            user.user_id,
         )
     return {"tags": [{"tag": r["tag"], "count": r["count"]} for r in rows]}
 
@@ -946,9 +889,10 @@ async def memory_recall(context: str, expanded_query: str = "",
             f"""
             SELECT id, content, category, tags, importance, is_sensitive,
                    ts_rank(search_vector, query) AS rank, created_at, updated_at,
-                   NULL::text AS shared_by
+                   user_id AS owner,
+                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
             FROM memories, plainto_tsquery('english', $2) query
-            WHERE user_id = $1 AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
               AND (search_vector @@ query OR $2 = '')
               {category_filter}
             ORDER BY {order_clause}
@@ -957,34 +901,8 @@ async def memory_recall(context: str, expanded_query: str = "",
             *params,
         )
 
-        # Also fetch shared memories (individual + tag-based)
-        shared_rows = await conn.fetch(
-            """
-            SELECT DISTINCT ON (m.id) m.id, m.content, m.category, m.tags, m.importance,
-                   m.is_sensitive, ts_rank(m.search_vector, query) AS rank,
-                   m.created_at, m.updated_at, m.user_id AS shared_by
-            FROM memories m, plainto_tsquery('english', $2) query
-            WHERE m.deleted_at IS NULL
-              AND (m.search_vector @@ query OR $2 = '')
-              AND m.user_id != $1
-              AND (
-                EXISTS (SELECT 1 FROM memory_shares ms WHERE ms.memory_id = m.id AND ms.shared_with = $1)
-                OR EXISTS (
-                  SELECT 1 FROM tag_shares ts
-                  WHERE ts.owner_id = m.user_id AND ts.shared_with = $1
-                    AND EXISTS (SELECT 1 FROM unnest(string_to_array(m.tags, ',')) t WHERE trim(t) = ts.tag)
-                )
-              )
-            ORDER BY m.id
-            LIMIT $3
-            """,
-            *params,
-        )
-
-    seen_ids = set()
     results = []
     for row in rows:
-        seen_ids.add(row["id"])
         c = row["content"]
         if row["is_sensitive"]:
             c = f"[SENSITIVE - use secret_get(id={row['id']})]"
@@ -992,26 +910,13 @@ async def memory_recall(context: str, expanded_query: str = "",
             "id": row["id"], "content": c, "category": row["category"],
             "tags": row["tags"], "importance": row["importance"],
             "rank": float(row["rank"]),
+            "owner": row["owner"],
             "created_at": row["created_at"].isoformat(),
             "updated_at": row["updated_at"].isoformat(),
         }
+        if row["shared_by"]:
+            entry["shared_by"] = row["shared_by"]
         results.append(entry)
-
-    for row in shared_rows:
-        if row["id"] in seen_ids:
-            continue
-        seen_ids.add(row["id"])
-        c = row["content"]
-        if row["is_sensitive"]:
-            c = f"[SENSITIVE - use secret_get(id={row['id']})]"
-        results.append({
-            "id": row["id"], "content": c, "category": row["category"],
-            "tags": row["tags"], "importance": row["importance"],
-            "rank": float(row["rank"]),
-            "shared_by": row["shared_by"],
-            "created_at": row["created_at"].isoformat(),
-            "updated_at": row["updated_at"].isoformat(),
-        })
 
     return json.dumps({"memories": results})
 
@@ -1020,81 +925,30 @@ async def memory_recall(context: str, expanded_query: str = "",
 async def memory_list(category: str | None = None, limit: int = 20) -> str:
     """List stored memories."""
     pool = await get_pool()
-    user_id = _current_user.get()
 
     if category:
-        query = """SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-                   FROM memories WHERE user_id = $1 AND deleted_at IS NULL AND category = $2
-                   ORDER BY importance DESC LIMIT $3"""
-        params: list[Any] = [user_id, category, limit]
-    else:
-        query = """SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at
-                   FROM memories WHERE user_id = $1 AND deleted_at IS NULL
+        query = """SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at, user_id AS owner
+                   FROM memories WHERE deleted_at IS NULL AND category = $1
                    ORDER BY importance DESC LIMIT $2"""
-        params = [user_id, limit]
-
-    if category:
-        shared_query = """
-            SELECT DISTINCT ON (m.id) m.id, m.content, m.category, m.tags, m.importance,
-                   m.is_sensitive, m.created_at, m.updated_at, m.user_id AS shared_by
-            FROM memories m
-            WHERE m.deleted_at IS NULL AND m.category = $2 AND m.user_id != $1
-              AND (
-                EXISTS (SELECT 1 FROM memory_shares ms WHERE ms.memory_id = m.id AND ms.shared_with = $1)
-                OR EXISTS (
-                  SELECT 1 FROM tag_shares ts
-                  WHERE ts.owner_id = m.user_id AND ts.shared_with = $1
-                    AND EXISTS (SELECT 1 FROM unnest(string_to_array(m.tags, ',')) t WHERE trim(t) = ts.tag)
-                )
-              )
-            ORDER BY m.id LIMIT $3"""
-        shared_params: list[Any] = [user_id, category, limit]
+        params: list[Any] = [category, limit]
     else:
-        shared_query = """
-            SELECT DISTINCT ON (m.id) m.id, m.content, m.category, m.tags, m.importance,
-                   m.is_sensitive, m.created_at, m.updated_at, m.user_id AS shared_by
-            FROM memories m
-            WHERE m.deleted_at IS NULL AND m.user_id != $1
-              AND (
-                EXISTS (SELECT 1 FROM memory_shares ms WHERE ms.memory_id = m.id AND ms.shared_with = $1)
-                OR EXISTS (
-                  SELECT 1 FROM tag_shares ts
-                  WHERE ts.owner_id = m.user_id AND ts.shared_with = $1
-                    AND EXISTS (SELECT 1 FROM unnest(string_to_array(m.tags, ',')) t WHERE trim(t) = ts.tag)
-                )
-              )
-            ORDER BY m.id LIMIT $2"""
-        shared_params = [user_id, limit]
+        query = """SELECT id, content, category, tags, importance, is_sensitive, created_at, updated_at, user_id AS owner
+                   FROM memories WHERE deleted_at IS NULL
+                   ORDER BY importance DESC LIMIT $1"""
+        params = [limit]
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(query, *params)
-        shared_rows = await conn.fetch(shared_query, *shared_params)
 
-    seen_ids = set()
     results = []
     for row in rows:
-        seen_ids.add(row["id"])
         c = row["content"]
         if row["is_sensitive"]:
             c = f"[SENSITIVE - use secret_get(id={row['id']})]"
         results.append({
             "id": row["id"], "content": c, "category": row["category"],
             "tags": row["tags"], "importance": row["importance"],
-            "created_at": row["created_at"].isoformat(),
-            "updated_at": row["updated_at"].isoformat(),
-        })
-
-    for row in shared_rows:
-        if row["id"] in seen_ids:
-            continue
-        seen_ids.add(row["id"])
-        c = row["content"]
-        if row["is_sensitive"]:
-            c = f"[SENSITIVE - use secret_get(id={row['id']})]"
-        results.append({
-            "id": row["id"], "content": c, "category": row["category"],
-            "tags": row["tags"], "importance": row["importance"],
-            "shared_by": row["shared_by"],
+            "owner": row["owner"],
             "created_at": row["created_at"].isoformat(),
             "updated_at": row["updated_at"].isoformat(),
         })
@@ -1131,9 +985,8 @@ async def memory_delete(memory_id: int) -> str:
 async def memory_count() -> str:
     """Count total memories."""
     pool = await get_pool()
-    user_id = _current_user.get()
     async with pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE user_id = $1 AND deleted_at IS NULL", user_id)
+        count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL")
     return json.dumps({"count": count})
 
 
