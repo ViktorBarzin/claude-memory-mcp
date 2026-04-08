@@ -14,7 +14,6 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -1194,31 +1193,7 @@ class MCPAuthMiddleware:
 
 app.add_middleware(MCPAuthMiddleware)
 
-# Mount SSE transport
-sse_transport = SseServerTransport("/messages/")
-
-
-class HandleSSE:
-    """ASGI app for SSE connections."""
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        # Extract user from Authorization header for multi-user MCP
-        user_id = "default"
-        for name, value in scope.get("headers", []):
-            if name == b"authorization":
-                token = value.decode().removeprefix("Bearer ").strip()
-                resolved = _resolve_user_from_token(token)
-                if resolved:
-                    user_id = resolved
-                break
-        _current_user.set(user_id)
-        async with sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            await mcp_server._mcp_server.run(
-                read_stream, write_stream, mcp_server._mcp_server.create_initialization_options()
-            )
-
-
-# Streamable HTTP transport — session manager handles lifecycle automatically.
-# More reliable through proxies than SSE since responses come in HTTP body.
+# Streamable HTTP transport — the only MCP transport (SSE is deprecated).
 streamable_session_mgr = StreamableHTTPSessionManager(
     app=mcp_server._mcp_server,
     json_response=True,
@@ -1247,10 +1222,7 @@ streamable_handler = HandleStreamableHTTP()
 # Static files for UI (before MCP mount)
 app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
 
-# Client connects to /mcp/sse, posts to /mcp/messages/ (SSE transport)
-# Client can also POST to /mcp/mcp (streamable-http transport)
+# MCP streamable-http transport at /mcp/mcp
 app.router.routes.insert(0, Mount("/mcp", routes=[
-    Route("/sse", endpoint=HandleSSE()),
-    Mount("/messages", app=sse_transport.handle_post_message),
     Route("/mcp", endpoint=streamable_handler, methods=["GET", "POST", "DELETE"]),
 ]))
