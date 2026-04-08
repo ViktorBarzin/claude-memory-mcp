@@ -20,7 +20,7 @@ class MemoryRecall(BaseModel):
     expanded_query: str = ""
     category: Optional[str] = None
     sort_by: Literal["importance", "relevance", "recency"] = "importance"
-    limit: int = Field(default=10, ge=1, le=500)
+    limit: int = Field(default=10000, ge=1, le=10000)
 
 
 class MemoryResponse(BaseModel):

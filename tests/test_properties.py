@@ -89,10 +89,10 @@ def test_invalid_sort_by_rejected(sort_by):
         pass
 
 
-@given(limit=st.integers(min_value=501, max_value=10000))
+@given(limit=st.integers(min_value=10001, max_value=50000))
 @settings(max_examples=10)
 def test_limit_too_high_rejected(limit):
-    """Limit above 500 is rejected after model update."""
+    """Limit above 10000 is rejected after model update."""
     try:
         MemoryRecall(context="test", limit=limit)
         assert False, "Should have raised ValidationError"

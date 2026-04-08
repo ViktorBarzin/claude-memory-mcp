@@ -289,7 +289,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
 async def list_memories(
     category: Optional[str] = None,
     tag: Optional[str] = None,
-    limit: int = 50,
+    limit: int = 10000,
     offset: int = 0,
     user: AuthUser = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -862,7 +862,7 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
 @mcp_server.tool()
 async def memory_recall(context: str, expanded_query: str = "",
                         category: str | None = None, sort_by: str = "importance",
-                        limit: int = 10) -> str:
+                        limit: int = 10000) -> str:
     """Recall memories by semantic search."""
     pool = await get_pool()
     user_id = _current_user.get()
@@ -922,7 +922,7 @@ async def memory_recall(context: str, expanded_query: str = "",
 
 
 @mcp_server.tool()
-async def memory_list(category: str | None = None, limit: int = 20) -> str:
+async def memory_list(category: str | None = None, limit: int = 10000) -> str:
     """List stored memories."""
     pool = await get_pool()
 
