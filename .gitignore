@@ -44,3 +44,7 @@ docker/pgdata/
 *.db
 *.sqlite3
 .hypothesis/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key

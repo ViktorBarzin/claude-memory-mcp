@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "claude_memory_mcp",
+  "project_id": "83137e85-8f85-4af8-9aec-434bc052dc75"
+}
