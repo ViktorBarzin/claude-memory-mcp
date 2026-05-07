@@ -24,21 +24,13 @@ steps:
     depends_on:
       - test
     settings:
-      # Dual-push during the Forgejo registry consolidation bake. DockerHub
-      # stays as the canonical pull target until Phase 3 flips
-      # infra/stacks/claude-memory/main.tf to Forgejo. The GHA build (CI)
-      # workflow is .disabled until rollback — see
-      # docs/plans/2026-05-07-forgejo-registry-consolidation-plan.md
-      # § "Risk register".
+      # Phase 4 of forgejo-registry-consolidation 2026-05-07 — Forgejo only.
+      # The DockerHub mirror stays as the public-facing release target via
+      # the GitHub `release.yml` workflow (still enabled), but the cluster
+      # pulls from Forgejo (infra/stacks/claude-memory/main.tf flipped 2026-05-07).
       repo:
-        - viktorbarzin/claude-memory-mcp
         - forgejo.viktorbarzin.me/viktor/claude-memory-mcp
       logins:
-        - registry: docker.io
-          username:
-            from_secret: dockerhub_username
-          password:
-            from_secret: dockerhub_token
         - registry: forgejo.viktorbarzin.me
           username:
             from_secret: forgejo_user
