@@ -190,6 +190,12 @@ async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_u
     return MemoryResponse(id=row["id"], category=row["category"], importance=row["importance"])
 
 
+# OR-broadening fallback: when the precise AND-match is sparse we widen to an
+# OR-match to fill results, but only with rows whose relevance (ts_rank) clears
+# this floor. Below it a row merely contains one query word incidentally — noise.
+OR_BROADEN_MIN_RANK = 0.01
+
+
 @app.post("/api/memories/recall")
 async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     pool = await get_pool()
@@ -251,8 +257,9 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
                     FROM memories, to_tsquery('english', $2) query
                     WHERE deleted_at IS NULL
                       AND search_vector @@ query
+                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
                       {or_cat_filter}
-                    ORDER BY {order_clause}
+                    ORDER BY ts_rank(search_vector, query) DESC
                     LIMIT $3
                     """,
                     *or_params,
@@ -896,7 +903,7 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
 @mcp_server.tool()
 async def memory_recall(context: str, expanded_query: str = "",
                         category: str | None = None, sort_by: str = "importance",
-                        limit: int = 10000) -> str:
+                        limit: int = 30) -> str:
     """Recall memories by semantic search."""
     pool = await get_pool()
     user_id = _current_user.get()
@@ -957,8 +964,9 @@ async def memory_recall(context: str, expanded_query: str = "",
                     FROM memories, to_tsquery('english', $2) query
                     WHERE deleted_at IS NULL
                       AND search_vector @@ query
+                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
                       {or_cat_filter}
-                    ORDER BY {order_clause}
+                    ORDER BY ts_rank(search_vector, query) DESC
                     LIMIT $3
                     """,
                     *or_params,

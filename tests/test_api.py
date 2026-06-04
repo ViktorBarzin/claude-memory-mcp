@@ -163,6 +163,56 @@ async def test_recall_returns_all_memories(client):
 
 
 @pytest.mark.asyncio
+async def test_recall_default_limit_is_capped(client):
+    """Default recall limit must be a small top-N (30), not the whole store.
+
+    Regression for the 'recall returns the entire ~1460-memory store' bug:
+    the default was 10000, so a default call returned everything.
+    """
+    ac, conn, app_mod = client
+    conn.fetch.return_value = [_make_memory_row(id=1)]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "singleword"},  # 1 word -> no OR-broadening
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    # fetch(sql, user_id, query_text, limit[, category]) -> limit is the 4th arg
+    first_args = conn.fetch.call_args_list[0].args
+    assert first_args[3] == 30, f"default recall limit should be 30, got {first_args[3]}"
+
+
+@pytest.mark.asyncio
+async def test_recall_or_broadening_is_relevance_bounded(client):
+    """When the precise AND-match is sparse, the OR-broadening fallback must
+    order by relevance (ts_rank) and apply a minimum-rank floor — not pad up to
+    `limit` ordered by the importance hybrid (which floods with high-importance
+    but irrelevant memories).
+    """
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1)],  # AND-match: 1 row (< limit -> triggers OR)
+        [_make_memory_row(id=2)],  # OR-broadening result
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "two words"},  # >1 word -> OR-broadening fires
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    assert len(conn.fetch.call_args_list) == 2, "OR-broadening query should fire"
+    or_sql = conn.fetch.call_args_list[1].args[0]
+    assert "ts_rank(search_vector, query) DESC" in or_sql, "OR matches must be ordered by relevance"
+    assert "ts_rank(search_vector, query) >" in or_sql, "OR matches must have a minimum-rank floor"
+
+
+@pytest.mark.asyncio
 async def test_recall_redacts_sensitive_memories(client):
     ac, conn, app_mod = client
     conn.fetch.return_value = [

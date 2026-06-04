@@ -17,7 +17,9 @@ class MemoryRecall(BaseModel):
     expanded_query: str = ""
     category: Optional[str] = None
     sort_by: Literal["importance", "relevance", "recency"] = "importance"
-    limit: int = Field(default=10000, ge=1, le=10000)
+    # Default to a small top-N so recall returns the most relevant matches, not
+    # the whole store. Ceiling stays high for callers that explicitly want more.
+    limit: int = Field(default=30, ge=1, le=10000)
 
 
 class MemoryResponse(BaseModel):
