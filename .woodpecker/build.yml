@@ -12,6 +12,18 @@ clone:
 steps:
   - name: test
     image: python:3.12-slim
+    # The woodpecker ns LimitRange defaults containers to a 256Mi memory limit.
+    # `uv sync` + mypy over fastapi/pydantic/sqlalchemy needs far more, so the
+    # step was OOM-killed (exit 137) on every run since the 2026-05-07 Forgejo
+    # switch — repo never built. Pin explicit memory so it never OOMs again.
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            memory: 2Gi
     commands:
       - pip install --no-cache-dir uv
       - uv sync --all-extras
@@ -23,6 +35,15 @@ steps:
     image: woodpeckerci/plugin-docker-buildx
     depends_on:
       - test
+    # buildx + image export also exceeds the 256Mi ns default; give it room.
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            memory: 2Gi
     settings:
       # Phase 4 of forgejo-registry-consolidation 2026-05-07 — Forgejo only.
       # The DockerHub mirror stays as the public-facing release target via

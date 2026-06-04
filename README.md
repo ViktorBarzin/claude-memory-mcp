@@ -230,6 +230,10 @@ LIMIT $3
 - `sort_by="relevance"` — `ORDER BY ts_rank(search_vector, query) DESC`
 - `sort_by="recency"` — `ORDER BY created_at DESC`
 
+**Result limit:** `limit` defaults to **30** — recall returns a small top-N of the most relevant matches, not the whole store. The ceiling is 10000 for callers that explicitly opt into more.
+
+**OR-broadening fallback:** the query above is an AND-match (`plainto_tsquery` requires every query word to be present). When it returns fewer than `limit` rows and the query has more than one word, recall widens to an OR-match (`to_tsquery` joining the words with `|`) to fill the result set. Those broadened rows are ordered by `ts_rank` relevance (as in `sort_by="relevance"`) and must clear a minimum-rank floor (`OR_BROADEN_MIN_RANK = 0.01`) — a memory that merely contains one query word incidentally is dropped as noise rather than padding the results.
+
 ### Semantic Expansion at Store Time
 
 When Claude stores a memory via `memory_store`, it generates an `expanded_keywords` field — at least 5 space-separated semantically related terms. For example, storing "User prefers Svelte for frontends" might produce:
