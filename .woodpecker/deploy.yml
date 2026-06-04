@@ -1,5 +1,9 @@
+# Manual-only targeted deploy of a specific tag (set IMAGE_NAME + IMAGE_TAG).
+# Push-driven deploys are handled by build.yml's deploy step now; this no longer
+# fires on push (its IMAGE_TAG-absent exit-78 used to red every push pipeline,
+# since build.yml + deploy.yml are workflows in the same pipeline run).
 when:
-  - event: [manual, push]
+  - event: manual
 
 steps:
   - name: check-vars

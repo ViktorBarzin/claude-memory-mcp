@@ -59,6 +59,26 @@ steps:
             from_secret: forgejo_push_token
       dockerfile: docker/Dockerfile
       context: .
-      auto_tag: true
+      # Tag :latest AND the 8-char commit SHA. The SHA tag is what the deploy
+      # step pins — a unique tag forces a fresh pull under the deployment's
+      # imagePullPolicy: IfNotPresent (a re-pushed :latest would not).
+      tags:
+        - "latest"
+        - "${CI_COMMIT_SHA:0:8}"
       platforms:
         - linux/amd64
+
+  - name: deploy
+    image: bitnami/kubectl:latest
+    depends_on:
+      - build-and-push
+    when:
+      branch: [main, master]
+      event: [push, manual]
+    # Owned-app deploy model (infra CLAUDE.md): the build pipeline drives the
+    # rollout, so a push self-deploys — no manual `kubectl set image`. The
+    # woodpecker-agent SA is cluster-admin, so the in-cluster kubectl needs no
+    # kubeconfig. Keel stays enrolled as a redundant net.
+    commands:
+      - "kubectl set image deployment/claude-memory claude-memory=forgejo.viktorbarzin.me/viktor/claude-memory-mcp:${CI_COMMIT_SHA:0:8} -n claude-memory"
+      - "kubectl rollout status deployment/claude-memory -n claude-memory --timeout=300s"
