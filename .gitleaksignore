@@ -1,0 +1,5 @@
+# Synthetic test fixtures (credential-detector + crypto tests) — ruled false
+# positives during the ADR-0002 public flip (infra#20). gitleaks skips these.
+0ed5e1e016901abedae2c33049748e938bdfcf67:tests/test_crypto.py:generic-api-key:18
+0ed5e1e016901abedae2c33049748e938bdfcf67:tests/test_credential_detector.py:generic-api-key:113
+0ed5e1e016901abedae2c33049748e938bdfcf67:tests/test_credential_detector.py:private-key:37
