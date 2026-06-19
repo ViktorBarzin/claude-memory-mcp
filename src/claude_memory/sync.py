@@ -5,14 +5,14 @@ Uses only stdlib — no pip install required.
 
 import json
 import logging
-import sqlite3
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 from datetime import datetime, timezone
-from pathlib import Path
+
+from claude_memory.local_store import LocalStore
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,14 @@ FULL_RESYNC_EVERY = 10
 class SyncEngine:
     """Background sync between local SQLite cache and remote API."""
 
-    def __init__(self, db_path: str, api_base_url: str, api_key: str, sync_interval: int = 60):
+    def __init__(
+        self,
+        db_path: str,
+        api_base_url: str,
+        api_key: str,
+        sync_interval: int = 60,
+        store: "LocalStore | None" = None,
+    ):
         self.db_path = db_path
         self.api_base_url = api_base_url.rstrip("/")
         self.api_key = api_key
@@ -37,13 +44,20 @@ class SyncEngine:
         self._last_sync_success = False
         self._auth_failed = False
 
-        # Own connection for thread safety
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        self._lock = threading.Lock()
+        # Share the caller's LocalStore (one connection, one lock) when given, so the
+        # background sync writer never opens a SECOND connection to the same file and
+        # never races the store path on the single SQLite writer. When run standalone
+        # (e.g. tests), open our own store. Either way, all SQLite access below goes
+        # through self._store / self._conn / self._lock, which now point at one shared
+        # connection guarded by one re-entrant lock.
+        if store is None:
+            self._store = LocalStore.open(db_path)
+            self._owns_store = True
+        else:
+            self._store = store
+            self._owns_store = False
+        self._conn = self._store.conn
+        self._lock = self._store.lock
 
         self._init_sync_tables()
 
@@ -121,7 +135,10 @@ class SyncEngine:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
-        self._conn.close()
+        # Only close the connection if we opened it; when sharing the server's
+        # LocalStore, the server owns the connection lifecycle.
+        if self._owns_store:
+            self._store.close()
 
     def _sync_loop(self) -> None:
         """Periodic sync loop running in background thread."""

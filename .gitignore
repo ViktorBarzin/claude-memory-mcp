@@ -48,3 +48,9 @@ docker/pgdata/
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key
+
+# Agent git worktrees (standing policy: never the shared checkout)
+.worktrees/
+
+# uv lockfile — CI runs `uv sync` itself; not tracked
+uv.lock

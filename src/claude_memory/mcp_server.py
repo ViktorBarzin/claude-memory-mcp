@@ -17,7 +17,10 @@ import sqlite3
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from claude_memory.local_store import LocalStore
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +38,17 @@ HYBRID_MODE = bool(API_KEY) and not SYNC_DISABLED
 HTTP_ONLY = bool(API_KEY) and SYNC_DISABLED
 SQLITE_ONLY = not API_KEY
 
+# Default per-request HTTP timeout, and a wider bound for the one genuinely slow path:
+# a remote semantic ``memory_recall`` (embedding/search can be slow to warm up). Both are
+# explicit upper bounds so a call can never hang the MCP server indefinitely.
+DEFAULT_API_TIMEOUT = 15
+RECALL_TIMEOUT = int(os.environ.get("MEMORY_RECALL_TIMEOUT", "30"))
 
-def _api_request(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Make an HTTP request to the memory API."""
+
+def _api_request(
+    method: str, path: str, body: dict[str, Any] | None = None, timeout: int = DEFAULT_API_TIMEOUT
+) -> dict[str, Any]:
+    """Make an HTTP request to the memory API (bounded by ``timeout`` seconds)."""
     url = f"{API_BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(
@@ -50,7 +61,7 @@ def _api_request(method: str, path: str, body: dict[str, Any] | None = None) -> 
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             result: dict[str, Any] = json.loads(resp.read().decode())
             return result
     except urllib.error.HTTPError as e:
@@ -128,7 +139,9 @@ def _init_sqlite(db_path: str | None = None) -> tuple[sqlite3.Connection, str]:
     db_path = _get_db_path(db_path)
     Path(os.path.dirname(db_path)).mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(db_path, timeout=30.0)
+    # check_same_thread=False: the MCP server may handle requests on different
+    # threads and shares this one connection via LocalStore's lock (see local_store.py).
+    conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
@@ -390,19 +403,30 @@ class MemoryServer:
 
     def __init__(self, sqlite_db_path: str | None = None) -> None:
         self.sqlite_conn: sqlite3.Connection | None = None
+        self.store: "LocalStore | None" = None  # single serialized writer (see local_store.py)
         self.sync_engine: Any = None
+        # Sink for MCP notifications (e.g. progress). Defaults to writing a JSON-RPC
+        # notification line to stdout; overridable in tests.
+        self._notify: Callable[[str, dict[str, Any]], None] = self._emit_notification
 
         if SQLITE_ONLY or HYBRID_MODE:
-            self.sqlite_conn, resolved_path = _init_sqlite(sqlite_db_path)
+            conn, resolved_path = _init_sqlite(sqlite_db_path)
+            from claude_memory.local_store import LocalStore
+            self.store = LocalStore(conn)
+            self.sqlite_conn = conn
 
             if HYBRID_MODE:
                 from claude_memory.sync import SyncEngine
                 sync_interval = int(os.environ.get("MEMORY_SYNC_INTERVAL", "60"))
+                # Share the SAME LocalStore (one connection, one lock) so the background
+                # sync writer never opens a second connection to the file and never races
+                # the store path on the single SQLite writer.
                 self.sync_engine = SyncEngine(
                     db_path=resolved_path,
                     api_base_url=API_BASE_URL,
                     api_key=API_KEY,
                     sync_interval=sync_interval,
+                    store=self.store,
                 )
                 self.sync_engine.start()
 
@@ -455,30 +479,58 @@ class MemoryServer:
         limit = args.get("limit", 10)
 
         if HTTP_ONLY:
-            result = _api_request("POST", "/api/memories/recall", {
-                "context": context,
-                "expanded_query": expanded_query,
-                "category": category,
-                "sort_by": sort_by,
-                "limit": limit,
-            })
-            rows = result.get("memories", [])
-            if not rows:
-                filter_desc = f" in category '{category}'" if category else ""
-                return f"No memories found matching: {context}{filter_desc}"
-
-            sort_desc = "by relevance" if sort_by == "relevance" else "by importance"
-            filter_desc = f" in '{category}'" if category else ""
-            results = []
-            for row in rows:
-                results.append(
-                    f"#{row['id']} [{row['category']}] (importance: {row['importance']:.1f}) {row['content']}"
-                    f"\n  Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
-                )
-            return f"Found {len(rows)} memories{filter_desc} ({sort_desc}):\n\n" + "\n\n".join(results)
+            return self._recall_remote(args)
 
         # SQLite-only or Hybrid: always read from local cache
         return self._sqlite_recall(context, expanded_query, category, sort_by, limit)
+
+    def _recall_remote(self, args: dict[str, Any]) -> str:
+        """Remote semantic recall — the one genuinely slow path.
+
+        Bounded by ``RECALL_TIMEOUT`` so it can never hang the MCP server. On a timeout
+        or unreachable backend it returns a clear "working / not done — retry" signal
+        rather than raising or blocking silently.
+        """
+        context = args.get("context")
+        expanded_query = args.get("expanded_query", "")
+        category = args.get("category")
+        sort_by = args.get("sort_by", "importance")
+        limit = args.get("limit", 10)
+
+        try:
+            result = _api_request(
+                "POST", "/api/memories/recall",
+                {
+                    "context": context,
+                    "expanded_query": expanded_query,
+                    "category": category,
+                    "sort_by": sort_by,
+                    "limit": limit,
+                },
+                timeout=RECALL_TIMEOUT,
+            )
+        except RuntimeError as e:
+            # _api_request wraps connection errors / timeouts as RuntimeError. Surface a
+            # clear, actionable signal instead of hanging or dumping a stack trace.
+            return (
+                f"Memory recall did not complete within {RECALL_TIMEOUT}s — the semantic "
+                f"search backend is slow or unreachable ({e}). Please try again."
+            )
+
+        rows = result.get("memories", [])
+        if not rows:
+            filter_desc = f" in category '{category}'" if category else ""
+            return f"No memories found matching: {context}{filter_desc}"
+
+        sort_desc = "by relevance" if sort_by == "relevance" else "by importance"
+        filter_desc = f" in '{category}'" if category else ""
+        results = []
+        for row in rows:
+            results.append(
+                f"#{row['id']} [{row['category']}] (importance: {row['importance']:.1f}) {row['content']}"
+                f"\n  Tags: {row.get('tags') or 'none'} | Stored: {row['created_at']}"
+            )
+        return f"Found {len(rows)} memories{filter_desc} ({sort_desc}):\n\n" + "\n\n".join(results)
 
     def memory_list(self, args: dict[str, Any]) -> str:
         category = args.get("category")
@@ -519,10 +571,11 @@ class MemoryServer:
         # SQLite-only or Hybrid: delete from local SQLite
         # In hybrid mode, also try to sync delete to server
         server_id: int | None = None
-        if HYBRID_MODE and self.sync_engine and self.sqlite_conn:
-            cursor = self.sqlite_conn.cursor()
-            cursor.execute("SELECT server_id FROM memories WHERE id = ?", (memory_id,))
-            row = cursor.fetchone()
+        if HYBRID_MODE and self.sync_engine and self.store:
+            with self.store.lock:
+                cursor = self.store.conn.cursor()
+                cursor.execute("SELECT server_id FROM memories WHERE id = ?", (memory_id,))
+                row = cursor.fetchone()
             server_id = row["server_id"] if row and row["server_id"] else None
 
         result_text = self._sqlite_delete(memory_id)
@@ -563,12 +616,13 @@ class MemoryServer:
             lines.append(f"Last sync success: {counts['last_sync_success']}")
             return "\n".join(lines)
 
-        if self.sqlite_conn:
-            cursor = self.sqlite_conn.cursor()
-            cursor.execute("SELECT COUNT(*) as c FROM memories")
-            total = cursor.fetchone()["c"]
-            cursor.execute("SELECT category, COUNT(*) as c FROM memories GROUP BY category ORDER BY c DESC")
-            by_cat = cursor.fetchall()
+        if self.store:
+            with self.store.lock:
+                cursor = self.store.conn.cursor()
+                cursor.execute("SELECT COUNT(*) as c FROM memories")
+                total = cursor.fetchone()["c"]
+                cursor.execute("SELECT category, COUNT(*) as c FROM memories GROUP BY category ORDER BY c DESC")
+                by_cat = cursor.fetchall()
             lines = [f"Local memories (SQLite-only): {total}"]
             for row in by_cat:
                 lines.append(f"  {row['category']}: {row['c']}")
@@ -682,19 +736,25 @@ class MemoryServer:
     def _sqlite_store(self, content: str, category: str, tags: str, importance: float, expanded_keywords: str, force_sensitive: bool = False) -> str:
         from datetime import datetime, timezone
 
-        assert self.sqlite_conn is not None
+        assert self.store is not None
         now = datetime.now(timezone.utc).isoformat()
         is_sensitive = 1 if force_sensitive else 0
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute(
-            "INSERT INTO memories (content, category, tags, expanded_keywords, importance, is_sensitive, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (content, category, tags, expanded_keywords, importance, is_sensitive, now, now),
-        )
-        self.sqlite_conn.commit()
-        return f"Stored memory #{cursor.lastrowid} in category '{category}' with importance {importance:.1f}"
+
+        def _insert(conn: sqlite3.Connection) -> int | None:
+            cursor = conn.execute(
+                "INSERT INTO memories (content, category, tags, expanded_keywords, importance, is_sensitive, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (content, category, tags, expanded_keywords, importance, is_sensitive, now, now),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+        # Serialized + retry-guarded through the shared LocalStore so concurrent
+        # stores (and the background sync writer) never collide on the SQLite writer.
+        new_id = self.store.transaction(_insert)
+        return f"Stored memory #{new_id} in category '{category}' with importance {importance:.1f}"
 
     def _sqlite_recall(self, context: str, expanded_query: str, category: str | None, sort_by: str, limit: int) -> str:
-        assert self.sqlite_conn is not None
+        assert self.store is not None
         all_terms = f"{context} {expanded_query}".strip()
         words = [w.replace(chr(34), "") for w in all_terms.split() if w]
         and_query = " AND ".join(f'"{w}"' for w in words)
@@ -712,35 +772,38 @@ class MemoryServer:
             "SELECT m.id, m.content, m.category, m.tags, m.importance, m.created_at "
             "FROM memories m JOIN memories_fts fts ON m.id = fts.rowid "
         )
-        cursor = self.sqlite_conn.cursor()
         rows: list[Any] = []
-        try:
-            # Try AND first for precise matches, fall back to OR for broader results
-            cat_filter = "AND m.category = ?" if category else ""
-            for fts_query in (and_query, or_query):
-                params = [fts_query, category, limit] if category else [fts_query, limit]
-                cursor.execute(
-                    f"{base_select}WHERE memories_fts MATCH ? {cat_filter} ORDER BY {order} LIMIT ?",
-                    tuple(p for p in params if p is not None),
-                )
+        # Hold the shared lock for the whole read — the connection is shared across
+        # threads with the sync writer, so reads must serialize too.
+        with self.store.lock:
+            cursor = self.store.conn.cursor()
+            try:
+                # Try AND first for precise matches, fall back to OR for broader results
+                cat_filter = "AND m.category = ?" if category else ""
+                for fts_query in (and_query, or_query):
+                    params = [fts_query, category, limit] if category else [fts_query, limit]
+                    cursor.execute(
+                        f"{base_select}WHERE memories_fts MATCH ? {cat_filter} ORDER BY {order} LIMIT ?",
+                        tuple(p for p in params if p is not None),
+                    )
+                    rows = cursor.fetchall()
+                    if rows:
+                        break
+            except sqlite3.OperationalError:
+                like = f"%{context}%"
+                if category:
+                    cursor.execute(
+                        "SELECT id, content, category, tags, importance, created_at FROM memories "
+                        "WHERE (content LIKE ? OR tags LIKE ?) AND category = ? ORDER BY importance DESC LIMIT ?",
+                        (like, like, category, limit),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, content, category, tags, importance, created_at FROM memories "
+                        "WHERE content LIKE ? OR tags LIKE ? ORDER BY importance DESC LIMIT ?",
+                        (like, like, limit),
+                    )
                 rows = cursor.fetchall()
-                if rows:
-                    break
-        except sqlite3.OperationalError:
-            like = f"%{context}%"
-            if category:
-                cursor.execute(
-                    "SELECT id, content, category, tags, importance, created_at FROM memories "
-                    "WHERE (content LIKE ? OR tags LIKE ?) AND category = ? ORDER BY importance DESC LIMIT ?",
-                    (like, like, category, limit),
-                )
-            else:
-                cursor.execute(
-                    "SELECT id, content, category, tags, importance, created_at FROM memories "
-                    "WHERE content LIKE ? OR tags LIKE ? ORDER BY importance DESC LIMIT ?",
-                    (like, like, limit),
-                )
-            rows = cursor.fetchall()
 
         if not rows:
             return f"No memories found matching: {context}"
@@ -757,21 +820,22 @@ class MemoryServer:
         )
 
     def _sqlite_list(self, category: str | None, limit: int) -> str:
-        assert self.sqlite_conn is not None
-        cursor = self.sqlite_conn.cursor()
-        if category:
-            cursor.execute(
-                "SELECT id, content, category, tags, importance, created_at FROM memories "
-                "WHERE category = ? ORDER BY created_at DESC LIMIT ?",
-                (category, limit),
-            )
-        else:
-            cursor.execute(
-                "SELECT id, content, category, tags, importance, created_at FROM memories "
-                "ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            )
-        rows = cursor.fetchall()
+        assert self.store is not None
+        with self.store.lock:
+            cursor = self.store.conn.cursor()
+            if category:
+                cursor.execute(
+                    "SELECT id, content, category, tags, importance, created_at FROM memories "
+                    "WHERE category = ? ORDER BY created_at DESC LIMIT ?",
+                    (category, limit),
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, content, category, tags, importance, created_at FROM memories "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                )
+            rows = cursor.fetchall()
         if not rows:
             return f"No memories in category '{category}'" if category else "No memories stored yet"
 
@@ -785,25 +849,30 @@ class MemoryServer:
         return header + f" ({len(rows)} shown):\n\n" + "\n\n".join(results)
 
     def _sqlite_delete(self, memory_id: int) -> str:
-        assert self.sqlite_conn is not None
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute("SELECT id, content FROM memories WHERE id = ?", (memory_id,))
-        row = cursor.fetchone()
-        if not row:
-            return f"Memory #{memory_id} not found"
-        preview = row["content"][:50]
-        cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self.sqlite_conn.commit()
-        return f"Deleted memory #{memory_id}: {preview}..."
+        assert self.store is not None
+
+        def _delete(conn: sqlite3.Connection) -> str:
+            cursor = conn.execute("SELECT id, content FROM memories WHERE id = ?", (memory_id,))
+            row = cursor.fetchone()
+            if not row:
+                return f"Memory #{memory_id} not found"
+            preview = row["content"][:50]
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.commit()
+            return f"Deleted memory #{memory_id}: {preview}..."
+
+        # SELECT + DELETE + commit as one serialized, retry-guarded unit.
+        return self.store.transaction(_delete)
 
     def _sqlite_secret_get(self, memory_id: int) -> str:
-        assert self.sqlite_conn is not None
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute(
-            "SELECT id, content, category, is_sensitive FROM memories WHERE id = ?",
-            (memory_id,),
-        )
-        row = cursor.fetchone()
+        assert self.store is not None
+        with self.store.lock:
+            cursor = self.store.conn.cursor()
+            cursor.execute(
+                "SELECT id, content, category, is_sensitive FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+            row = cursor.fetchone()
         if not row:
             return f"Memory #{memory_id} not found"
         if not row["is_sensitive"]:
@@ -825,9 +894,25 @@ class MemoryServer:
             tools.extend(SHARING_TOOLS)
         return {"tools": tools}
 
+    # Tools whose work is genuinely slow enough to warrant a progress signal.
+    _SLOW_TOOLS = frozenset({"memory_recall"})
+
     def handle_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         tool_name: str = params.get("name", "")
         arguments: dict[str, Any] = params.get("arguments", {})
+
+        # If the client opted into progress (sent a token) and this is a slow tool, emit a
+        # single "working" progress notification so the call shows life instead of looking hung.
+        progress_token = (params.get("_meta") or {}).get("progressToken")
+        if progress_token is not None and tool_name in self._SLOW_TOOLS:
+            try:
+                self._notify(
+                    "notifications/progress",
+                    {"progressToken": progress_token, "progress": 0, "message": f"Running {tool_name}…"},
+                )
+            except Exception:
+                pass  # never let progress reporting break the actual call
+
         try:
             handler = {
                 "memory_store": self.memory_store,
@@ -850,6 +935,10 @@ class MemoryServer:
             return {"content": [{"type": "text", "text": result}]}
         except Exception as e:
             return {"content": [{"type": "text", "text": f"Error: {e!s}"}], "isError": True}
+
+    def _emit_notification(self, method: str, params: dict[str, Any]) -> None:
+        """Default notification sink: write a JSON-RPC notification line to stdout."""
+        print(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}), flush=True)
 
     def process_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         method = message.get("method")
