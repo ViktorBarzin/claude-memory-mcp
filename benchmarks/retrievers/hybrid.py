@@ -39,9 +39,10 @@ Three legs, mirroring the FINAL DESIGN
    dropped as non-discriminative) links those memories: ``memory -[shares
    concept c]- memory``. At query time we take the fused dense+lexical SEEDS, walk
    1 hop to neighbours that share *discriminative* concepts, and emit those
-   neighbours as a third ranked list. This targets the **multihop** stratum
-   (queries needing 2+ memories that share an entity/concept) without re-ranking
-   the precise hits the other legs already nail.
+   neighbours as a third ranked list that joins the SHARED fused pool — NO base-set
+   exclusion (ADR-0005 fusion fix), so a graph candidate can reinforce a base hit
+   or compete as a graph-only id. This targets the **multihop** stratum (queries
+   needing 2+ memories that share an entity/concept).
 
 Fusion (``retrieval_fusion``)
 =============================
@@ -53,10 +54,13 @@ Reciprocal Rank Fusion (Cormack et al., 2009): for a document *d* with rank
 with ``k_rrf = 60`` (the standard constant) and per-leg weights. RRF is
 score-scale-free (no BM25-vs-cosine calibration), which is why the design floats
 "RRF vs CC" and we pick RRF for the prototype. The dense and lexical legs carry
-full weight; the graph leg is down-weighted (it is a RECALL extender for multihop,
-and the design explicitly flags a possible negative graph prior — so it can add
-documents but should not dethrone strong dense/lexical hits). All three weights
-are class attributes so the kill-gate analysis can ablate the graph to zero.
+full weight; ``w_graph`` is a SWEPT attribute (ADR-0005). Because the graph leg now
+competes in the SHARED fused pool with no exclusion, a graph-only rank-1 hit scores
+only ``w_graph/(60+1)`` and must clear the TOP-10 fused boundary (≈ 0.0286 under
+realistic dual-leg double-counting, NOT the weakest tail) — so the sweep extends
+above 1.0 (to ~2.0+) to give the sparse graph leg a genuine shot. All three weights
+are class attributes so the comparison can ablate the graph to zero (w_graph=0) or
+sweep it up.
 
 Graceful degradation (task requirement)
 =======================================
@@ -71,7 +75,6 @@ import hashlib
 import os
 import re
 import sys
-import time
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
@@ -480,11 +483,21 @@ class HybridRetriever:
         self._n_edges = g.number_of_edges()
         self._graph = g
 
-    def _graph_rank(self, seeds: list[MemoryId], exclude: set[MemoryId], k: int) -> list[MemoryId]:
+    def _graph_rank(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
         """From fused seeds, walk 1 hop and rank neighbour memories by accumulated
         edge weight (shared-concept strength), weighted by the seed's own rank so
-        higher-confidence seeds pull harder. Returns up to k NEW ids (not in
-        ``exclude``)."""
+        higher-confidence seeds pull harder. Returns up to k ranked ids.
+
+        FUSION FIX (ADR-0005): NO ``exclude`` — the graph leg is NOT carved out of
+        the FTS∪dense base pool. Every neighbour it surfaces (whether or not a base
+        leg also returned it) goes into the SHARED fused pool, so a graph candidate
+        can REINFORCE a base hit (extra RRF mass, exactly like FTS∪dense overlap) OR
+        introduce a graph-only id that competes on its own merit. The prior
+        ``exclude=base_set`` structurally barred reinforcement and capped a
+        graph-only hit at ``w_graph/(60+rank)`` below any realistic top-k boundary —
+        the math artifact this run exists to undo. A node is never its own neighbour
+        (no self-loops), so a sole seed never re-emits itself; a node reachable from
+        any OTHER seed does enter the ranking."""
         if self._graph is None or not seeds:
             return []
         g = self._graph
@@ -497,8 +510,6 @@ class HybridRetriever:
                 g[s].items(), key=lambda kv: kv[1].get("weight", 1), reverse=True
             )[:_GRAPH_NEIGHBOURS_PER_SEED]
             for nbr, data in nbrs:
-                if nbr in exclude:
-                    continue
                 scores[nbr] += seed_w * float(data.get("weight", 1))
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return [mid for mid, _ in ranked[:k]]
@@ -507,6 +518,12 @@ class HybridRetriever:
 
     @staticmethod
     def _rrf_accumulate(scores: dict[MemoryId, float], ranked: list[MemoryId], weight: float) -> None:
+        # A zero-weight leg is a TRUE no-op: it must not even seed 0.0-score keys
+        # into the pool, or an ABLATED leg (w_graph=0 in the +dense config,
+        # w_dense=0 in the +graph config) would still leak its ids into the fused
+        # tail when the surviving legs return < k candidates — polluting recall@k.
+        if weight == 0.0:
+            return
         for r, mid in enumerate(ranked, start=1):
             scores[mid] += weight / (_RRF_K + r)
 
@@ -525,8 +542,13 @@ class HybridRetriever:
         self._rrf_accumulate(seed_scores, fts_ranked, self.w_fts)
         self._rrf_accumulate(seed_scores, dense_ranked, self.w_dense)
         seeds = [mid for mid, _ in sorted(seed_scores.items(), key=lambda kv: kv[1], reverse=True)]
-        base_set = set(seeds)
-        graph_ranked = self._graph_rank(seeds, exclude=base_set, k=depth)
+        # FUSION FIX (ADR-0005): the graph leg's FULL ranking enters the SAME shared
+        # fused pool as FTS+dense — NO base-set exclusion. Graph candidates that also
+        # appear in a base leg are reinforced; graph-only candidates compete on their
+        # own RRF mass. w_graph is a swept attribute so the sparse graph leg gets a
+        # genuine shot at the top-k (the prior exclude=base_set + fixed w_graph=0.35
+        # made "graph adds nothing" a math artifact rather than a tested result).
+        graph_ranked = self._graph_rank(seeds, k=depth)
 
         # Final weighted RRF over all three legs.
         scores: dict[MemoryId, float] = defaultdict(float)
