@@ -1,0 +1,25 @@
+# Benchmark dataset is the user's REAL personal memories — NEVER commit.
+# Privacy hard-rule (research task brief): corpus/queries/qrels stay LOCAL.
+data/
+.venv/
+cache/
+*.npy
+*.faiss
+*.db
+
+# The eval-set GENERATOR embeds real memory-derived query text + author notes
+# (paraphrases of real memories, real ids/notes). Treat it as a data artifact:
+# LOCAL-ONLY, never commit. Regenerates data/ from corpus.jsonl. The HARNESS
+# itself (harness/*.py, the other scripts) contains NO real content and is safe.
+scripts/build_eval_set.py
+
+# Python noise
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Results from runs may quote real content — keep local by default.
+results/
+*.results.json
