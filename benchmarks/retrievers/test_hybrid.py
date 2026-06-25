@@ -36,7 +36,7 @@ import math
 from collections import defaultdict
 
 from harness.types import Memory, MemoryId
-from retrievers.graph_build import ConceptGraph, build_concept_graph
+from retrievers.graph_build import Concept, ConceptGraph, MemoryConcept, build_concept_graph
 from retrievers.graph_extract import Triple
 from retrievers.hybrid import (
     _RRF_K,
@@ -359,11 +359,16 @@ def test_graceful_degradation_records_error(monkeypatch) -> None:  # type: ignor
 #
 # The contract S4 must satisfy (the only way S1's "graph-only G reaches top-k" is even
 # REACHABLE):
-#   * PPR ranks ALL memory nodes by stationary probability; the SEEDS only set the
-#     restart/personalization vector — they do NOT pre-select the output set.
+#   * The PPR PRIMITIVE (``_ppr_stationary``) ranks ALL nodes by stationary probability;
+#     the SEEDS only set the restart/personalization vector — they do NOT pre-select the
+#     output set.
 #   * A NON-SEEDED memory ONE concept-hop from a seed (it shares a canonical concept
 #     with a seed) gets NONZERO stationary mass and OUTRANKS memories unreachable from
 #     any seed. This is the entity-bridged hop the typed graph is theorised to win on.
+#   * The PPR LEG (``_ppr_memory_ranking``) then EXCLUDES the seed memories from its
+#     output (neighbours-only, like the 1hop leg) — otherwise the high-mass seeds occupy
+#     the head of the graph leg and, being FTS+dense-reinforced too, never let a lone
+#     graph-only hit reach the fused top-k at any w_graph (the seed-lockout finding).
 #   * PPR converges DETERMINISTICALLY (fixed damping + fixed seed → identical vector).
 #   * EMPTY seeds → EMPTY leg (no restart mass → nothing to rank).
 #   * The graph leg still feeds the SHARED fused pool from S1 (no base-set exclusion),
@@ -571,3 +576,115 @@ def test_graph_stats_and_latency_reporting() -> None:
     ms = r.measure_ppr_latency_ms([100], repeats=3)
     assert isinstance(ms, float)
     assert ms > 0.0, "a measured per-query PPR latency must be a positive millisecond figure"
+
+
+# =====================================================================================
+# THE PPR SEED-LOCKOUT FIX — the review finding this slice exists to close.
+#
+# THE FLAW (the two tests below pin it down): the prior ``_ppr_memory_ranking``
+# returned ALL memory nodes ranked by stationary mass — SEEDS
+# INCLUDED. PPR gives the restart-vector seeds the highest mass, so the top graph-ranks
+# are the (already FTS+dense-reinforced) seeds, and a purely-bridged graph-only memory
+# lands BELOW them. In ``retrieve()`` those seeds then sit in all THREE legs (F+D+G),
+# so raising w_graph lifts the seeds in LOCKSTEP with the lone graph-only hit — which
+# can therefore NEVER overtake all the seeds into the fused top-10 at ANY w_graph.
+# Empirically: with the realistic 10-seed base pool (the fusion the verdict actually
+# uses), graph-only-in-top10 = 0 across the WHOLE w_graph sweep (0.0→5.0) in 'ppr'
+# mode — a NEW instance of the very math artifact this run exists to undo.
+#
+# THE FIX: ``_ppr_memory_ranking`` returns NON-SEED memories only (mirroring the 1hop
+# leg's neighbours-only contract). A bridged graph-only memory is then at graph-rank
+# ~1, so the documented 0.0286 / w_graph≈2.0 boundary analysis above actually applies;
+# seed REINFORCEMENT is unchanged (it still happens via the FTS+dense legs).
+# =====================================================================================
+
+
+def _ten_seed_bridge_graph() -> ConceptGraph:
+    """A typed graph where ten DISTINCT seed memories (ids 1..10) each mention a
+    distinct concept c_i, and a distinct graph-only memory (ids 101..110) ALSO mentions
+    c_i — so seed i SINGLE-ENTITY-bridges to graph-only target 100+i and to nothing
+    else. This is the realistic 10-seed base pool the fusion-fix argument rests on (the
+    prior test set only ever stubbed a SINGLE seed, hiding the lockout)."""
+    g = ConceptGraph()
+    concepts: dict[int, Concept] = {}
+    cm: list[MemoryConcept] = []
+    c2m: dict[int, list[int]] = {}
+    for i in range(1, 11):
+        cid = i
+        concepts[cid] = Concept(id=cid, canonical_name=f"c{i}", aliases=[f"c{i}"], embedding=[])
+        seed_mem, target_mem = i, 100 + i
+        cm.append(MemoryConcept(memory_id=seed_mem, concept_id=cid, relation="mentions"))
+        cm.append(MemoryConcept(memory_id=target_mem, concept_id=cid, relation="mentions"))
+        c2m[cid] = sorted([seed_mem, target_mem])
+    g.concepts = concepts
+    g.concept_edges = []  # single-entity bridge: bipartite mention-links only
+    g.memory_concepts = cm
+    g._concept_to_memories = c2m
+    return g
+
+
+def test_ppr_memory_ranking_excludes_seed_memories() -> None:
+    """CONTRACT (seed-lockout fix): ``_ppr_memory_ranking`` returns NON-SEED bridged
+    memories only — never the seed memories themselves. With ten seeds each bridging to
+    a distinct target, the ranking is the ten targets (a bridged graph-only memory at
+    graph-rank ~1), NOT the ten high-mass seeds. Seed reinforcement is not lost — it
+    still happens via the FTS+dense legs in retrieve()."""
+    r = HybridRetriever()
+    r.set_concept_graph(_ten_seed_bridge_graph())
+    seeds = list(range(1, 11))
+
+    ranked = r._ppr_memory_ranking(seeds, k=50)
+
+    assert ranked, "PPR must surface the bridged neighbours"
+    assert not (set(ranked) & set(seeds)), "the PPR ranking must EXCLUDE the seed memories"
+    assert set(ranked) >= set(range(101, 111)), "every single-entity-bridged target must be ranked"
+    # the first ranked item is a bridged target at graph-rank 1 — the profile the
+    # documented 0.0286 / w_graph≈2.0 boundary analysis requires (PPR could not produce
+    # it while seeds occupied the head).
+    assert ranked[0] in range(101, 111)
+
+
+def test_fusion_ppr_graph_only_competes_with_realistic_ten_seed_pool() -> None:
+    """THE MISSING FUSION TEST (review finding): with the REALISTIC 10-seed base pool
+    AND graph_mode='ppr' (the mode run_eval.py/matrix.py actually use for the verdict),
+    a single-entity-bridge graph-only target must REACH the fused top-10 within the
+    sweep — barred below the boundary, entering above it. The prior test set only
+    stubbed a single seed, so this lockout shipped green.
+
+    Boundary (from the same RRF math the docstring derives): the realistic 10-seed pool
+    is ten dual-leg (FTS+dense) docs whose top-10 bar ≈ 0.0286; a graph-only target at
+    graph-rank 1 scores w_graph/61, which clears 0.0286 only at w_graph≈2.0."""
+    fts = list(range(1, 51))                            # 1..50
+    dense = list(range(1, 31)) + list(range(201, 221))  # 1..30 overlap + 201..220 dense-only
+    # 101..110 are GRAPH-ONLY (in neither base leg).
+    g = _ten_seed_bridge_graph()
+
+    def fused_top10(w: float) -> list[MemoryId]:
+        r = HybridRetriever()
+        r.set_concept_graph(g)
+        assert r.graph_mode == "ppr"  # the mode the verdict is computed on
+        r._fts.retrieve = lambda q, k: list(fts[:k])  # type: ignore[method-assign]
+        r._dense_rank = lambda q, k: list(dense[:k])  # type: ignore[method-assign]
+        r.w_fts = r.w_dense = 1.0
+        r.w_graph = w
+        return r.retrieve("q", k=10)
+
+    # below the boundary: no single-entity-bridge graph-only target reaches the top-10.
+    for w in (0.0, 1.0, 1.5):
+        out = fused_top10(w)
+        assert not [m for m in out if 101 <= m <= 110], (
+            f"at w_graph={w} a graph-rank-1 graph-only target scores {w}/61 < the 0.0286 "
+            "top-10 bar and must stay out"
+        )
+
+    # at/above the boundary: graph-only targets ENTER the fused top-10 — they genuinely
+    # competed in the SHARED pool in PPR mode (the assertion the prior run could never
+    # satisfy because PPR put the reinforced seeds at the head of the graph leg).
+    out2 = fused_top10(2.0)
+    assert [m for m in out2 if 101 <= m <= 110], (
+        "at w_graph=2.0 a graph-only target scores 0.0328 > the 0.0286 top-10 bar and "
+        "MUST enter under graph_mode='ppr' — proving the seed lockout is gone"
+    )
+    # and the effect strengthens with weight (more graph-only targets displace seeds).
+    out5 = fused_top10(5.0)
+    assert len([m for m in out5 if 101 <= m <= 110]) >= len([m for m in out2 if 101 <= m <= 110])

@@ -29,6 +29,18 @@ jobs:
           uv run ruff check src/ tests/
           uv run mypy src/claude_memory/
           uv run pytest tests/ -v --tb=short
+      # The offline recall-benchmark harness (benchmarks/) ships its OWN model-free
+      # test suite — fusion arithmetic, the PPR graph leg, the comparison matrix +
+      # verdict. CI must run it: those tests guard the dense-vs-graph verdict's
+      # correctness (e.g. that graph-only candidates can actually reach the fused
+      # top-k under the default graph_mode='ppr'), and were previously NOT exercised
+      # (`pytest tests/` only). Run from benchmarks/ so the `harness`/`retrievers`
+      # imports resolve. The data-dependent tests skip automatically when the
+      # gitignored, LOCAL-only eval set / cached embeddings aren't present (they
+      # never are in CI), so only the model-free tests run here.
+      - name: Benchmark harness tests (model-free)
+        working-directory: benchmarks
+        run: uv run --project .. pytest -q --tb=short
 
   build:
     needs: lint-and-test

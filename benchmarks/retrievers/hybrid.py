@@ -323,8 +323,10 @@ class HybridRetriever:
 
     # Graph-leg traversal mode over the TYPED concept graph (slice S4):
     #   "ppr"  — Personalized PageRank over the bipartite memory↔concept graph
-    #            (HippoRAG-2 idea; the DEFAULT). Ranks ALL memory nodes by stationary
-    #            probability with the fused seeds setting only the restart vector.
+    #            (HippoRAG-2 idea; the DEFAULT). The fused seeds set the restart vector;
+    #            the leg then ranks the NON-SEED memory nodes by stationary probability
+    #            (seeds are excluded from the output — they reinforce via FTS+dense, so
+    #            a bridged graph-only memory lands at graph-rank ~1 and can compete).
     #   "1hop" — the cheaper typed-1-hop traversal: from each seed, walk
     #            memory→concept→memory once and rank the bridged neighbours by shared-
     #            concept weight. Evaluated alongside PPR (the production-substrate
@@ -636,14 +638,27 @@ class HybridRetriever:
 
     def _ppr_memory_ranking(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
         """PPR graph leg: seed the restart vector from the fused-seed MEMORY nodes, run
-        PPR over the bipartite graph, then rank MEMORY nodes by stationary probability.
+        PPR over the bipartite graph, then rank the NON-SEED memory nodes by stationary
+        probability.
 
         Seed weight is rank-decayed (1/rank) so the best-agreed FTS∪dense seeds pull
-        hardest — the same monotone seed prior the keyword leg used. The returned
-        ranking spans ALL memory nodes that picked up mass (seeds reinforce in the
-        shared fused pool; non-seeded bridged memories compete as graph-only ids), top
-        ``k``. Concept nodes are dropped from the output (only memories are retrievable
-        candidates)."""
+        hardest — the same monotone seed prior the keyword leg used.
+
+        SEED-LOCKOUT FIX (review finding): the SEED memory nodes are EXCLUDED from the
+        returned ranking — only the bridged NON-SEED memories are emitted, mirroring the
+        1hop leg's neighbours-only contract. PPR gives the restart-vector seeds the
+        highest stationary mass, so leaving them in put the (already FTS∪dense-
+        reinforced) seeds at graph-ranks 1..|seeds| and forced any purely-bridged
+        graph-only memory below them; in ``retrieve()`` those seeds then sat in all
+        three legs, so raising ``w_graph`` lifted the seeds in LOCKSTEP with the lone
+        graph-only hit, which could therefore never reach the fused top-k at ANY weight.
+        Dropping the seeds here puts a bridged graph-only memory at graph-rank ~1 (the
+        profile the 0.0286 / w_graph≈2.0 boundary analysis assumes), so it genuinely
+        competes in the shared pool. Nothing is lost: seed REINFORCEMENT still happens
+        via the FTS+dense legs (the seeds are base hits already), exactly as before.
+
+        Concept nodes are dropped from the output too (only memories are retrievable
+        candidates), top ``k``."""
         if self._cgraph is None or not seeds or self._node_count == 0:
             return []
         seed_weights: dict[int, float] = {}
@@ -654,10 +669,14 @@ class HybridRetriever:
         if not seed_weights:
             return []  # none of the seeds is a memory node in the typed graph
 
+        seed_nodes = set(seed_weights)
         dist = _ppr_stationary(self._bipartite_edges, self._node_count, seed_weights)
-        # rank memory nodes (drop concept nodes) by stationary mass, mass > 0 only.
+        # rank NON-SEED memory nodes (drop seed + concept nodes) by stationary mass,
+        # mass > 0 only — so a bridged graph-only memory is at graph-rank ~1.
         scored: list[tuple[float, MemoryId]] = []
         for node, mid in self._node_to_mem.items():
+            if node in seed_nodes:
+                continue  # seeds reinforce via FTS+dense, not via the graph leg
             p = dist[node]
             if p > 0.0:
                 scored.append((p, mid))
@@ -767,12 +786,13 @@ class HybridRetriever:
         DISPATCH (slice S4): if a TYPED concept graph has been injected
         (``set_concept_graph``), the leg runs over it — ``graph_mode='ppr'`` (default)
         does Personalized PageRank over the bipartite memory↔concept graph and ranks
-        ALL memory nodes by stationary probability (the seeds set ONLY the restart
-        vector — so a non-seeded memory sharing a concept with a seed is reachable),
-        while ``graph_mode='1hop'`` does the cheaper typed memory→concept→memory walk.
-        With NO typed graph set, the leg falls back to the prior keyword-co-occurrence
-        1-hop walk (the prototype this run supersedes), so existing keyword-graph
-        callers keep working unchanged.
+        the NON-SEED memory nodes by stationary probability (the seeds set ONLY the
+        restart vector, then are dropped from the output — so a non-seeded memory
+        sharing a concept with a seed surfaces at graph-rank ~1 rather than below the
+        high-mass seeds), while ``graph_mode='1hop'`` does the cheaper typed
+        memory→concept→memory walk (neighbours only). With NO typed graph set, the leg
+        falls back to the prior keyword-co-occurrence 1-hop walk (the prototype this run
+        supersedes), so existing keyword-graph callers keep working unchanged.
 
         FUSION FIX (ADR-0005), preserved across all three modes: NO ``exclude`` — the
         graph leg is NOT carved out of the FTS∪dense base pool. Whatever it surfaces
