@@ -1,11 +1,19 @@
 # Benchmark dataset is the user's REAL personal memories — NEVER commit.
 # Privacy hard-rule (research task brief): corpus/queries/qrels stay LOCAL.
+# NOTE: both the trailing-slash (real dir) and bare-name (SYMLINK into the
+# preserved artifacts at ~/.claude/claude-memory/benchmark-artifacts) forms are
+# listed — git treats a symlink as a file, so `data/` alone would NOT ignore a
+# `data` symlink and the real corpus could leak. Keep both forms.
 data/
+data
 .venv/
 cache/
+cache
 *.npy
 *.faiss
 *.db
+# Cached LLM-extracted triples (derived from real memories) — gitignored.
+triples_*.jsonl
 
 # The eval-set GENERATOR embeds real memory-derived query text + author notes
 # (paraphrases of real memories, real ids/notes). Treat it as a data artifact:

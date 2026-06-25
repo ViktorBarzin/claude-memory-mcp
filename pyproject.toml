@@ -19,6 +19,11 @@ classifiers = [
 api = ["fastapi>=0.115", "asyncpg>=0.30", "uvicorn>=0.34", "pydantic>=2.0", "alembic>=1.14", "sqlalchemy>=2.0", "psycopg2-binary>=2.9", "mcp>=1.0.0"]
 vault = ["hvac>=2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "httpx>=0.28", "cryptography>=43.0", "hypothesis>=6.0"]
+# Offline recall-benchmark harness (benchmarks/). OPTIONAL — never required by the
+# product or SQLite-only mode (ADR-0002). numpy backs the cached dense matrix;
+# networkx backs the concept-graph leg. CI runs `uv sync --all-extras`, so the
+# harness tests get these; a bare `uv sync` (and the shipped image) pulls none.
+benchmarks = ["numpy>=1.26", "networkx>=3.0"]
 
 [project.scripts]
 claude-memory-server = "claude_memory.mcp_server:main"

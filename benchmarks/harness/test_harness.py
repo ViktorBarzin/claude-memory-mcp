@@ -1,10 +1,24 @@
-"""Unit tests for metrics + runner. No real corpus needed (synthetic data).
+"""Unit tests for metrics + runner (synthetic data, always run) PLUS the S0
+preserved-artifact wiring tests (skip unless the local, gitignored eval set +
+cached bge-large matrix are symlinked into benchmarks/data and benchmarks/cache).
+
+The synthetic tests need no real corpus. The S0 tests assert that:
+  * load_dataset() resolves the PRESERVED eval set (119 queries, strata
+    exact:40 / paraphrase:40 / multihop:39) byte-identically — not regenerated;
+  * HybridRetriever.build_index takes the dense CACHE-HIT branch against the
+    preserved bge-large matrix (fingerprint ca7b1d4ed22672e8) with NO model load
+    — verified by patching _embed_local to raise and confirming build still wins.
+They skip cleanly where numpy/networkx or the preserved artifacts are absent
+(e.g. CI), so `pytest tests/` and the harness suite stay green everywhere.
 
 Run:  .venv/bin/python -m pytest harness/test_harness.py -q
 """
 from __future__ import annotations
 
 import math
+from pathlib import Path
+
+import pytest
 
 from harness import metrics
 from harness.dataset import Dataset
@@ -143,3 +157,117 @@ def test_runner_callable_retriever_and_misses():
     assert res.index_build_seconds is None  # no hook on a bare callable
     assert "perfect" not in res.summary()
     assert "bad" in res.summary()
+
+
+# ---------------- S0: preserved eval set + cached bge-large matrix ----------
+#
+# These exercise the REAL (local, gitignored) artifacts wired in via symlinks
+# (benchmarks/data -> preserved data, benchmarks/cache -> preserved cache). They
+# skip when those are absent or numpy/networkx aren't installed, so they never
+# break CI; locally they prove the harness reuses the preserved set + matrix
+# WITHOUT regenerating or re-embedding.
+
+# Preserved-artifact fingerprint of the eval corpus (id+content hash). The cached
+# bge-large matrix is named emb_BAAI_bge-large-en-v1.5_<this>.npy. If the corpus
+# ever changes this constant must change with it — that is the point of the test.
+_PRESERVED_FINGERPRINT = "ca7b1d4ed22672e8"
+_EXPECTED_STRATA = {"exact": 40, "paraphrase": 40, "multihop": 39}
+
+_BENCH_ROOT = Path(__file__).resolve().parents[1]
+_DATA_DIR = _BENCH_ROOT / "data"
+_CACHE_DIR = _BENCH_ROOT / "cache"
+_PRESERVED_EMB = _CACHE_DIR / f"emb_BAAI_bge-large-en-v1.5_{_PRESERVED_FINGERPRINT}.npy"
+
+# Preserved data/cache live OUTSIDE the repo (gitignored symlinks). If a teammate
+# has not wired them in, skip the whole module-tail rather than fail.
+_artifacts_present = (
+    (_DATA_DIR / "corpus.jsonl").exists()
+    and (_DATA_DIR / "queries.jsonl").exists()
+    and (_DATA_DIR / "qrels.jsonl").exists()
+    and _PRESERVED_EMB.exists()
+)
+_needs_artifacts = pytest.mark.skipif(
+    not _artifacts_present,
+    reason="preserved eval set / cached bge-large matrix not symlinked into benchmarks/{data,cache}",
+)
+
+
+@_needs_artifacts
+def test_preserved_eval_set_loads_with_expected_strata():
+    """load_dataset() resolves the PRESERVED eval set: exactly 119 queries with
+    strata exact:40 / paraphrase:40 / multihop:39, all referentially valid."""
+    pytest.importorskip("numpy")
+    from collections import Counter
+
+    from harness import load_dataset
+
+    ds = load_dataset(validate=True)  # raises on any referential-integrity break
+    assert len(ds.corpus) == 5452
+    assert len(ds.queries) == 119
+    assert dict(Counter(q.stratum for q in ds.queries)) == _EXPECTED_STRATA
+    # qrels cover every query (validate=True already enforces this; assert the
+    # count too so a regenerated, differently-sized set trips the test).
+    assert len(ds.qrels) == 119
+
+
+@_needs_artifacts
+def test_preserved_eval_set_is_byte_identical_not_regenerated():
+    """The wired-in eval files are BYTE-IDENTICAL to the preserved artifacts — we
+    reuse them, never regenerate. Reading through the symlink and hashing both
+    ends proves no in-repo copy diverged."""
+    import hashlib
+
+    preserved = Path(
+        "/home/wizard/.claude/claude-memory/benchmark-artifacts/data"
+    )
+    if not preserved.exists():  # pragma: no cover - environment-specific
+        pytest.skip("preserved artifact directory not present on this host")
+    for name in ("corpus.jsonl", "queries.jsonl", "qrels.jsonl"):
+        via_harness = (_DATA_DIR / name).read_bytes()
+        canonical = (preserved / name).read_bytes()
+        assert hashlib.sha256(via_harness).hexdigest() == hashlib.sha256(canonical).hexdigest(), (
+            f"{name} read through benchmarks/data differs from the preserved artifact"
+        )
+
+
+@_needs_artifacts
+def test_hybrid_build_index_takes_dense_cache_hit_without_model_load():
+    """HybridRetriever.build_index must take the dense CACHE-HIT branch against the
+    preserved bge-large matrix: it loads emb_..._ca7b1d4ed22672e8.npy and NEVER
+    loads the model. We patch _embed_local to raise — if the cache-miss branch
+    were taken the dense leg would be disabled and self._emb would stay None.
+    Because build_index swallows dense failures into self.errors, the assertion is
+    the absence of that error AND a populated matrix, not an exception."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("networkx")
+
+    from harness.dataset import load_corpus
+    from retrievers.hybrid import HybridRetriever, _corpus_fingerprint
+
+    corpus = load_corpus()
+    # Sanity: the preserved corpus still fingerprints to the cached matrix's name,
+    # i.e. the matrix on disk genuinely matches this corpus (no silent staleness).
+    assert _corpus_fingerprint(corpus) == _PRESERVED_FINGERPRINT
+
+    r = HybridRetriever()
+    # Booby-trap BOTH embed paths: a cache HIT must touch neither.
+    def _boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise AssertionError("re-embedding attempted — cache-hit branch was NOT taken")
+
+    r._embed_local = _boom  # type: ignore[method-assign]
+    r._embed_hosted = _boom  # type: ignore[method-assign]
+    r._load_local_model = _boom  # type: ignore[method-assign]
+
+    r.build_index(corpus)
+
+    # Dense leg succeeded via the cache — no "dense leg disabled" error recorded.
+    assert not any("dense leg disabled" in e for e in r.errors), r.errors
+    # Matrix loaded from cache: 5452 rows × 1024 dims, float32, model never touched.
+    assert r._emb is not None
+    assert r._emb.shape == (5452, 1024)
+    assert r._emb.dtype == np.float32
+    assert r.embedding_dim == 1024
+    assert r._model is None  # the cache-hit branch returns before loading the model
+    assert r.embedding_backend == "local:BAAI/bge-large-en-v1.5"
+    # Row order matches the corpus order (the cache .ids.npy gate passed).
+    assert r._ids == [m.id for m in corpus]
