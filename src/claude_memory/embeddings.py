@@ -56,6 +56,13 @@ EMBEDDING_DIM = 1024
 #: Env var that selects the hosted backend when set (and non-empty).
 VOYAGE_API_KEY_ENV = "VOYAGE_API_KEY"
 
+#: Bounded request timeout (seconds) for the hosted client. voyageai.Client defaults to
+#: ``timeout=None`` (no timeout); on the recall READ path embed_query runs in a threadpool,
+#: so an unbounded hang would pin a worker and never return — a hung/slow hosted API must
+#: not stall recall indefinitely. A finite timeout caps the worst case (the recall caller
+#: then degrades to lexical-only on the raised timeout).
+VOYAGE_TIMEOUT_SECONDS = 10.0
+
 
 def _l2_normalise(vec: list[float]) -> list[float]:
     """Return ``vec`` scaled to unit L2 norm (a zero vector is returned unchanged).
@@ -217,7 +224,10 @@ class VoyageEmbedder:
         if self._client is None:
             import voyageai
 
-            self._client = cast(_VoyageClient, voyageai.Client())
+            # Bounded timeout: the library default is None (unbounded). embed runs in a
+            # threadpool on the recall path, so an unbounded hang would pin a worker; the
+            # finite timeout lets the recall caller degrade to lexical on a slow/hung API.
+            self._client = cast(_VoyageClient, voyageai.Client(timeout=VOYAGE_TIMEOUT_SECONDS))
         return self._client
 
     def _embed(self, text: str, *, input_type: str) -> list[float]:

@@ -872,6 +872,92 @@ async def test_fused_recall_dense_leg_excludes_sensitive_rows():
 
 
 @pytest.mark.asyncio
+async def test_fused_recall_degrades_to_lexical_when_embed_query_raises():
+    """Read-path degradation safety: with embeddings ON, if the embed backend is
+    down/raising (Voyage 5xx/timeout, sentence-transformers ImportError or model-load
+    failure), the dense leg must be swallowed and recall returns the lexical rows
+    ALREADY in hand — never 500. Mirrors the write-side _embed_and_persist try/except.
+    """
+    from claude_memory.api import recall as recall_mod
+
+    pool, conn = _mock_conn()
+    lexical = [_make_memory_row(id=1, rank=0.9), _make_memory_row(id=2, rank=0.1)]
+    # Only the lexical leg should ever hit the DB; the dense leg dies in embed_query.
+    conn.fetch.return_value = lexical
+
+    embedder = MagicMock()
+    embedder.embed_query.side_effect = RuntimeError("voyage 503 / model load failed")
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}):
+        out = await recall_mod._fused_recall(
+            conn, user_id="u", query_text="q", sort_by="relevance",
+            category=None, limit=30, pool=pool, embedder=embedder,
+        )
+
+    # The embed was attempted, but the failure degraded to lexical-only (no 500).
+    embedder.embed_query.assert_called_once()
+    # No dense SQL ran — the embed died before _dense_recall could query.
+    assert conn.fetch.call_count == 1
+    # _fuse(lexical, []) reduces to lexical order, so the rows come back as fetched.
+    assert [r["id"] for r in out] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_fused_recall_degrades_to_lexical_when_dense_sql_raises():
+    """Read-path degradation safety (full dense leg): even if embed_query succeeds but the
+    dense ANN query itself raises (e.g. pgvector/HNSW unavailable, halfvec cast error), the
+    whole dense leg is swallowed and recall returns the lexical rows already in hand.
+    """
+    from claude_memory.api import recall as recall_mod
+
+    pool, conn = _mock_conn()
+    lexical = [_make_memory_row(id=3, rank=0.8)]
+    conn.fetch.side_effect = [
+        lexical,                                  # lexical leg succeeds
+        RuntimeError("operator <=> does not exist: halfvec"),  # dense leg query fails
+    ]
+
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [0.0] * 1024
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}):
+        out = await recall_mod._fused_recall(
+            conn, user_id="u", query_text="q", sort_by="relevance",
+            category=None, limit=30, pool=pool, embedder=embedder,
+        )
+
+    # Lexical + a (failed) dense attempt both hit fetch, but recall still succeeds lexically.
+    assert conn.fetch.call_count == 2
+    assert [r["id"] for r in out] == [3]
+
+
+@pytest.mark.asyncio
+async def test_fused_recall_runs_embed_query_off_the_event_loop():
+    """embed_query is a blocking call (network for Voyage, model load+inference for bge),
+    so it must run OFF the event loop via asyncio.to_thread — never inline — so a hung
+    hosted API or a slow local model cannot stall the recall event loop.
+    """
+    from claude_memory.api import recall as recall_mod
+
+    pool, conn = _mock_conn()
+    conn.fetch.side_effect = [[_make_memory_row(id=1)], []]
+
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [0.0] * 1024
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}), \
+         patch.object(recall_mod.asyncio, "to_thread", wraps=recall_mod.asyncio.to_thread) as to_thread:
+        await recall_mod._fused_recall(
+            conn, user_id="u", query_text="q", sort_by="relevance",
+            category=None, limit=30, pool=pool, embedder=embedder,
+        )
+
+    # The blocking embed went through asyncio.to_thread, not a direct inline call.
+    to_thread.assert_called_once()
+    assert to_thread.call_args.args[0] is embedder.embed_query
+
+
+@pytest.mark.asyncio
 async def test_schedule_embedding_flag_off_is_noop():
     """schedule_embedding returns None and schedules nothing when the flag is off."""
     from claude_memory.api import recall as recall_mod

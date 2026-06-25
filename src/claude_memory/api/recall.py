@@ -293,9 +293,20 @@ async def _fused_recall(
 
     dense_rows: list[Any] = []
     if embeddings_enabled() and query_text:
-        emb = embedder or select_embedder()
-        qvec = emb.embed_query(query_text)
-        dense_rows = await _dense_recall(conn, user_id=user_id, qvec=qvec, category=category)
+        # Degrade-safe dense leg (asymmetry fix vs the write path). embed_query is a
+        # BLOCKING call — a network round-trip for Voyage, a model load+inference for bge —
+        # so it runs OFF the event loop via to_thread (a hung hosted API or slow local model
+        # must not stall recall). ANY embedder/query failure (Voyage 5xx/timeout, a
+        # sentence-transformers ImportError/model-load error, an HNSW/halfvec query error) is
+        # swallowed: lexical_rows was ALREADY fetched above, and _fuse(lexical, []) reduces to
+        # lexical order, so a dense-backend outage degrades to lexical-only — never a 500.
+        # Recall runs on every prompt; the lexical leg must always be returnable.
+        try:
+            emb = embedder or select_embedder()
+            qvec = await asyncio.to_thread(emb.embed_query, query_text)
+            dense_rows = await _dense_recall(conn, user_id=user_id, qvec=qvec, category=category)
+        except Exception as exc:  # noqa: BLE001 - degrade to lexical on any dense-leg failure
+            logger.warning("dense recall leg failed, falling back to lexical: %s", exc)
 
     # graph leg: phase-2 (MEMORY_GRAPH_ENABLED) — production graph module lands later.
     return _fuse(lexical_rows, dense_rows, limit=limit)

@@ -86,12 +86,15 @@ class _FakeVoyageEmbeddingResult:
 
 class _FakeVoyageClient:
     """Stand-in for ``voyageai.Client``; echoes a fixed-dim un-normalised vector and
-    records the ``input_type`` so document-vs-query routing can be asserted."""
+    records the ``input_type`` so document-vs-query routing can be asserted. Also records
+    constructor kwargs so the bounded-timeout hardening (a hung hosted API must not stall
+    recall) can be asserted."""
 
     calls: list[tuple[str, str]] = []  # (text, input_type)
+    init_kwargs: dict[str, object] = {}  # kwargs the real Client() was constructed with
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, **kwargs: object) -> None:
+        _FakeVoyageClient.init_kwargs = dict(kwargs)
 
     def embed(self, texts: list[str], *, model: str, input_type: str, output_dimension: int) -> object:
         out: list[list[float]] = []
@@ -106,6 +109,7 @@ class _FakeVoyageClient:
 @pytest.fixture(autouse=True)
 def _reset_voyage_calls() -> Iterator[None]:
     _FakeVoyageClient.calls = []
+    _FakeVoyageClient.init_kwargs = {}
     yield
 
 
@@ -200,6 +204,24 @@ def test_selects_bge_when_no_key(monkeypatch: pytest.MonkeyPatch, fake_local: ty
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
     embedder = emb.select_embedder()
     assert embedder.backend_label == "local:BAAI/bge-large-en-v1.5"
+
+
+def test_voyage_client_constructed_with_bounded_timeout(
+    monkeypatch: pytest.MonkeyPatch, fake_voyage: type[_FakeVoyageClient]
+) -> None:
+    """The hosted client MUST carry a bounded request timeout. The voyageai default is
+    timeout=None (no timeout), so a hung/slow API would otherwise stall the recall thread
+    indefinitely — the embed call runs in a threadpool, but an unbounded hang still pins a
+    worker and never returns a result. A finite timeout bounds the worst case."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    embedder = emb.select_embedder()
+    # Force lazy client construction.
+    embedder.embed_query("q")
+    timeout = _FakeVoyageClient.init_kwargs.get("timeout")
+    assert isinstance(timeout, (int, float)) and timeout > 0, (
+        "voyageai.Client must be constructed with a positive finite timeout"
+    )
+    assert timeout == emb.VOYAGE_TIMEOUT_SECONDS
 
 
 # ── 4. sensitive documents are NEVER embedded (ADR-0003 hard gate) ───────────────
