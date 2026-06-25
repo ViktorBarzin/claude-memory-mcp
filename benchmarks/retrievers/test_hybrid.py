@@ -36,11 +36,14 @@ import math
 from collections import defaultdict
 
 from harness.types import Memory, MemoryId
+from retrievers.graph_build import ConceptGraph, build_concept_graph
+from retrievers.graph_extract import Triple
 from retrievers.hybrid import (
     _RRF_K,
     HybridRetriever,
     _concepts_for,
     _normalise_concept,
+    _ppr_stationary,
 )
 
 
@@ -346,3 +349,225 @@ def test_graceful_degradation_records_error(monkeypatch) -> None:  # type: ignor
     # FTS still answers
     out = r.retrieve("doc number 3 content", k=5)
     assert 3 in out
+
+
+# =====================================================================================
+# SLICE S4 — PPR graph leg over the TYPED concept graph (HippoRAG-2 idea, no per-query
+# LLM). These tests are MODEL-FREE: the PPR primitive is exercised on a HAND-BUILT
+# bipartite typed graph, and the typed-graph integration uses the real S3
+# ``build_concept_graph`` with a deterministic stub embedder (NO sentence-transformers).
+#
+# The contract S4 must satisfy (the only way S1's "graph-only G reaches top-k" is even
+# REACHABLE):
+#   * PPR ranks ALL memory nodes by stationary probability; the SEEDS only set the
+#     restart/personalization vector — they do NOT pre-select the output set.
+#   * A NON-SEEDED memory ONE concept-hop from a seed (it shares a canonical concept
+#     with a seed) gets NONZERO stationary mass and OUTRANKS memories unreachable from
+#     any seed. This is the entity-bridged hop the typed graph is theorised to win on.
+#   * PPR converges DETERMINISTICALLY (fixed damping + fixed seed → identical vector).
+#   * EMPTY seeds → EMPTY leg (no restart mass → nothing to rank).
+#   * The graph leg still feeds the SHARED fused pool from S1 (no base-set exclusion),
+#     so a graph-only PPR hit competes on its own RRF mass.
+#   * The run can REPORT the typed graph's edge count and a MEASURED per-query PPR
+#     latency (the survey's ~2 ms is unproven; the 2.1M-edge prior would be
+#     ~140-280 ms — we measure, we don't assume).
+# =====================================================================================
+
+
+# ---------------- the PPR primitive, on a hand-built bipartite typed graph -----------
+
+
+def _bipartite_adjacency() -> tuple[list[tuple[int, int]], int, dict[str, int]]:
+    """A tiny hand-built bipartite memory<->concept graph, as undirected edges over a
+    single node index space (memories AND concepts share the index — exactly how the
+    production bipartite PPR substrate is laid out).
+
+    Layout (node index in parens):
+        memory M1 (0)  --mentions--> concept C (4)
+        memory G  (2)  --mentions--> concept C (4)      # G shares C with M1
+        memory U  (3)  --mentions--> concept D (5)      # disjoint component
+        memory M2 (1)  : isolated (mentions no concept)
+
+    Seed only M1. Then M1 -> C -> G is a single concept hop, so the NON-SEEDED G must
+    pick up nonzero mass; U is in a separate component (only reachable via teleport,
+    which targets M1 only) so U gets ZERO; the isolated M2 also gets ZERO. This is the
+    minimal graph that proves the entity-bridge.
+    """
+    idx = {"M1": 0, "M2": 1, "G": 2, "U": 3, "C": 4, "D": 5}
+    edges = [
+        (idx["M1"], idx["C"]),
+        (idx["G"], idx["C"]),
+        (idx["U"], idx["D"]),
+    ]
+    return edges, len(idx), idx
+
+
+def test_ppr_stationary_bridged_node_gets_nonzero_mass_and_outranks_unrelated() -> None:
+    """CORE S4 CONTRACT. On the hand-built bipartite graph, seeding ONLY M1:
+      * the seed M1 carries the most mass,
+      * the NON-SEEDED, one-concept-hop G gets NONZERO mass,
+      * G OUTRANKS the disconnected U and the isolated M2 (both exactly zero),
+    proving PPR ranks all nodes by stationary probability with seeds setting only the
+    restart vector — the mechanism that lets a graph-only hit reach the fused top-k."""
+    edges, n, idx = _bipartite_adjacency()
+    dist = _ppr_stationary(edges, n, {idx["M1"]: 1.0})
+
+    # a probability distribution: nonneg and sums to 1 (mass conserved).
+    assert all(p >= -1e-12 for p in dist)
+    assert math.isclose(sum(dist), 1.0, rel_tol=1e-6, abs_tol=1e-9)
+
+    assert dist[idx["G"]] > 0.0, "a non-seeded node one concept-hop from a seed must get mass"
+    assert dist[idx["U"]] == 0.0, "a node in a disjoint component gets no mass (teleport→seed only)"
+    assert dist[idx["M2"]] == 0.0, "an isolated memory node gets no mass"
+    assert dist[idx["M1"]] > dist[idx["G"]], "the seed retains more mass than the bridged hop"
+    assert dist[idx["G"]] > dist[idx["U"]], "the bridged hop OUTRANKS the unreachable node"
+    assert dist[idx["G"]] > dist[idx["M2"]], "the bridged hop OUTRANKS the isolated node"
+
+
+def test_ppr_stationary_is_deterministic() -> None:
+    """Fixed damping + fixed seed → byte-identical stationary vector across runs (the
+    leg must be reproducible for the comparison matrix)."""
+    edges, n, idx = _bipartite_adjacency()
+    a = _ppr_stationary(edges, n, {idx["M1"]: 1.0})
+    b = _ppr_stationary(edges, n, {idx["M1"]: 1.0})
+    assert a == b, "PPR must converge deterministically for a fixed damping/seed"
+
+
+def test_ppr_stationary_empty_seeds_is_empty() -> None:
+    """No restart mass → no ranking. An empty seed map yields an all-zero (empty) leg
+    rather than a uniform PageRank — the graph leg contributes nothing without seeds."""
+    edges, n, _idx = _bipartite_adjacency()
+    dist = _ppr_stationary(edges, n, {})
+    assert all(p == 0.0 for p in dist), "empty seeds → empty (all-zero) distribution"
+
+
+def test_ppr_stationary_multiple_seeds_normalise_restart() -> None:
+    """Seed weights set the restart distribution and are normalised internally, so the
+    relative weighting (not the absolute scale) is what matters."""
+    edges, n, idx = _bipartite_adjacency()
+    # seeding M1 and G (both touch C) — heavier on M1.
+    weighted = _ppr_stationary(edges, n, {idx["M1"]: 3.0, idx["G"]: 1.0})
+    # passing the SAME weights pre-scaled must give the identical stationary vector.
+    scaled = _ppr_stationary(edges, n, {idx["M1"]: 0.75, idx["G"]: 0.25})
+    assert all(math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12) for x, y in zip(weighted, scaled))
+    assert math.isclose(sum(weighted), 1.0, rel_tol=1e-6, abs_tol=1e-9)
+
+
+# ---------------- a typed concept graph built model-free (real S3 builder) -----------
+
+
+def _typed_embed_stub(texts: list[str]) -> list[list[float]]:
+    """Deterministic model-free embedder for the typed-graph integration tests. Each
+    surface form maps to an orthogonal axis so NOTHING over-merges; an unseen form gets
+    a stable per-string axis. (We do NOT exercise alias collapse here — S3 owns that;
+    here we only need a clean typed graph to drive PPR.)"""
+    axes = {
+        "viktor": [1.0, 0.0, 0.0, 0.0, 0.0],
+        "svelte": [0.0, 1.0, 0.0, 0.0, 0.0],
+        "postgres": [0.0, 0.0, 1.0, 0.0, 0.0],
+        "redis": [0.0, 0.0, 0.0, 1.0, 0.0],
+        "kafka": [0.0, 0.0, 0.0, 0.0, 1.0],
+    }
+    out: list[list[float]] = []
+    for t in texts:
+        key = t.strip().lower()
+        if key in axes:
+            out.append(list(axes[key]))
+        else:
+            seed = (sum(ord(c) for c in key) or 1) % 5
+            v = [0.0] * 5
+            v[seed] = 1.0
+            out.append(v)
+    return out
+
+
+def _typed_graph_two_memories_share_concept() -> tuple[ConceptGraph, dict[int, list[Triple]]]:
+    """Build (via the REAL S3 builder, model-free) a typed graph where memory 100 and
+    memory 200 BOTH mention 'Svelte', while memory 300 mentions only 'Kafka'. So 100<->
+    Svelte<->200 is a concept bridge and 300 is in a different component."""
+    triples: dict[int, list[Triple]] = {
+        100: [("Viktor", "prefers", "Svelte")],
+        200: [("Svelte", "runs-on", "Postgres")],   # 200 also mentions Svelte
+        300: [("service", "uses", "Kafka")],          # disjoint
+    }
+    g = build_concept_graph(triples, _typed_embed_stub, threshold=0.9)
+    return g, triples
+
+
+def test_graph_rank_ppr_over_typed_graph_surfaces_bridged_memory() -> None:
+    """Integration: with a TYPED concept graph set and graph_mode='ppr', seeding the
+    graph leg from memory 100 must surface memory 200 (it shares the canonical concept
+    'Svelte') while NOT surfacing the disjoint memory 300 — the entity-bridged hop the
+    typed graph is theorised to add over dense."""
+    g, _ = _typed_graph_two_memories_share_concept()
+    r = HybridRetriever()
+    r.set_concept_graph(g)
+    assert r.graph_mode == "ppr"  # PPR is the default S4 substrate
+
+    ranked = r._graph_rank([100], k=10)
+    assert 200 in ranked, "PPR must reach memory 200 via the shared 'Svelte' concept"
+    assert 300 not in ranked, "the disjoint memory 300 shares no concept with the seed"
+
+
+def test_graph_rank_ppr_empty_seeds_and_no_graph() -> None:
+    """The PPR leg degrades cleanly: no typed graph → empty; typed graph but empty
+    seeds → empty."""
+    r = HybridRetriever()
+    assert r._graph_rank([100], k=5) == []  # no typed graph set
+    g, _ = _typed_graph_two_memories_share_concept()
+    r.set_concept_graph(g)
+    assert r._graph_rank([], k=5) == []  # graph but no seeds → empty leg
+
+
+def test_graph_rank_typed_one_hop_variant_behind_flag() -> None:
+    """The cheaper typed-1-hop traversal variant lives behind graph_mode='1hop': from
+    seed memory 100 it walks memory→concept→memory once and returns the bridged
+    neighbour 200 without the PPR power iteration."""
+    g, _ = _typed_graph_two_memories_share_concept()
+    r = HybridRetriever()
+    r.set_concept_graph(g)
+    r.graph_mode = "1hop"
+
+    ranked = r._graph_rank([100], k=10)
+    assert 200 in ranked, "typed 1-hop must reach the shared-concept neighbour"
+    assert 300 not in ranked
+    assert 100 not in ranked, "1-hop returns NEIGHBOURS, not the seed itself"
+
+
+def test_ppr_graph_leg_feeds_shared_fused_pool() -> None:
+    """END-TO-END with the typed PPR leg (S1 fusion contract preserved): a PPR-only
+    bridged memory (absent from FTS+dense) competes in the SHARED fused pool. Stub
+    FTS+dense to return only memory 100; the typed graph bridges 100→200; at a swept-up
+    w_graph the graph-only 200 must enter the fused output."""
+    g, _ = _typed_graph_two_memories_share_concept()
+    r = HybridRetriever()
+    r.set_concept_graph(g)
+    # base legs see only memory 100 (200 is graph-only)
+    r._fts.retrieve = lambda q, k: [100]  # type: ignore[method-assign]
+    r._dense_rank = lambda q, k: [100]  # type: ignore[method-assign]
+
+    r.w_graph = 0.0
+    assert 200 not in r.retrieve("q", k=10), "w_graph=0 → the PPR-only id cannot appear"
+
+    r.w_graph = 5.0
+    out = r.retrieve("q", k=10)
+    assert 200 in out, "swept w_graph → the PPR-bridged graph-only id competes in the pool"
+
+
+def test_graph_stats_and_latency_reporting() -> None:
+    """The run REPORTS the typed graph's edge count and a MEASURED per-query PPR
+    latency. graph_stats() exposes the typed edge count; measure_ppr_latency_ms()
+    returns a real (>0) measured millisecond figure for a representative seed set."""
+    g, _ = _typed_graph_two_memories_share_concept()
+    r = HybridRetriever()
+    r.set_concept_graph(g)
+
+    stats = r.graph_stats()
+    # typed-graph edge count is reported and is FAR below the prior 2,095,624.
+    assert "typed_edges" in stats
+    assert stats["typed_edges"] == len(g.concept_edges)
+    assert stats["typed_edges"] < 2_095_624
+
+    ms = r.measure_ppr_latency_ms([100], repeats=3)
+    assert isinstance(ms, float)
+    assert ms > 0.0, "a measured per-query PPR latency must be a positive millisecond figure"

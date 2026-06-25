@@ -21,9 +21,11 @@ vault = ["hvac>=2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "httpx>=0.28", "cryptography>=43.0", "hypothesis>=6.0"]
 # Offline recall-benchmark harness (benchmarks/). OPTIONAL — never required by the
 # product or SQLite-only mode (ADR-0002). numpy backs the cached dense matrix;
-# networkx backs the concept-graph leg. CI runs `uv sync --all-extras`, so the
-# harness tests get these; a bare `uv sync` (and the shipped image) pulls none.
-benchmarks = ["numpy>=1.26", "networkx>=3.0"]
+# networkx backs the concept-graph leg; scipy.sparse backs the S4 PPR power
+# iteration over the typed graph (sparse matvec — the HippoRAG-2 hot-path cost we
+# MEASURE). CI runs `uv sync --all-extras`, so the harness tests get these; a bare
+# `uv sync` (and the shipped image) pulls none.
+benchmarks = ["numpy>=1.26", "networkx>=3.0", "scipy>=1.13"]
 
 [project.scripts]
 claude-memory-server = "claude_memory.mcp_server:main"

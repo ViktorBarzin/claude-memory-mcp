@@ -76,8 +76,9 @@ import os
 import re
 import sys
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # ── package-relative imports that also work under direct execution ────────────
 try:  # pragma: no cover - exercised by both import paths
@@ -87,6 +88,9 @@ except ModuleNotFoundError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from harness.types import Memory, MemoryId
     from retrievers.fts import FtsRetriever
+
+if TYPE_CHECKING:  # type-only: the typed graph is injected (S5 wiring), never imported
+    from retrievers.graph_build import ConceptGraph  # at module import (ADR-0002 lazy).
 
 _BENCH_ROOT = Path(__file__).resolve().parents[1]
 _CACHE_DIR = _BENCH_ROOT / "cache"
@@ -116,6 +120,26 @@ _CONCEPT_MIN_DF = 2
 _CONCEPT_MAX_DF_FRAC = 0.02
 _GRAPH_SEEDS = 10
 _GRAPH_NEIGHBOURS_PER_SEED = 25
+
+# ── Personalized PageRank (PPR) over the TYPED concept graph (slice S4) ───────────
+#   The HippoRAG-2 idea WITHOUT a per-query LLM: seed a restart vector from the
+#   memory nodes the FTS∪dense fusion surfaced, then run PPR to convergence over the
+#   bipartite memory↔concept graph and read off a graph-leg ranking of MEMORIES by
+#   stationary probability. A non-seeded memory reaches the ranking purely via a
+#   shared canonical concept with a seed — that is the entity-bridged hop, and the
+#   only mechanism by which S1's "graph-only G reaches the fused top-k" is reachable.
+#
+#   _PPR_ALPHA : damping = probability of FOLLOWING an edge each step; (1-alpha) is
+#                the restart/teleport probability back to the personalization (seed)
+#                distribution. 0.5 is the HippoRAG default and keeps mass close to the
+#                seeds (short-hop bias) rather than smearing it across the graph.
+#   _PPR_TOL   : L1 convergence tolerance on successive iterates.
+#   _PPR_MAX_ITER : hard iteration cap (the power iteration converges geometrically;
+#                this just bounds a pathological graph). Fixed alpha + fixed seed ⇒
+#                a DETERMINISTIC stationary vector (required for the comparison).
+_PPR_ALPHA = 0.5
+_PPR_TOL = 1e-9
+_PPR_MAX_ITER = 200
 
 # A small English stop-word set for the lightweight noun-phrase extraction. We
 # deliberately keep this tiny + dependency-free (no spaCy/NLTK download on the hot
@@ -189,6 +213,101 @@ def _corpus_fingerprint(corpus: Sequence[Memory]) -> str:
     return h.hexdigest()[:16]
 
 
+def _ppr_stationary(
+    edges: Sequence[tuple[int, int]],
+    n_nodes: int,
+    seed_weights: Mapping[int, float],
+    *,
+    alpha: float = _PPR_ALPHA,
+    tol: float = _PPR_TOL,
+    max_iter: int = _PPR_MAX_ITER,
+) -> list[float]:
+    """Personalized PageRank over an UNDIRECTED graph, by sparse power iteration.
+
+    This is the model-free numerical core of the S4 graph leg (HippoRAG-2 idea). It
+    is deliberately a free function over a plain edge list + node count + seed map so
+    it can be unit-tested on a hand-built bipartite memory↔concept graph with NO
+    embedding model, NO corpus, and NO database.
+
+    Args:
+        edges: undirected edges as ``(u, v)`` index pairs into ``[0, n_nodes)``. Each
+            pair is symmetrised internally; duplicates accumulate edge weight (so a
+            doubly-asserted concept link pulls harder), matching the typed graph where
+            an edge's ``weight`` counts supporting triples.
+        n_nodes: total node count (memory nodes ∪ concept nodes share one index space).
+        seed_weights: ``{node_index: restart_weight}`` — the personalization / restart
+            distribution. NON-NEGATIVE weights; they are L1-normalised internally, so
+            only the RELATIVE weighting matters. An EMPTY map means NO restart mass and
+            returns an all-zero vector (the graph leg contributes nothing without
+            seeds) rather than a uniform PageRank.
+
+    Returns:
+        A length-``n_nodes`` list of stationary probabilities (sums to 1 when there is
+        restart mass; all-zero when ``seed_weights`` is empty). Every node is ranked —
+        the seeds only set the restart vector — so a NON-SEEDED node reachable from a
+        seed (through a shared concept) gets nonzero mass and a node in a disjoint
+        component gets exactly zero (teleport targets seeds only). Deterministic for a
+        fixed ``alpha`` and ``seed_weights``.
+
+    The iteration (mass-conserving, with dangling-node handling):
+
+        x_{t+1} = alpha · (Pᵀ x_t + d_t · p) + (1 - alpha) · p
+
+    where ``P = D⁻¹ A`` is the row-stochastic random-walk matrix, ``p`` is the
+    normalised restart vector, and ``d_t`` is the mass on dangling (degree-0) nodes at
+    step t (redistributed to ``p`` so total mass stays 1). Note ``Pᵀ`` is built once
+    per call; production would CACHE it across queries (the real hot-path cost — see
+    ``HybridRetriever.measure_ppr_latency_ms``).
+    """
+    import numpy as np
+    import scipy.sparse as sp
+
+    if n_nodes <= 0 or not seed_weights:
+        return [0.0] * max(n_nodes, 0)
+
+    # Build the symmetric adjacency (duplicates sum → integer edge multiplicity/weight).
+    if edges:
+        rows: list[int] = []
+        cols: list[int] = []
+        for u, v in edges:
+            rows.append(u)
+            cols.append(v)
+            rows.append(v)
+            cols.append(u)
+        data = np.ones(len(rows), dtype=np.float64)
+        adj = sp.csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+        adj.sum_duplicates()
+    else:
+        adj = sp.csr_matrix((n_nodes, n_nodes), dtype=np.float64)
+
+    deg = np.asarray(adj.sum(axis=1)).ravel()
+    dangling = deg == 0.0
+    deg_safe = deg.copy()
+    deg_safe[dangling] = 1.0
+    d_inv = sp.diags(1.0 / deg_safe)
+    # P = D⁻¹ A (row-stochastic); we iterate with its transpose (column-stochastic).
+    p_transition = (d_inv @ adj).T.tocsr()
+
+    pers = np.zeros(n_nodes, dtype=np.float64)
+    for node, w in seed_weights.items():
+        if 0 <= node < n_nodes and w > 0.0:
+            pers[node] += float(w)
+    total = pers.sum()
+    if total <= 0.0:
+        return [0.0] * n_nodes  # seeds out of range / all non-positive → empty leg
+    pers /= total
+
+    x = pers.copy()
+    for _ in range(max_iter):
+        dangling_mass = float(x[dangling].sum())
+        x_new = alpha * (p_transition @ x + dangling_mass * pers) + (1.0 - alpha) * pers
+        if float(np.abs(x_new - x).sum()) < tol:
+            x = x_new
+            break
+        x = x_new
+    return [float(v) for v in x]
+
+
 class HybridRetriever:
     """Lexical FTS + dense (bge-large-en-v1.5 / hosted) + concept-graph expansion,
     fused with RRF. Degrades to FTS(+graph) if embeddings are unavailable."""
@@ -201,6 +320,18 @@ class HybridRetriever:
     w_dense = 1.0
     w_fts = 1.0
     w_graph = 0.35
+
+    # Graph-leg traversal mode over the TYPED concept graph (slice S4):
+    #   "ppr"  — Personalized PageRank over the bipartite memory↔concept graph
+    #            (HippoRAG-2 idea; the DEFAULT). Ranks ALL memory nodes by stationary
+    #            probability with the fused seeds setting only the restart vector.
+    #   "1hop" — the cheaper typed-1-hop traversal: from each seed, walk
+    #            memory→concept→memory once and rank the bridged neighbours by shared-
+    #            concept weight. Evaluated alongside PPR (the production-substrate
+    #            choice is deferred to the measured-latency verdict).
+    # Only consulted when a typed ConceptGraph has been set via set_concept_graph();
+    # with no typed graph the leg falls back to the prior keyword-co-occurrence walk.
+    graph_mode = "ppr"
 
     def __init__(self, model_name: str | None = None) -> None:
         self.errors: list[str] = []
@@ -217,13 +348,25 @@ class HybridRetriever:
         self._emb = None  # (N, d) float32 L2-normalised matrix, row i ↔ self._ids[i]
         self._ids: list[MemoryId] = []  # row order of self._emb
 
-        # Graph leg state.
+        # Graph leg state — prior keyword-co-occurrence graph (fallback when no typed
+        # graph is injected; the prototype this run supersedes).
         self._graph = None  # networkx.Graph or None
         self._concept_to_mems: dict[str, list[MemoryId]] = {}
         self._mem_concepts: dict[MemoryId, set[str]] = {}
         self._n_concepts_total = 0  # before df pruning, for reporting
         self._n_concepts_kept = 0
         self._n_edges = 0
+
+        # TYPED concept graph (slice S3) + its bipartite memory↔concept index for PPR
+        # (slice S4). Injected via set_concept_graph (S5 wiring); None ⇒ the leg uses
+        # the keyword fallback above. The transition matrix is built lazily and CACHED
+        # (the real per-query PPR hot-path is the iterate, not the rebuild).
+        self._cgraph: ConceptGraph | None = None
+        self._node_count = 0  # |memory nodes ∪ concept nodes| in the bipartite index
+        self._mem_to_node: dict[MemoryId, int] = {}  # memory id → bipartite node index
+        self._node_to_mem: dict[int, MemoryId] = {}  # inverse, for reading PPR results
+        self._bipartite_edges: list[tuple[int, int]] = []  # undirected memory↔concept
+        self._typed_edge_count = 0  # |concept_edges| in the typed graph, for reporting
 
         self._corpus_size = 0
 
@@ -432,7 +575,142 @@ class HybridRetriever:
         idx = idx[np.argsort(-sims[idx])]
         return [self._ids[i] for i in idx]
 
-    # ── graph leg ──────────────────────────────────────────────────────────
+    # ── typed concept graph (S3) + PPR leg (S4) ──────────────────────────────
+
+    def set_concept_graph(self, cgraph: ConceptGraph) -> None:
+        """Inject the TYPED concept graph (slice S3) and pre-compute its bipartite
+        memory↔concept index for the PPR / typed-1-hop graph leg (slice S4).
+
+        Building the index here (once, at wiring time) keeps ``_graph_rank`` on the
+        query hot path cheap: it only seeds a restart vector and iterates. The node
+        index space holds BOTH memory nodes and concept nodes — memory ids are mapped
+        to fresh node indices and concept ids are offset above them — and an undirected
+        edge connects every memory to each concept it mentions (the bipartite
+        adjacency PPR walks). This is the structure that lets memory→concept→memory be
+        a single concept hop, so a non-seeded memory sharing a concept with a seed is
+        reachable.
+        """
+        self._cgraph = cgraph
+        self._typed_edge_count = len(cgraph.concept_edges)
+
+        # 1) memory nodes: every memory that mentions at least one concept. Stable
+        #    sorted order → deterministic node indices (and thus deterministic PPR).
+        mem_ids = sorted({mc.memory_id for mc in cgraph.memory_concepts})
+        self._mem_to_node = {mid: i for i, mid in enumerate(mem_ids)}
+        self._node_to_mem = {i: mid for mid, i in self._mem_to_node.items()}
+        n_mem = len(mem_ids)
+
+        # 2) concept nodes: offset above the memory nodes in the shared index space.
+        concept_ids = sorted(cgraph.concepts.keys())
+        concept_to_node = {cid: n_mem + i for i, cid in enumerate(concept_ids)}
+        self._node_count = n_mem + len(concept_ids)
+
+        # 3) bipartite edges: memory ↔ each concept it mentions. De-duplicate (a memory
+        #    may mention the same concept via several relations) — multiplicity here
+        #    would over-weight a single mention; the typed concept↔concept edges carry
+        #    the relational weight separately (added below).
+        seen_mc: set[tuple[int, int]] = set()
+        edges: list[tuple[int, int]] = []
+        for mc in cgraph.memory_concepts:
+            mnode = self._mem_to_node.get(mc.memory_id)
+            cnode = concept_to_node.get(mc.concept_id)
+            if mnode is None or cnode is None:
+                continue
+            key = (mnode, cnode)
+            if key not in seen_mc:
+                seen_mc.add(key)
+                edges.append(key)
+
+        # 4) typed concept↔concept edges (relational structure): a triple
+        #    (src)-[rel]->(dst) connects two concept nodes. Repeated edges in the list
+        #    accumulate weight inside the PPR adjacency, so a strongly-asserted relation
+        #    pulls harder. Self-loops were already dropped by the S3 builder.
+        for e in cgraph.concept_edges:
+            s = concept_to_node.get(e.src_id)
+            d = concept_to_node.get(e.dst_id)
+            if s is None or d is None or s == d:
+                continue
+            edges.append((s, d))
+
+        self._bipartite_edges = edges
+
+    def _ppr_memory_ranking(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
+        """PPR graph leg: seed the restart vector from the fused-seed MEMORY nodes, run
+        PPR over the bipartite graph, then rank MEMORY nodes by stationary probability.
+
+        Seed weight is rank-decayed (1/rank) so the best-agreed FTS∪dense seeds pull
+        hardest — the same monotone seed prior the keyword leg used. The returned
+        ranking spans ALL memory nodes that picked up mass (seeds reinforce in the
+        shared fused pool; non-seeded bridged memories compete as graph-only ids), top
+        ``k``. Concept nodes are dropped from the output (only memories are retrievable
+        candidates)."""
+        if self._cgraph is None or not seeds or self._node_count == 0:
+            return []
+        seed_weights: dict[int, float] = {}
+        for rank, s in enumerate(seeds[:_GRAPH_SEEDS], start=1):
+            node = self._mem_to_node.get(s)
+            if node is not None:
+                seed_weights[node] = seed_weights.get(node, 0.0) + 1.0 / rank
+        if not seed_weights:
+            return []  # none of the seeds is a memory node in the typed graph
+
+        dist = _ppr_stationary(self._bipartite_edges, self._node_count, seed_weights)
+        # rank memory nodes (drop concept nodes) by stationary mass, mass > 0 only.
+        scored: list[tuple[float, MemoryId]] = []
+        for node, mid in self._node_to_mem.items():
+            p = dist[node]
+            if p > 0.0:
+                scored.append((p, mid))
+        # sort by mass desc, then by id asc for a deterministic tie-break.
+        scored.sort(key=lambda pm: (-pm[0], pm[1]))
+        return [mid for _, mid in scored[:k]]
+
+    def _typed_one_hop_ranking(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
+        """Cheaper typed-1-hop graph-leg variant (behind ``graph_mode='1hop'``): from
+        each seed memory, walk memory→concept→memory ONCE and rank the bridged
+        NEIGHBOUR memories by shared-concept count, rank-decayed by the seed. No power
+        iteration — this is the candidate production substrate that ports to a
+        recursive Postgres CTE. Returns NEIGHBOURS only (a seed is not its own
+        neighbour), so it mirrors the keyword leg's 1-hop contract."""
+        if self._cgraph is None or not seeds:
+            return []
+        cg = self._cgraph
+        # memory → set(concept ids) it mentions (built once from the mention-links).
+        mem_concepts: dict[MemoryId, set[int]] = defaultdict(set)
+        for mc in cg.memory_concepts:
+            mem_concepts[mc.memory_id].add(mc.concept_id)
+
+        scores: dict[MemoryId, float] = defaultdict(float)
+        for rank, s in enumerate(seeds[:_GRAPH_SEEDS], start=1):
+            seed_w = 1.0 / rank
+            for cid in mem_concepts.get(s, set()):
+                for nbr in cg.memories_for_concept(cid):
+                    if nbr == s:
+                        continue  # no self-neighbour
+                    scores[nbr] += seed_w
+        ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [mid for mid, _ in ranked[:k]]
+
+    def measure_ppr_latency_ms(self, seeds: list[MemoryId], *, repeats: int = 5) -> float:
+        """MEASURE the per-query PPR latency (the challenger-corrected honesty: the
+        survey's ~2 ms is unproven; a 2.1M-edge graph would be ~140-280 ms). Times the
+        FULL leg (build the restart vector + the power iteration over the current
+        bipartite edges) and returns the MEDIAN milliseconds over ``repeats`` runs.
+        Reported, never gating — but it IS the production hot-path cost if PPR is
+        promoted, so it informs the substrate choice."""
+        import time
+
+        if self._cgraph is None or self._node_count == 0:
+            return 0.0
+        samples: list[float] = []
+        for _ in range(max(1, repeats)):
+            t0 = time.perf_counter()
+            self._ppr_memory_ranking(seeds, k=max(self._node_count, 1))
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        samples.sort()
+        return samples[len(samples) // 2]
+
+    # ── graph leg (prior keyword-co-occurrence prototype — fallback) ──────────
 
     def _build_graph(self, corpus: Sequence[Memory]) -> None:
         import networkx as nx
@@ -484,21 +762,34 @@ class HybridRetriever:
         self._graph = g
 
     def _graph_rank(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
-        """From fused seeds, walk 1 hop and rank neighbour memories by accumulated
-        edge weight (shared-concept strength), weighted by the seed's own rank so
-        higher-confidence seeds pull harder. Returns up to k ranked ids.
+        """Rank graph-leg candidates from the fused seeds, returning up to ``k`` ids.
 
-        FUSION FIX (ADR-0005): NO ``exclude`` — the graph leg is NOT carved out of
-        the FTS∪dense base pool. Every neighbour it surfaces (whether or not a base
-        leg also returned it) goes into the SHARED fused pool, so a graph candidate
-        can REINFORCE a base hit (extra RRF mass, exactly like FTS∪dense overlap) OR
-        introduce a graph-only id that competes on its own merit. The prior
-        ``exclude=base_set`` structurally barred reinforcement and capped a
-        graph-only hit at ``w_graph/(60+rank)`` below any realistic top-k boundary —
-        the math artifact this run exists to undo. A node is never its own neighbour
-        (no self-loops), so a sole seed never re-emits itself; a node reachable from
-        any OTHER seed does enter the ranking."""
-        if self._graph is None or not seeds:
+        DISPATCH (slice S4): if a TYPED concept graph has been injected
+        (``set_concept_graph``), the leg runs over it — ``graph_mode='ppr'`` (default)
+        does Personalized PageRank over the bipartite memory↔concept graph and ranks
+        ALL memory nodes by stationary probability (the seeds set ONLY the restart
+        vector — so a non-seeded memory sharing a concept with a seed is reachable),
+        while ``graph_mode='1hop'`` does the cheaper typed memory→concept→memory walk.
+        With NO typed graph set, the leg falls back to the prior keyword-co-occurrence
+        1-hop walk (the prototype this run supersedes), so existing keyword-graph
+        callers keep working unchanged.
+
+        FUSION FIX (ADR-0005), preserved across all three modes: NO ``exclude`` — the
+        graph leg is NOT carved out of the FTS∪dense base pool. Whatever it surfaces
+        (a base-leg overlap that gets REINFORCED, or a graph-only id) enters the SHARED
+        fused pool and competes on its own RRF mass. The prior ``exclude=base_set`` +
+        fixed ``w_graph=0.35`` capped a graph-only hit below any realistic top-k
+        boundary — the math artifact this run exists to undo."""
+        if not seeds:
+            return []
+        # typed-graph path (the S4 substrate) takes precedence when wired in.
+        if self._cgraph is not None:
+            if self.graph_mode == "1hop":
+                return self._typed_one_hop_ranking(seeds, k)
+            return self._ppr_memory_ranking(seeds, k)
+
+        # fallback: prior keyword-co-occurrence 1-hop walk (no typed graph injected).
+        if self._graph is None:
             return []
         g = self._graph
         scores: dict[MemoryId, float] = defaultdict(float)
@@ -578,11 +869,21 @@ class HybridRetriever:
         return total
 
     def graph_stats(self) -> dict[str, int]:
+        """Graph-build statistics for the report. The keyword fields (``edges``,
+        ``concepts_*``) describe the prior keyword-co-occurrence fallback; the
+        ``typed_*`` fields (slice S4) describe the injected TYPED concept graph + its
+        bipartite PPR index. ``typed_edges`` is the headline for the latency-sanity
+        check — it MUST be far below the prior keyword prototype's 2,095,624 edges."""
         return {
             "nodes": self._graph.number_of_nodes() if self._graph is not None else 0,
             "edges": self._n_edges,
             "concepts_total": self._n_concepts_total,
             "concepts_kept": self._n_concepts_kept,
+            # typed concept graph (S3) + bipartite PPR index (S4):
+            "typed_concepts": len(self._cgraph.concepts) if self._cgraph is not None else 0,
+            "typed_edges": self._typed_edge_count,
+            "bipartite_nodes": self._node_count,
+            "bipartite_edges": len(self._bipartite_edges),
         }
 
     def close(self) -> None:
