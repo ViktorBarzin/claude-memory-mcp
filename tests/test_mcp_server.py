@@ -654,3 +654,99 @@ class TestRecallProgressAndBounding:
         })
 
         assert [s for s in sent if s["method"] == "notifications/progress"] == []
+
+
+# ─── FastMCP Postgres-backed tools (api/app.py) wire through the shared helpers ──
+#
+# app.memory_recall / app.memory_store are the FastMCP (Postgres) tools — distinct
+# from the local SQLite MemoryServer above. They must use the SAME shared
+# _fused_recall / schedule_embedding helpers as the REST endpoints so the two recall
+# paths and two store paths cannot drift (S8 item (f)).
+
+
+@pytest.fixture
+def fastmcp_app():
+    """Reload api.app with a mocked asyncpg pool + a fixed MCP user context.
+
+    Returns (app_mod, conn). app_mod.memory_recall / app_mod.memory_store are the
+    FastMCP tool coroutines; in this FastMCP version the decorator returns the original
+    function, so they can be awaited directly.
+    """
+    import importlib
+    from unittest.mock import AsyncMock, MagicMock
+
+    conn = AsyncMock()
+    pool = MagicMock()
+    acm = MagicMock()
+    acm.__aenter__ = AsyncMock(return_value=conn)
+    acm.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire.return_value = acm
+
+    with patch.dict(os.environ, {"DATABASE_URL": "postgresql://test", "API_KEY": "k", "API_KEYS": ""}):
+        import claude_memory.api.database as db_mod
+        import claude_memory.api.app as app_mod
+
+        importlib.reload(db_mod)
+        importlib.reload(app_mod)
+        db_mod.pool = pool
+        app_mod._current_user.set("mcpuser")
+        yield app_mod, conn
+
+
+class TestFastMCPToolsShareHelpers:
+    @pytest.mark.asyncio
+    async def test_memory_recall_delegates_to_shared_fused_recall(self, fastmcp_app):
+        """(f) FastMCP memory_recall retrieves via the shared _fused_recall helper."""
+        from datetime import datetime, timezone
+
+        app_mod, conn = fastmcp_app
+        now = datetime.now(timezone.utc)
+        captured: dict[str, Any] = {}
+
+        async def fake_fused(conn_arg, **kwargs):
+            captured.update(kwargs)
+            return [{
+                "id": 1, "content": "mcp helper row", "category": "facts", "tags": "",
+                "importance": 0.5, "is_sensitive": False, "rank": 0.5,
+                "owner": "mcpuser", "created_at": now, "updated_at": now, "shared_by": None,
+            }]
+
+        with patch.object(app_mod, "_fused_recall", side_effect=fake_fused) as mock_fused:
+            out = await app_mod.memory_recall(context="hello mcp", limit=9)
+
+        data = json.loads(out)
+        assert data["memories"][0]["content"] == "mcp helper row"
+        mock_fused.assert_called_once()
+        assert captured["query_text"] == "hello mcp"
+        assert captured["limit"] == 9
+        assert captured["user_id"] == "mcpuser"
+
+    @pytest.mark.asyncio
+    async def test_memory_store_schedules_embed_on_write(self, fastmcp_app):
+        """(e/f) FastMCP memory_store calls the shared schedule_embedding after INSERT."""
+        app_mod, conn = fastmcp_app
+        conn.fetchrow.return_value = {"id": 77}
+
+        with patch.object(app_mod, "schedule_embedding") as mock_sched:
+            out = await app_mod.memory_store(content="store via mcp", category="facts")
+
+        assert json.loads(out)["id"] == 77
+        mock_sched.assert_called_once()
+        args, kwargs = mock_sched.call_args
+        assert args[1] == 77
+        assert args[2] == "store via mcp"
+        assert kwargs["is_sensitive"] is False
+
+    @pytest.mark.asyncio
+    async def test_memory_store_sensitive_chunk_not_embedded(self, fastmcp_app):
+        """(c) A sensitive chunk passes is_sensitive=True to schedule_embedding."""
+        app_mod, conn = fastmcp_app
+        conn.fetchrow.return_value = {"id": 88}
+
+        with patch.object(app_mod, "schedule_embedding") as mock_sched, \
+             patch.object(app_mod, "_detect_sensitive", return_value=True), \
+             patch.object(app_mod, "is_vault_configured", return_value=False):
+            await app_mod.memory_store(content="api key sk-xyz", category="facts")
+
+        mock_sched.assert_called_once()
+        assert mock_sched.call_args.kwargs["is_sensitive"] is True

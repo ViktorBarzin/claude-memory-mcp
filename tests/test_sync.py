@@ -756,3 +756,70 @@ class TestGetCounts:
         assert counts["by_category"]["projects"] == 1
         assert counts["orphans_no_server_id"] == 1
         assert counts["pending_ops"] == 1
+
+
+class TestSyncIsEmbeddingFree:
+    """Embeddings live ONLY in Postgres; SQLite stays purely lexical (S8 / challenger
+    must_fix #4).
+
+    sync.py must neither READ nor WRITE the ``embedding`` column: the local SQLite
+    cache gets no vector column, the sync payload it sends/receives carries no
+    embedding field, and a full round-trip never touches one. These tests pin that
+    contract so a future change can't quietly start syncing vectors.
+    """
+
+    def test_sqlite_schema_has_no_embedding_column(self, engine):
+        """The local cache schema the sync engine manages carries no vector column."""
+        cursor = engine._conn.execute("PRAGMA table_info(memories)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        assert "embedding" not in columns, "SQLite memories must stay lexical-only (no embedding column)"
+
+    def test_sync_module_source_never_references_embedding(self):
+        """sync.py never mentions ``embedding`` — it is not read, written, or carried."""
+        import inspect
+
+        import claude_memory.sync as sync_mod
+
+        source = inspect.getsource(sync_mod)
+        assert "embedding" not in source, "sync.py must not reference the embedding column"
+
+    def test_full_resync_ignores_embedding_in_payload(self, engine, sqlite_conn):
+        """A full server→local resync upserts the documented columns only — no embedding.
+
+        The server payload deliberately INCLUDES an ``embedding`` field; the sync engine
+        enumerates columns explicitly, so it drops the field on the floor: the row lands
+        with its lexical fields and SQLite never grows an embedding column.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        server_payload = {
+            "memories": [
+                {
+                    "id": 501,
+                    "content": "a synced memory",
+                    "category": "facts",
+                    "tags": "",
+                    "expanded_keywords": "",
+                    "importance": 0.5,
+                    "is_sensitive": False,
+                    "created_at": now,
+                    "updated_at": now,
+                    "deleted_at": None,
+                    # The server would NEVER send this (embedding is Postgres-only), but if
+                    # it ever did, the lexical SQLite cache must drop it on the floor.
+                    "embedding": [0.1] * 1024,
+                },
+            ],
+            "server_time": now,
+        }
+
+        with patch.object(engine, "_api_request", return_value=server_payload):
+            engine._full_resync()
+
+        # The row landed, lexical fields intact, and the schema still has no embedding column.
+        row = engine._conn.execute(
+            "SELECT content, importance FROM memories WHERE server_id = 501"
+        ).fetchone()
+        assert row is not None
+        assert row["content"] == "a synced memory"
+        cols = {r["name"] for r in engine._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        assert "embedding" not in cols

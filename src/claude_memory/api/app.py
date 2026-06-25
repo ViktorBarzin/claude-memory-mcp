@@ -25,6 +25,7 @@ from claude_memory.api.models import (
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
 )
 from claude_memory.api.permissions import check_memory_permission
+from claude_memory.api.recall import _fused_recall, schedule_embedding
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -187,13 +188,11 @@ async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_u
                 memory_id,
             )
 
+    # Embed-on-write OFF the hot path (shared helper): non-sensitive rows only, flag-gated.
+    # Returns immediately; the response is never blocked on the embedding compute.
+    schedule_embedding(pool, memory_id, body.content, is_sensitive=is_sensitive)
+
     return MemoryResponse(id=row["id"], category=row["category"], importance=row["importance"])
-
-
-# OR-broadening fallback: when the precise AND-match is sparse we widen to an
-# OR-match to fill results, but only with rows whose relevance (ts_rank) clears
-# this floor. Below it a row merely contains one query word incidentally — noise.
-OR_BROADEN_MIN_RANK = 0.01
 
 
 @app.post("/api/memories/recall")
@@ -202,70 +201,20 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
 
     query_text = f"{body.context} {body.expanded_query}".strip()
 
-    # Hybrid scoring: blend ts_rank relevance (0-1) with importance (0-1)
-    hybrid_score = "(ts_rank(search_vector, query) * 0.7 + importance * 0.3)"
-    if body.sort_by == "importance":
-        hybrid_score = "(ts_rank(search_vector, query) * 0.4 + importance * 0.6)"
-
-    order_clause = f"{hybrid_score} DESC"
-    if body.sort_by == "recency":
-        order_clause = "created_at DESC"
-
-    category_filter = ""
-    params: list[Any] = [user.user_id, query_text, body.limit]
-    if body.category:
-        category_filter = "AND category = $4"
-        params.append(body.category)
-
+    # One shared retrieval helper for BOTH recall entry points (REST + FastMCP) so the
+    # lexical→hybrid logic cannot drift. Flags off ⇒ verbatim current lexical SQL (no-op);
+    # the embeddings flag adds the dense leg to a shared weighted-RRF pool with importance
+    # as a post-fusion multiplier (api/recall.py).
     async with pool.acquire() as conn:
-        # All memories (public by default) — AND-match
-        rows = await conn.fetch(
-            f"""
-            SELECT id, content, category, tags, importance, is_sensitive,
-                   ts_rank(search_vector, query) AS rank,
-                   created_at, updated_at, user_id AS owner,
-                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-            FROM memories, plainto_tsquery('english', $2) query
-            WHERE deleted_at IS NULL
-              AND (search_vector @@ query OR $2 = '')
-              {category_filter}
-            ORDER BY {order_clause}
-            LIMIT $3
-            """,
-            *params,
+        all_rows = await _fused_recall(
+            conn,
+            user_id=user.user_id,
+            query_text=query_text,
+            sort_by=body.sort_by,
+            category=body.category,
+            limit=body.limit,
+            pool=pool,
         )
-
-        all_rows = list(rows)
-
-        # If AND-match returned too few results, broaden to OR-match
-        if len(all_rows) < body.limit and query_text:
-            words = query_text.split()
-            if len(words) > 1:
-                or_tsquery = " | ".join(w for w in words if w)
-                or_params: list[Any] = [user.user_id, or_tsquery, body.limit]
-                or_cat_filter = ""
-                if body.category:
-                    or_cat_filter = "AND category = $4"
-                    or_params.append(body.category)
-                seen_ids = {r["id"] for r in all_rows}
-                or_rows = await conn.fetch(
-                    f"""
-                    SELECT id, content, category, tags, importance, is_sensitive,
-                           ts_rank(search_vector, query) AS rank,
-                           created_at, updated_at, user_id AS owner,
-                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-                    FROM memories, to_tsquery('english', $2) query
-                    WHERE deleted_at IS NULL
-                      AND search_vector @@ query
-                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
-                      {or_cat_filter}
-                    ORDER BY ts_rank(search_vector, query) DESC
-                    LIMIT $3
-                    """,
-                    *or_params,
-                )
-                all_rows = all_rows + [r for r in or_rows if r["id"] not in seen_ids]
-                all_rows = all_rows[:body.limit]
 
     results = []
     for row in all_rows:
@@ -895,6 +844,10 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
                 vault_path = await store_secret(user_id, memory_id, chunk)
                 await conn.execute("UPDATE memories SET vault_path = $1 WHERE id = $2", vault_path, memory_id)
 
+            # Embed-on-write OFF the hot path (same shared helper as the REST store path):
+            # non-sensitive chunks only, flag-gated; does not block the store response.
+            schedule_embedding(pool, memory_id, chunk, is_sensitive=is_sensitive)
+
     if len(created_ids) == 1:
         return json.dumps({"id": created_ids[0], "category": category, "importance": importance})
     return json.dumps({"ids": created_ids, "parts": len(created_ids), "category": category, "importance": importance})
@@ -911,68 +864,19 @@ async def memory_recall(context: str, expanded_query: str = "",
     if not query_text:
         return json.dumps({"error": "context is required"})
 
-    hybrid_score = "(ts_rank(search_vector, query) * 0.7 + importance * 0.3)"
-    if sort_by == "importance":
-        hybrid_score = "(ts_rank(search_vector, query) * 0.4 + importance * 0.6)"
-
-    order_clause = f"{hybrid_score} DESC"
-    if sort_by == "recency":
-        order_clause = "created_at DESC"
-
-    category_filter = ""
-    params: list[Any] = [user_id, query_text, limit]
-    if category:
-        category_filter = "AND category = $4"
-        params.append(category)
-
+    # SAME shared retrieval helper as the REST recall_memories endpoint — the two paths
+    # cannot drift. Flags off ⇒ verbatim current lexical SQL (no-op); embeddings flag adds
+    # the dense leg to a shared weighted-RRF pool (api/recall.py).
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT id, content, category, tags, importance, is_sensitive,
-                   ts_rank(search_vector, query) AS rank, created_at, updated_at,
-                   user_id AS owner,
-                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-            FROM memories, plainto_tsquery('english', $2) query
-            WHERE deleted_at IS NULL
-              AND (search_vector @@ query OR $2 = '')
-              {category_filter}
-            ORDER BY {order_clause}
-            LIMIT $3
-            """,
-            *params,
+        all_rows = await _fused_recall(
+            conn,
+            user_id=user_id,
+            query_text=query_text,
+            sort_by=sort_by,
+            category=category,
+            limit=limit,
+            pool=pool,
         )
-
-        all_rows = list(rows)
-
-        # If AND-match returned too few results, broaden to OR-match
-        if len(all_rows) < limit and query_text:
-            words = query_text.split()
-            if len(words) > 1:
-                or_tsquery = " | ".join(w for w in words if w)
-                or_params: list[Any] = [user_id, or_tsquery, limit]
-                or_cat_filter = ""
-                if category:
-                    or_cat_filter = "AND category = $4"
-                    or_params.append(category)
-                seen_ids = {r["id"] for r in all_rows}
-                or_rows = await conn.fetch(
-                    f"""
-                    SELECT id, content, category, tags, importance, is_sensitive,
-                           ts_rank(search_vector, query) AS rank, created_at, updated_at,
-                           user_id AS owner,
-                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-                    FROM memories, to_tsquery('english', $2) query
-                    WHERE deleted_at IS NULL
-                      AND search_vector @@ query
-                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
-                      {or_cat_filter}
-                    ORDER BY ts_rank(search_vector, query) DESC
-                    LIMIT $3
-                    """,
-                    *or_params,
-                )
-                all_rows = all_rows + [r for r in or_rows if r["id"] not in seen_ids]
-                all_rows = all_rows[:limit]
 
     results = []
     for row in all_rows:
