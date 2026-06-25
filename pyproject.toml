@@ -19,6 +19,23 @@ classifiers = [
 api = ["fastapi>=0.115", "asyncpg>=0.30", "uvicorn>=0.34", "pydantic>=2.0", "alembic>=1.14", "sqlalchemy>=2.0", "psycopg2-binary>=2.9", "mcp>=1.0.0"]
 vault = ["hvac>=2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "httpx>=0.28", "cryptography>=43.0", "hypothesis>=6.0"]
+# PRODUCTION dense-embedding backends (src/claude_memory/embeddings.py). OPTIONAL —
+# never required by the product or SQLite-only mode (ADR-0002), and the embed-on-write
+# path is flag-gated (MEMORY_EMBEDDINGS_ENABLED, default off). A bare `uv sync` (and the
+# shipped SQLite-only image) pulls NONE of these; the package still imports cleanly via
+# lazy imports inside each backend. CI runs `uv sync --all-extras` so ruff/mypy(strict)/
+# pytest exercise them.
+#   embeddings — the LOCAL bge-large-en-v1.5 backend (sensitive-safe + no-key fallback);
+#                numpy is sentence-transformers' array return type (the module's own
+#                L2-normalisation is pure-Python, so the base install needs no numpy).
+#   voyage     — the HOSTED voyage-3.5 backend (non-sensitive rows only; ADR-0003/0006).
+#   graph      — the PRODUCTION concept-graph leg (phase-2, flag-gated MEMORY_GRAPH_ENABLED,
+#                default off): networkx builds the typed graph, scipy.sparse backs the PPR
+#                power iteration. Declared here so the full optional surface is in place; the
+#                production graph module itself lands in a later slice.
+embeddings = ["sentence-transformers>=3.0", "numpy>=1.26"]
+voyage = ["voyageai>=0.3"]
+graph = ["networkx>=3.0", "scipy>=1.13"]
 # Offline recall-benchmark harness (benchmarks/). OPTIONAL — never required by the
 # product or SQLite-only mode (ADR-0002). numpy backs the cached dense matrix;
 # networkx backs the concept-graph leg; scipy.sparse backs the S4 PPR power
@@ -40,4 +57,25 @@ line-length = 120
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# Optional embedding-backend deps, imported lazily inside src/claude_memory/embeddings.py
+# and absent from the base install (optional extras). embeddings.py wraps every call into
+# our OWN local Protocols (cast at the boundary), so we rely on NONE of these libraries'
+# own type info — treat them as opaque. We must do this rather than just trust their
+# stubs because sentence-transformers ships py.typed and pulls in numpy 2.x, whose
+# bundled .pyi uses Python-3.12-only `type` statements that error under our pinned
+# python_version = "3.11". follow_imports = "skip" stops mypy parsing their internals;
+# ignore_missing_imports covers voyageai, which ships no stubs at all. Strict typing still
+# applies in full to all of our own code.
+[[tool.mypy.overrides]]
+module = [
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "voyageai",
+    "voyageai.*",
+    "numpy",
+    "numpy.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
 
