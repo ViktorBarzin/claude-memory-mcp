@@ -1,0 +1,77 @@
+# CloudNativePG-compatible PostgreSQL 16 operand image: PostGIS + GENUINE pgvector.
+# =============================================================================
+# WHY THIS IMAGE EXISTS
+# ---------------------------------------------------------------------------
+# The hybrid-recall dense leg stores embeddings in `memories.embedding halfvec(1024)`
+# and queries them with `embedding <=> $1::halfvec` over an HNSW index built with
+# `halfvec_cosine_ops` (see migrations/versions/005_add_embeddings_and_graph.py and
+# src/claude_memory/api/recall.py). All of `halfvec`, the `<=>` cosine operator, the
+# `hnsw` access method, and `halfvec_cosine_ops` are provided ONLY by pgvector.
+#
+# The shared CNPG cluster (dbaas/pg-cluster) currently runs the stock CNPG PostGIS
+# operand image `ghcr.io/cloudnative-pg/postgis:16`. That image bundles PostGIS but
+# NOT pgvector — `pg_available_extensions` lists `postgis` and not `vector`, and
+# `CREATE EXTENSION vector` fails with "extension \"vector\" is not available".
+# Migration 005 is availability-gated, so on that image every vector step correctly
+# NO-OPS and the dense leg can never function. This image is the operand-image swap
+# that makes `vector` AVAILABLE so a re-run of migration 005 picks up the column +
+# index. Promotion procedure: docs/runbooks/promote-pgvector-dense-recall.md.
+#
+# WHY THIS BASE
+# ---------------------------------------------------------------------------
+# We extend the CNPG PostGIS operand image rather than a vanilla postgres image so:
+#   * the CNPG instance manager + barman-cloud tooling the operator injects survive
+#     (a vanilla `postgres:16` is NOT a valid CNPG operand image), and
+#   * PostGIS is PRESERVED. The shared cluster is multi-tenant and at least one tenant
+#     (dawarich) has `postgis` installed; dropping PostGIS would break it. This image
+#     is strictly additive: PostGIS stays, pgvector is added.
+#
+# THE TRAP WE EXPLICITLY AVOID  (read before "improving" this file)
+# ---------------------------------------------------------------------------
+# pgvecto.rs / VectorChord is a DIFFERENT vector engine. It ships a `vectors.so`
+# library loaded via `shared_preload_libraries=vectors.so` and exposes the `vectors`
+# / `vchord` extensions — NOT `vector`. It does NOT provide `CREATE EXTENSION vector`,
+# the `halfvec` type, `halfvec_cosine_ops`, or the `hnsw` access method this codebase
+# needs. An image built on pgvecto.rs would leave migration 005 silently in its no-op
+# (lexical-only) state with NO error. So this Dockerfile:
+#   * installs ONLY the genuine pgvector Debian package `postgresql-16-pgvector`,
+#   * does NOT add the pgvecto.rs binary, and
+#   * does NOT set `shared_preload_libraries=vectors.so` (pgvector needs no preload;
+#     `CREATE EXTENSION vector` alone is sufficient). We do NOT override the base
+#     image's ENTRYPOINT/CMD — CNPG drives the operand via its own instance manager,
+#     and `postgresql.parameters` in the Cluster spec is the only place server params
+#     belong.
+#
+# BUILD / PUBLISH
+# ---------------------------------------------------------------------------
+# Per infra ADR-0002, first-party images build on GitHub Actions and publish to ghcr.
+# Build for linux/amd64 (cluster arch), then set the `pg_cluster_image` Terraform
+# variable to the pushed tag per the runbook. Example (CI does this; shown for clarity):
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/infra/Dockerfile.pgvector \
+#     -t ghcr.io/viktorbarzin/cnpg-postgis-pgvector:16-pgvector0.8.0 --push deploy/infra
+# (Pin the pgvector version via the build-arg below so the tag is reproducible.)
+
+FROM ghcr.io/cloudnative-pg/postgis:16
+
+# Pin the pgvector minor so rebuilds are reproducible. 0.8.x ships the halfvec type,
+# the hnsw access method, and halfvec_cosine_ops — the exact surface migration 005
+# and recall.py depend on.
+ARG PGVECTOR_VERSION=0.8.0
+
+# Install the GENUINE pgvector extension from the PostgreSQL Debian repository the
+# PostGIS operand image already trusts. `postgresql-16-pgvector` is the Debian package
+# name for pgvector on PG16 (bookworm). NOTHING about pgvecto.rs/VectorChord is added.
+# Switch to root for apt, install, then drop back to the postgres uid the base runs as.
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "postgresql-16-pgvector=*${PGVECTOR_VERSION}*" \
+      || apt-get install -y --no-install-recommends postgresql-16-pgvector; \
+    rm -rf /var/lib/apt/lists/*; \
+    # Sanity-gate the build: the vector control file MUST be present, otherwise we
+    # have silently produced an image that cannot CREATE EXTENSION vector.
+    test -f "$(pg_config --sharedir)/extension/vector.control"
+
+# 26 == the postgres user in the CNPG operand images; matches the base image default.
+USER 26

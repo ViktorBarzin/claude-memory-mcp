@@ -25,13 +25,19 @@ recall and the SQLite-only degrade path stay byte-identical (ADR-0002).
 Two correctness invariants, both verified against this repo:
 
 * **pgvector-gated.** ``env.py`` may run this migration against a cluster where
-  pgvector has not yet been enabled (the Terraform operand-image swap lands
-  separately and is staged-only this run). The embedding column + HNSW index
-  steps are therefore **gated on the ``vector`` extension being present**: if it
-  is absent they no-op, so the migration is safe to run *before* infra enables
-  pgvector. The graph tables carry no vector column on ``concept_edges`` /
-  ``memory_concepts`` and are created unconditionally; ``concepts.embedding`` is
-  the one graph-table vector column and is likewise gated.
+  pgvector has not yet been enabled. The live shared CNPG cluster runs the
+  ``ghcr.io/cloudnative-pg/postgis:16`` operand image, which bundles PostGIS but
+  NOT pgvector, so ``vector`` is unavailable there until the operand image is
+  swapped. That swap (Terraform + the build of a genuine-pgvector operand image,
+  explicitly NOT the pgvecto.rs/VectorChord ``vectors.so`` variant) is the staged
+  artifact in ``deploy/infra/`` and the ordered, reversible promotion sequence is
+  ``docs/runbooks/promote-pgvector-dense-recall.md`` — re-run this migration AFTER
+  that swap to pick up the vector objects. The embedding column + HNSW index steps
+  are **gated on the ``vector`` extension being present**: if it is absent they
+  no-op, so the migration is safe to run *before* infra enables pgvector. The
+  graph tables carry no vector column on ``concept_edges`` / ``memory_concepts``
+  and are created unconditionally; ``concepts.embedding`` is the one graph-table
+  vector column and is likewise gated.
 
 * **CONCURRENTLY needs autocommit.** ``migrations/env.py`` wraps every migration
   in ``context.begin_transaction()``. ``CREATE INDEX CONCURRENTLY`` is illegal
@@ -91,12 +97,13 @@ def _vector_extension_available(conn: sa.engine.Connection) -> bool:
     Checks ``pg_available_extensions`` — i.e. the extension's control files are
     installed on the server so ``CREATE EXTENSION vector`` will succeed. This is
     the gate that makes the migration **safe to run before infra enables
-    pgvector**: on a stock operand image (no pgvector bundled) the extension is
-    not available, so the embedding column + HNSW index steps no-op and only the
-    (vector-free) graph tables land. Once the Terraform operand-image swap (a
-    separate, staged-only change) ships a pgvector-bundled image, a re-run picks
-    up the column + index. ``pg_extension`` (already-created) is a subset of this
-    — both states return True, so the gate also covers a re-run after creation.
+    pgvector**: on the live ``postgis:16`` operand image (no pgvector bundled) the
+    extension is not available, so the embedding column + HNSW index steps no-op
+    and only the (vector-free) graph tables land. Once the Terraform operand-image
+    swap ships a genuine-pgvector image (staged in ``deploy/infra/``; promoted via
+    ``docs/runbooks/promote-pgvector-dense-recall.md``), a re-run picks up the
+    column + index. ``pg_extension`` (already-created) is a subset of this — both
+    states return True, so the gate also covers a re-run after creation.
     """
     result = conn.execute(
         sa.text("SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name = 'vector')")
