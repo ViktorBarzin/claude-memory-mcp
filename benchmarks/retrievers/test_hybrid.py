@@ -39,6 +39,7 @@ from harness.types import Memory, MemoryId
 from retrievers.graph_build import Concept, ConceptGraph, MemoryConcept, build_concept_graph
 from retrievers.graph_extract import Triple
 from retrievers.hybrid import (
+    _GRAPH_SEEDS,
     _RRF_K,
     HybridRetriever,
     _concepts_for,
@@ -537,6 +538,40 @@ def test_graph_rank_typed_one_hop_variant_behind_flag() -> None:
     assert 200 in ranked, "typed 1-hop must reach the shared-concept neighbour"
     assert 300 not in ranked
     assert 100 not in ranked, "1-hop returns NEIGHBOURS, not the seed itself"
+
+
+def test_ppr_transition_matrix_cache_matches_free_function() -> None:
+    """The per-retriever CACHED PPR transition matrix (built once in set_concept_graph)
+    must give a BYTE-IDENTICAL ranking to the un-cached free-function path on the same
+    seeds. The cache is a pure performance optimisation (the bipartite graph is fixed;
+    only the per-query restart vector changes) — production wants it on the hot path,
+    and the offline sweep needs it to not rebuild a 20k-node sparse matrix per query.
+    Equivalence is what makes the speed-up safe."""
+    g, _ = _typed_graph_two_memories_share_concept()
+    r = HybridRetriever()
+    r.set_concept_graph(g)
+    # the cached model is built by set_concept_graph
+    assert r._ppr_model is not None, "set_concept_graph must build the cached PPR model"
+
+    for seeds in ([100], [100, 300], [300], []):
+        cached = r._ppr_memory_ranking(seeds, k=10)
+        # recompute via the free function over the SAME bipartite edges + seed weights
+        seed_weights: dict[int, float] = {}
+        for rank, s in enumerate(seeds[:_GRAPH_SEEDS], start=1):
+            node = r._mem_to_node.get(s)
+            if node is not None:
+                seed_weights[node] = seed_weights.get(node, 0.0) + 1.0 / rank
+        if not seed_weights:
+            assert cached == []
+            continue
+        seed_nodes = set(seed_weights)
+        dist = _ppr_stationary(r._bipartite_edges, r._node_count, seed_weights)
+        expected = sorted(
+            ((dist[node], mid) for node, mid in r._node_to_mem.items()
+             if node not in seed_nodes and dist[node] > 0.0),
+            key=lambda pm: (-pm[0], pm[1]),
+        )
+        assert cached == [mid for _, mid in expected], f"cached PPR diverged for seeds={seeds}"
 
 
 def test_ppr_graph_leg_feeds_shared_fused_pool() -> None:

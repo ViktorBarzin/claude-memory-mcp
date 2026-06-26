@@ -319,3 +319,109 @@ def test_build_returns_a_concept_graph() -> None:
     g = build_concept_graph({1: [("Viktor", "prefers", "Svelte")]}, _stub_embedder(), threshold=_THRESHOLD)
     assert isinstance(g, ConceptGraph)
     assert hasattr(g, "concepts") and hasattr(g, "concept_edges") and hasattr(g, "memory_concepts")
+
+
+# ---------------------------------------------------------------------------
+# numpy fast path — MUST be byte-equivalent to the pure-Python single-linkage
+# ---------------------------------------------------------------------------
+#
+# The pure-Python canonicalizer is O(forms × clusters) cosines in interpreted
+# Python — wall-clock-prohibitive over the real 24k-form corpus (measured: ~72s
+# for 1000 forms, quadratic → hours for the full set). `build_concept_graph_fast`
+# vectorises the SAME greedy single-linkage with numpy (one form-vs-all-reps matmul
+# per form), so the full-corpus build is tractable WITHOUT sampling. It is only
+# ever invoked offline (numpy present); the model-free slow path stays the
+# ADR-0002 base. These tests pin the fast path to be IDENTICAL to the slow path —
+# same concept assignment, same first-seen canonical_name, same aliases, same
+# typed edges + evidence — INCLUDING the >=-threshold tie-break (a tie goes to the
+# LATER-seen cluster).
+
+def _embed_vocab(forms: list[str]) -> list[list[float]]:
+    """Embed via the same _VOCAB stub the other tests use (deterministic)."""
+    return CallCountingEmbedder()(forms)
+
+
+def _assert_graphs_equivalent(a: ConceptGraph, b: ConceptGraph) -> None:
+    # same surface-form → concept-id partition (ids may differ in label but the
+    # PARTITION and the canonical representative must be identical because both
+    # process forms in the same first-seen order).
+    assert a.stats() == b.stats()
+    # canonical_name + aliases per surface form must match exactly.
+    for surface in a._surface_to_concept:
+        ca = a.concepts[a.concept_of(surface)]  # type: ignore[index]
+        cb = b.concepts[b.concept_of(surface)]  # type: ignore[index]
+        assert ca.canonical_name == cb.canonical_name, surface
+        assert sorted(s.lower() for s in ca.aliases) == sorted(s.lower() for s in cb.aliases), surface
+    # typed edges (as canonical-name-keyed tuples) + evidence must match.
+    def _edge_key(g: ConceptGraph):  # type: ignore[no-untyped-def]
+        return sorted(
+            (
+                g.concepts[e.src_id].canonical_name,
+                g.concepts[e.dst_id].canonical_name,
+                e.relation,
+                e.weight,
+                tuple(e.evidence_memory_ids),
+            )
+            for e in g.concept_edges
+        )
+    assert _edge_key(a) == _edge_key(b)
+
+
+def test_fast_path_matches_slow_path_on_vocab_fixture() -> None:
+    """The numpy fast path produces an IDENTICAL graph to the pure-Python path on a
+    multi-cluster fixture with alias collapse on two independent axes."""
+    from retrievers.graph_build import build_concept_graph_fast
+
+    triples: dict[int, list[Triple]] = {
+        1: [("Viktor", "prefers", "Svelte"), ("Viktor", "uses", "Postgres")],
+        2: [("Viktor", "favors", "SvelteKit"), ("app", "depends-on", "PostgreSQL")],
+        3: [("team", "uses", "Svelte Kit"), ("service", "runs-on", "postgresql")],
+    }
+    slow = build_concept_graph(triples, _embed_vocab, threshold=_THRESHOLD)
+    fast = build_concept_graph_fast(triples, _embed_vocab, threshold=_THRESHOLD)
+    _assert_graphs_equivalent(slow, fast)
+
+
+def test_fast_path_matches_slow_path_with_tie_break() -> None:
+    """When a new form is EQUIDISTANT (cosine tie) from two existing clusters, BOTH
+    paths must break the tie identically — the pure-Python `>=` loop takes the
+    LATER-seen cluster, and the fast path must replicate that exact rule (NOT
+    numpy's first-argmax)."""
+    import math
+
+    from retrievers.graph_build import build_concept_graph_fast
+
+    # Two clusters founded first (axes A and B); then a probe form placed exactly
+    # on the 45° bisector is equally similar (cos = 1/√2) to both. With threshold
+    # below 1/√2 it must join — and BOTH paths must pick the LATER cluster.
+    inv = 1.0 / math.sqrt(2.0)
+    vocab = {
+        "alpha": _unit([1.0, 0.0]),       # cluster 0
+        "beta": _unit([0.0, 1.0]),        # cluster 1 (later-seen)
+        "probe": _unit([inv, inv]),       # tie: cos(alpha)=cos(beta)=1/√2
+    }
+
+    def embed(forms: list[str]) -> list[list[float]]:
+        return [list(vocab[f.lower()]) for f in forms]
+
+    triples: dict[int, list[Triple]] = {
+        1: [("alpha", "related-to", "beta")],
+        2: [("probe", "related-to", "alpha")],
+    }
+    thr = 0.5  # below 1/√2 ≈ 0.707 so probe merges into a cluster
+    slow = build_concept_graph(triples, embed, threshold=thr)
+    fast = build_concept_graph_fast(triples, embed, threshold=thr)
+    _assert_graphs_equivalent(slow, fast)
+    # and concretely: probe joined beta (the LATER cluster), not alpha.
+    assert slow.concept_of("probe") == slow.concept_of("beta")
+    assert fast.concept_of("probe") == fast.concept_of("beta")
+
+
+def test_fast_path_empty_triples() -> None:
+    """The fast path degrades to an empty graph on empty input, like the slow path."""
+    from retrievers.graph_build import build_concept_graph_fast
+
+    g = build_concept_graph_fast({}, _embed_vocab, threshold=_THRESHOLD)
+    assert g.concepts == {}
+    assert g.concept_edges == []
+    assert g.stats()["edges"] == 0

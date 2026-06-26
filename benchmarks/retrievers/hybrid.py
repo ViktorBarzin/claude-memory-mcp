@@ -308,6 +308,83 @@ def _ppr_stationary(
     return [float(v) for v in x]
 
 
+class _PprModel:
+    """Pre-built PPR transition matrix for a FIXED bipartite graph, reusable across
+    queries. Splits the cost of :func:`_ppr_stationary` into the once-per-graph build
+    (``D⁻¹A`` + the dangling mask) and the per-query power iteration over a varying
+    restart vector. ``run(seed_weights)`` is mathematically IDENTICAL to
+    ``_ppr_stationary(edges, n, seed_weights)`` (same iteration, same alpha/tol/iters);
+    only the matrix build is amortised. Equivalence is pinned by a unit test."""
+
+    def __init__(
+        self,
+        edges: Sequence[tuple[int, int]],
+        n_nodes: int,
+        *,
+        alpha: float = _PPR_ALPHA,
+        tol: float = _PPR_TOL,
+        max_iter: int = _PPR_MAX_ITER,
+    ) -> None:
+        import numpy as np
+        import scipy.sparse as sp
+
+        self._np = np
+        self.n_nodes = n_nodes
+        self.alpha = alpha
+        self.tol = tol
+        self.max_iter = max_iter
+        if n_nodes <= 0:
+            self._p_transition = None
+            self._dangling = None
+            return
+        if edges:
+            rows: list[int] = []
+            cols: list[int] = []
+            for u, v in edges:
+                rows.append(u)
+                cols.append(v)
+                rows.append(v)
+                cols.append(u)
+            adj = sp.csr_matrix(
+                (np.ones(len(rows), dtype=np.float64), (rows, cols)),
+                shape=(n_nodes, n_nodes),
+            )
+            adj.sum_duplicates()
+        else:
+            adj = sp.csr_matrix((n_nodes, n_nodes), dtype=np.float64)
+        deg = np.asarray(adj.sum(axis=1)).ravel()
+        self._dangling = deg == 0.0
+        deg_safe = deg.copy()
+        deg_safe[self._dangling] = 1.0
+        self._p_transition = (sp.diags(1.0 / deg_safe) @ adj).T.tocsr()
+
+    def run(self, seed_weights: Mapping[int, float]) -> list[float]:
+        """Stationary PPR distribution for ``seed_weights`` over the cached matrix.
+        Empty/zero seeds → all-zero (the graph leg contributes nothing without seeds),
+        matching :func:`_ppr_stationary`."""
+        np = self._np
+        n = self.n_nodes
+        if n <= 0 or not seed_weights or self._p_transition is None:
+            return [0.0] * max(n, 0)
+        pers = np.zeros(n, dtype=np.float64)
+        for node, w in seed_weights.items():
+            if 0 <= node < n and w > 0.0:
+                pers[node] += float(w)
+        total = pers.sum()
+        if total <= 0.0:
+            return [0.0] * n
+        pers /= total
+        x = pers.copy()
+        for _ in range(self.max_iter):
+            dangling_mass = float(x[self._dangling].sum())
+            x_new = self.alpha * (self._p_transition @ x + dangling_mass * pers) + (1.0 - self.alpha) * pers
+            if float(np.abs(x_new - x).sum()) < self.tol:
+                x = x_new
+                break
+            x = x_new
+        return [float(v) for v in x]
+
+
 class HybridRetriever:
     """Lexical FTS + dense (bge-large-en-v1.5 / hosted) + concept-graph expansion,
     fused with RRF. Degrades to FTS(+graph) if embeddings are unavailable."""
@@ -369,6 +446,13 @@ class HybridRetriever:
         self._node_to_mem: dict[int, MemoryId] = {}  # inverse, for reading PPR results
         self._bipartite_edges: list[tuple[int, int]] = []  # undirected memory↔concept
         self._typed_edge_count = 0  # |concept_edges| in the typed graph, for reporting
+        # Cached PPR transition matrix (built ONCE in set_concept_graph). The bipartite
+        # graph is fixed; only the per-query restart vector changes — so the expensive
+        # D⁻¹A build is amortised across every query/weight instead of rebuilt per call
+        # (the hot-path cost the _ppr_stationary docstring flags; offline the un-cached
+        # rebuild over a 20k-node graph dominated the sweep wall-clock). Equivalence to
+        # the free function is pinned by test_ppr_transition_matrix_cache_matches_*.
+        self._ppr_model: _PprModel | None = None
 
         self._corpus_size = 0
 
@@ -636,6 +720,15 @@ class HybridRetriever:
 
         self._bipartite_edges = edges
 
+        # Build the PPR transition matrix ONCE for this fixed bipartite graph so every
+        # query's PPR is just the power iteration (the D⁻¹A build is the expensive part).
+        # Best-effort: if scipy/numpy are unavailable the leg falls back to the per-call
+        # free function in _ppr_memory_ranking.
+        try:
+            self._ppr_model = _PprModel(self._bipartite_edges, self._node_count)
+        except Exception:  # pragma: no cover - defensive (numpy/scipy missing)
+            self._ppr_model = None
+
     def _ppr_memory_ranking(self, seeds: list[MemoryId], k: int) -> list[MemoryId]:
         """PPR graph leg: seed the restart vector from the fused-seed MEMORY nodes, run
         PPR over the bipartite graph, then rank the NON-SEED memory nodes by stationary
@@ -670,7 +763,12 @@ class HybridRetriever:
             return []  # none of the seeds is a memory node in the typed graph
 
         seed_nodes = set(seed_weights)
-        dist = _ppr_stationary(self._bipartite_edges, self._node_count, seed_weights)
+        # Use the cached transition matrix when available (built in set_concept_graph);
+        # fall back to the per-call free function otherwise. Both compute the SAME dist.
+        if self._ppr_model is not None:
+            dist = self._ppr_model.run(seed_weights)
+        else:
+            dist = _ppr_stationary(self._bipartite_edges, self._node_count, seed_weights)
         # rank NON-SEED memory nodes (drop seed + concept nodes) by stationary mass,
         # mass > 0 only — so a bridged graph-only memory is at graph-rank ~1.
         scored: list[tuple[float, MemoryId]] = []

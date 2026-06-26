@@ -382,9 +382,205 @@ class _EntityCanonicalizer:
         return self._concepts, self._surface_to_concept
 
 
+class _VectorisedCanonicalizer:
+    """numpy-backed equivalent of :class:`_EntityCanonicalizer`.
+
+    Same greedy single-linkage by cosine-NN + threshold, but each new form's cosine
+    against ALL existing cluster representatives is a single ``R @ v`` matmul instead
+    of an interpreted per-cluster Python loop. The clustering DECISION is byte-
+    identical to the pure-Python path, INCLUDING the ``>=`` tie-break (a cosine tie
+    goes to the LATER-seen cluster): we select the LAST representative index whose
+    cosine is the maximum among those ``>= threshold`` (numpy's ``argmax`` returns
+    the FIRST, so we reverse-scan the max-mask).
+
+    Only used by :func:`build_concept_graph_fast` (offline; numpy guaranteed). The
+    pure-Python class above stays the ADR-0002 base — this module still imports with
+    no required third-party dep; numpy is imported lazily inside ``assign_all``.
+    """
+
+    def __init__(self, threshold: float) -> None:
+        self.threshold = threshold
+        self._concepts: dict[ConceptId, Concept] = {}
+        self._surface_to_concept: dict[str, ConceptId] = {}
+
+    def assign_all(self, forms: list[str], vectors: list[list[float]]) -> None:
+        """Canonicalise ``forms`` (in the given order) using ``vectors``.
+
+        The representative matrix is held in a PRE-ALLOCATED, geometrically-growing
+        ``(capacity, dim)`` buffer; ``rep[:n_clusters]`` is the live contiguous view a
+        new form's cosine matmul runs against. A founded cluster appends in amortised
+        O(1) (double the buffer when full) — NOT an ``np.stack`` of a Python list on
+        every growth, which was O(clusters²·dim) in copying and dominated the wall-clock
+        on the ~24k-form corpus. The clustering DECISION is unchanged."""
+        import numpy as np
+
+        # Stack all (already-embedded) vectors once and L2-normalise the whole batch —
+        # one vectorised pass instead of a per-form sqrt/divide in Python.
+        all_vecs = np.asarray(vectors, dtype=np.float64)
+        if all_vecs.ndim != 2:
+            all_vecs = all_vecs.reshape(len(forms), -1)
+        norms = np.sqrt((all_vecs * all_vecs).sum(axis=1, keepdims=True))
+        norms[norms == 0.0] = 1.0
+        all_vecs = all_vecs / norms
+        dim = all_vecs.shape[1] if all_vecs.shape[0] else 0
+
+        capacity = 0
+        rep = np.empty((0, dim), dtype=np.float64)  # pre-allocated buffer
+        n_clusters = 0
+        next_id = 0
+        thr = self.threshold
+        for i, form in enumerate(forms):
+            key = form.strip().lower()
+            if key in self._surface_to_concept:
+                continue  # idempotent per surface form (matches the slow path)
+            v = all_vecs[i]
+
+            best_id: ConceptId | None = None
+            if n_clusters:
+                sims = rep[:n_clusters] @ v  # (n_clusters,) cosines (both L2-normalised)
+                # candidates meeting/exceeding threshold; pick the LAST index of the
+                # max among them (replicates the slow path's `>=` later-cluster tie).
+                mask = sims >= thr
+                if bool(mask.any()):
+                    masked = np.where(mask, sims, -np.inf)
+                    mx = float(masked.max())
+                    # last index equal to the max (within fp tolerance of the slow
+                    # path's exact `>=` — both compute the same float dot products).
+                    idxs = np.nonzero(masked >= mx)[0]
+                    best_id = int(idxs[-1])
+
+            if best_id is None:
+                cid = next_id
+                next_id += 1
+                self._concepts[cid] = Concept(
+                    id=cid,
+                    canonical_name=form,
+                    aliases=[form],
+                    embedding=[float(x) for x in v],
+                )
+                self._surface_to_concept[key] = cid
+                # append the representative, growing the buffer geometrically.
+                if n_clusters >= capacity:
+                    capacity = max(16, capacity * 2)
+                    grown = np.empty((capacity, dim), dtype=np.float64)
+                    grown[:n_clusters] = rep[:n_clusters]
+                    rep = grown
+                rep[n_clusters] = v
+                n_clusters += 1
+            else:
+                concept = self._concepts[best_id]
+                if form not in concept.aliases:
+                    concept.aliases.append(form)
+                self._surface_to_concept[key] = best_id
+
+    def result(self) -> tuple[dict[ConceptId, Concept], dict[str, ConceptId]]:
+        return self._concepts, self._surface_to_concept
+
+
 # ---------------------------------------------------------------------------
 # the build
 # ---------------------------------------------------------------------------
+
+
+def _distinct_forms(triples_by_memory: Mapping[int, list[Triple]]) -> list[str]:
+    """Every DISTINCT subject/object surface form across all triples, in first-seen
+    order (deterministic canonical representatives). Shared by both build paths."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for triples in triples_by_memory.values():
+        for subj, _rel, obj in triples:
+            for form in (subj, obj):
+                key = form.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    ordered.append(form)
+    return ordered
+
+
+def _assemble_graph(
+    triples_by_memory: Mapping[int, list[Triple]],
+    concepts: dict[ConceptId, Concept],
+    surface_to_concept: dict[str, ConceptId],
+) -> ConceptGraph:
+    """Build the typed :class:`ConceptGraph` from a finished entity canonicalisation
+    (concept nodes + surface→concept map). This is the second half of the build —
+    relation canonicalisation, edge merge + evidence, mention-links, concept→memory
+    index — shared verbatim by the pure-Python and numpy fast paths so they cannot
+    drift in anything but the clustering primitive."""
+    graph = ConceptGraph()
+    graph.concepts = concepts
+    graph._surface_to_concept = surface_to_concept
+
+    edge_index: dict[tuple[ConceptId, ConceptId, str], ConceptEdge] = {}
+    edge_evidence: dict[tuple[ConceptId, ConceptId, str], set[int]] = {}
+    seen_mentions: set[tuple[int, ConceptId, str]] = set()
+    concept_to_mems: dict[ConceptId, set[int]] = {}
+
+    for memory_id, triples in triples_by_memory.items():
+        for subj, rel, obj in triples:
+            subj_key = subj.strip().lower()
+            obj_key = obj.strip().lower()
+            if not subj_key or not obj_key:
+                continue
+            src = surface_to_concept[subj_key]
+            dst = surface_to_concept[obj_key]
+            relation = canonicalize_relation(rel)
+
+            for cid in (src, dst):
+                mk = (memory_id, cid, relation)
+                if mk not in seen_mentions:
+                    seen_mentions.add(mk)
+                    graph.memory_concepts.append(
+                        MemoryConcept(memory_id=memory_id, concept_id=cid, relation=relation)
+                    )
+                concept_to_mems.setdefault(cid, set()).add(memory_id)
+
+            if src == dst:
+                continue  # no self-loops
+
+            ek = (src, dst, relation)
+            edge = edge_index.get(ek)
+            if edge is None:
+                edge = ConceptEdge(src_id=src, dst_id=dst, relation=relation, weight=0)
+                edge_index[ek] = edge
+                edge_evidence[ek] = set()
+                graph.concept_edges.append(edge)
+            edge.weight += 1
+            edge_evidence[ek].add(memory_id)
+
+    for ek, edge in edge_index.items():
+        edge.evidence_memory_ids = sorted(edge_evidence[ek])
+    graph._concept_to_memories = {
+        cid: sorted(mems) for cid, mems in concept_to_mems.items()
+    }
+    return graph
+
+
+def build_concept_graph_fast(
+    triples_by_memory: Mapping[int, list[Triple]],
+    embed_fn: EmbedFn,
+    *,
+    threshold: float = _DEFAULT_THRESHOLD,
+) -> ConceptGraph:
+    """numpy-vectorised :func:`build_concept_graph` — IDENTICAL output, tractable on
+    the full 24k-form corpus. Uses :class:`_VectorisedCanonicalizer` (one matmul per
+    form) instead of the interpreted per-cluster loop, then the SHARED
+    :func:`_assemble_graph`. Offline-only (numpy guaranteed); the pure-Python path
+    remains the ADR-0002 base for model-free CI."""
+    if not triples_by_memory:
+        return ConceptGraph()
+    ordered_forms = _distinct_forms(triples_by_memory)
+    if not ordered_forms:
+        return ConceptGraph()
+    vectors = embed_fn(ordered_forms)
+    if len(vectors) != len(ordered_forms):
+        raise ValueError(
+            f"embedder returned {len(vectors)} vectors for {len(ordered_forms)} surface forms"
+        )
+    canon = _VectorisedCanonicalizer(threshold)
+    canon.assign_all(ordered_forms, [list(v) for v in vectors])
+    concepts, surface_to_concept = canon.result()
+    return _assemble_graph(triples_by_memory, concepts, surface_to_concept)
 
 
 def build_concept_graph(
@@ -408,24 +604,14 @@ def build_concept_graph(
         ``concept_edges`` carrying ``evidence_memory_ids``, ``memory_concepts``
         mention-links, and the concept↔memory index PPR (S4) seeds from.
     """
-    graph = ConceptGraph()
     if not triples_by_memory:
-        return graph
+        return ConceptGraph()
 
     # 1) collect every DISTINCT surface form (subject ∪ object) across all triples,
     #    preserving first-seen order for deterministic canonical representatives.
-    seen: set[str] = set()
-    ordered_forms: list[str] = []
-    for triples in triples_by_memory.values():
-        for subj, _rel, obj in triples:
-            for form in (subj, obj):
-                key = form.strip().lower()
-                if key and key not in seen:
-                    seen.add(key)
-                    ordered_forms.append(form)
-
+    ordered_forms = _distinct_forms(triples_by_memory)
     if not ordered_forms:
-        return graph
+        return ConceptGraph()
 
     # 2) embed each distinct form ONCE (de-duplicated above), then canonicalise by
     #    cosine-NN + threshold. The embedder is called as a single batch so the
@@ -439,59 +625,7 @@ def build_concept_graph(
     for form, vec in zip(ordered_forms, vectors):
         canon.assign(form, list(vec))
     concepts, surface_to_concept = canon.result()
-    graph.concepts = concepts
-    graph._surface_to_concept = surface_to_concept
 
-    # 3) walk the triples again, canonicalising relations + projecting endpoints to
-    #    their concept ids; merge edges by (src, dst, relation); accumulate evidence;
-    #    record mention-links and the concept→memory index.
-    edge_index: dict[tuple[ConceptId, ConceptId, str], ConceptEdge] = {}
-    edge_evidence: dict[tuple[ConceptId, ConceptId, str], set[int]] = {}
-    # de-dupe mention-links per (memory, concept, relation) so a repeated surface
-    # form in one memory doesn't emit duplicate rows.
-    seen_mentions: set[tuple[int, ConceptId, str]] = set()
-    concept_to_mems: dict[ConceptId, set[int]] = {}
-
-    for memory_id, triples in triples_by_memory.items():
-        for subj, rel, obj in triples:
-            subj_key = subj.strip().lower()
-            obj_key = obj.strip().lower()
-            if not subj_key or not obj_key:
-                continue
-            src = surface_to_concept[subj_key]
-            dst = surface_to_concept[obj_key]
-            relation = canonicalize_relation(rel)
-
-            # mention-links (subject plays the relation as actor; object as target).
-            for cid in (src, dst):
-                mk = (memory_id, cid, relation)
-                if mk not in seen_mentions:
-                    seen_mentions.add(mk)
-                    graph.memory_concepts.append(
-                        MemoryConcept(memory_id=memory_id, concept_id=cid, relation=relation)
-                    )
-                concept_to_mems.setdefault(cid, set()).add(memory_id)
-
-            # NO self-loops: subject and object that canonicalise to the same node
-            # carry no traversal value and would inflate the edge count.
-            if src == dst:
-                continue
-
-            ek = (src, dst, relation)
-            edge = edge_index.get(ek)
-            if edge is None:
-                edge = ConceptEdge(src_id=src, dst_id=dst, relation=relation, weight=0)
-                edge_index[ek] = edge
-                edge_evidence[ek] = set()
-                graph.concept_edges.append(edge)
-            edge.weight += 1
-            edge_evidence[ek].add(memory_id)
-
-    # finalise evidence id lists (sorted, de-duplicated) and the concept→memory index.
-    for ek, edge in edge_index.items():
-        edge.evidence_memory_ids = sorted(edge_evidence[ek])
-    graph._concept_to_memories = {
-        cid: sorted(mems) for cid, mems in concept_to_mems.items()
-    }
-
-    return graph
+    # 3) assemble the typed graph (relations, merged edges + evidence, mention-links,
+    #    concept→memory index) — SHARED verbatim with build_concept_graph_fast.
+    return _assemble_graph(triples_by_memory, concepts, surface_to_concept)

@@ -144,7 +144,7 @@ def _build_equipped_retriever(ds: Dataset, *, extract: bool, graph_sample: int |
     ``graph_sample`` caps the GRAPH build to that many memories (qrel targets always
     included) to keep the canonicalizer tractable; the FTS + dense legs always see
     the full corpus."""
-    from retrievers.graph_build import build_concept_graph
+    from retrievers.graph_build import build_concept_graph_fast
     from retrievers.graph_extract import default_haiku_extractor, extract_triples
     from retrievers.hybrid import HybridRetriever, _corpus_fingerprint
 
@@ -176,14 +176,37 @@ def _build_equipped_retriever(ds: Dataset, *, extract: bool, graph_sample: int |
               f"{n_triples} triples, loaded in {time.perf_counter() - t0:.1f}s "
               f"(cache: {triples_path.name})")
         # Build the typed graph with the SAME bge-large encoder the dense leg uses,
-        # so concept surface forms canonicalise under the fixed model. Adapt the
-        # retriever's numpy-returning batch embedder to EmbedFn's list[list[float]].
+        # so concept surface forms canonicalise under the fixed model. The ~24k
+        # distinct surface forms are NOT in the cached corpus matrix (that holds the
+        # 5452 memory CONTENTS), so they must be embedded with the bge model — a
+        # one-time ~minutes cost we CACHE to a gitignored .npy keyed by the ordered-
+        # form hash, so a rerun of the matrix re-embeds NOTHING. Adapts the
+        # retriever's numpy batch embedder to EmbedFn's list[list[float]].
+        import hashlib as _hashlib
+
+        import numpy as _np
+
         def _embed_forms(texts: list[str]) -> list[list[float]]:
-            mat = r._embed_local(texts)  # type: ignore[attr-defined]
+            key = _hashlib.sha256(
+                "\x00".join(texts).encode("utf-8", "replace")
+            ).hexdigest()[:16]
+            forms_cache = (
+                Path(__file__).resolve().parents[1] / "cache" / f"forms_{fp}_{key}.npy"
+            )
+            if forms_cache.exists():
+                mat = _np.load(forms_cache)
+            else:
+                mat = _np.asarray(r._embed_local(texts))  # type: ignore[attr-defined]
+                _np.save(forms_cache, mat)
             return [list(map(float, row)) for row in mat]
 
         t0 = time.perf_counter()
-        cgraph = build_concept_graph(triples_for_build, _embed_forms)
+        # numpy-vectorised build: the pure-Python single-linkage is O(forms×clusters)
+        # interpreted cosines (~72s/1000 forms measured → hours on the full ~24k-form
+        # vocabulary), wall-clock-prohibitive offline. build_concept_graph_fast is
+        # byte-equivalent (pinned by test_graph_build) but matmul-vectorised, so the
+        # FULL corpus builds without the sampling fallback.
+        cgraph = build_concept_graph_fast(triples_for_build, _embed_forms)
         r.set_concept_graph(cgraph)
         stats = r.graph_stats()
         print(f"[matrix] built typed concept graph in {time.perf_counter() - t0:.1f}s: "
