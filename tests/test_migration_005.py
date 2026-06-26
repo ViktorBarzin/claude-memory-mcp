@@ -44,6 +44,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -207,8 +208,12 @@ def _alembic_to(revision: str, db_url: str) -> None:
     else:
         op_call = f"command.upgrade(cfg, {revision!r})"
     code = "from alembic.config import Config; from alembic import command; cfg = Config('alembic.ini'); " + op_call
+    # sys.executable (NOT a bare "python"): the subprocess must use the SAME
+    # interpreter running pytest so it sees alembic from this venv. A bare "python"
+    # resolves to whatever is first on PATH (system python, no alembic) when pytest
+    # is invoked as ".venv/bin/python -m pytest" rather than via "uv run".
     proc = subprocess.run(
-        ["python", "-c", code],
+        [sys.executable, "-c", code],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
