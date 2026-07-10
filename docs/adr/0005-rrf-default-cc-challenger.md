@@ -1,5 +1,13 @@
 # Weighted RRF as the fusion default; convex combination as a benchmark challenger
 
+> **Amendment (2026-07-09, storage-model grilling):** the API's *default* `sort_by` flips
+> from `importance` to `relevance`. Importance keeps exactly the role this ADR gives it — a
+> post-fusion prior multiplier — and stops being the default rank axis; `sort_by=importance`
+> stays available explicitly. Rationale: a month-long session audit measured importance-sorted
+> recall as the largest rediscovery driver (55% of entries at ≥0.8 make the axis
+> non-discriminating), and a correct default protects every caller that forgets a flag — the
+> failure mode actually observed. See [ADR-0007](0007-bounded-self-contained-memories-with-typed-links.md).
+
 The hybrid read path must fuse three retrieval signals on **incomparable scales** — unbounded
 `ts_rank` (BM25), bounded cosine, and (phase 2) an arbitrary graph-proximity score — where the graph
 list is **sparse and often empty**. We adopt **weighted Reciprocal Rank Fusion** as the default
