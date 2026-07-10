@@ -34,6 +34,8 @@ import logging
 import os
 from typing import Any, Optional
 
+import asyncpg  # type: ignore[import-untyped]
+
 from claude_memory.embeddings import Embedder, select_embedder
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,19 @@ SUPERSEDES_DEPTH_CAP = 10
 #: BEYOND the caller's limit, so an unbounded fan-out would flood the 5-slot
 #: hook injection — the truncation problem ADR-0007 exists to fix.
 MAX_RESOLVED_BY_ATTACHMENTS = 3
+
+
+#: tsquery metacharacters stripped from OR-broadening tokens. The OR query goes
+#: through ``to_tsquery`` (NOT ``plainto_tsquery``), which parses these as
+#: operators — a raw user token like ``foo(bar`` used to 500 the whole recall
+#: with a PostgresSyntaxError.
+_TSQUERY_STRIP_TABLE = str.maketrans("", "", "&|!():*'\"<>[]{}")
+
+
+def _sanitize_tsquery_tokens(words: list[str]) -> list[str]:
+    """Strip tsquery metacharacters from each token and drop empties."""
+    cleaned = (w.translate(_TSQUERY_STRIP_TABLE) for w in words)
+    return [w for w in cleaned if w]
 
 
 def _flag_on(env_name: str) -> bool:
@@ -151,33 +166,46 @@ async def _lexical_recall(
 
     all_rows = list(rows)
 
-    # If AND-match returned too few results, broaden to OR-match.
+    # If AND-match returned too few results, broaden to OR-match. Unlike the
+    # AND-match's plainto_tsquery, this goes through to_tsquery, which PARSES
+    # its input — so tokens are sanitized of tsquery metacharacters first, and
+    # a residual syntax error degrades to the AND rows already in hand (recall
+    # runs on every prompt; a weird query string must never 500 it).
     if len(all_rows) < limit and query_text:
         words = query_text.split()
-        if len(words) > 1:
-            or_tsquery = " | ".join(w for w in words if w)
+        tokens = _sanitize_tsquery_tokens(words)
+        if len(words) > 1 and tokens:
+            or_tsquery = " | ".join(tokens)
             or_params: list[Any] = [user_id, or_tsquery, limit]
             or_cat_filter = ""
             if category:
                 or_cat_filter = "AND category = $4"
                 or_params.append(category)
             seen_ids = {r["id"] for r in all_rows}
-            or_rows = await conn.fetch(
-                f"""
-                SELECT id, content, category, tags, importance, is_sensitive,
-                       ts_rank(search_vector, query) AS rank,
-                       created_at, updated_at, user_id AS owner,
-                       CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-                FROM memories, to_tsquery('english', $2) query
-                WHERE deleted_at IS NULL
-                  AND search_vector @@ query
-                  AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
-                  {or_cat_filter}
-                ORDER BY ts_rank(search_vector, query) DESC
-                LIMIT $3
-                """,
-                *or_params,
-            )
+            try:
+                or_rows = await conn.fetch(
+                    f"""
+                    SELECT id, content, category, tags, importance, is_sensitive,
+                           ts_rank(search_vector, query) AS rank,
+                           created_at, updated_at, user_id AS owner,
+                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
+                    FROM memories, to_tsquery('english', $2) query
+                    WHERE deleted_at IS NULL
+                      AND search_vector @@ query
+                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
+                      {or_cat_filter}
+                    ORDER BY ts_rank(search_vector, query) DESC
+                    LIMIT $3
+                    """,
+                    *or_params,
+                )
+            except asyncpg.PostgresSyntaxError as exc:
+                logger.warning(
+                    "OR-broadening tsquery %r rejected by to_tsquery, keeping AND results: %s",
+                    or_tsquery,
+                    exc,
+                )
+                or_rows = []
             all_rows = all_rows + [r for r in or_rows if r["id"] not in seen_ids]
             all_rows = all_rows[:limit]
 

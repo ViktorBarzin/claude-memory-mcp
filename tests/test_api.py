@@ -963,6 +963,115 @@ async def test_recall_sort_by_importance_stays_available(client):
     assert "ts_rank(search_vector, query) * 0.4 + importance * 0.6" in sql
 
 
+# ─── tsquery metacharacters must never 500 the lexical leg ───────────────────
+#
+# The OR-broadening fallback used to feed raw query words into to_tsquery();
+# tokens with tsquery metacharacters ("foo(bar", "a & b") produced a
+# PostgresSyntaxError → 500 on a plain recall. Tokens are now sanitized before
+# the OR query is built, and a residual syntax error degrades to the AND rows.
+
+
+@pytest.mark.asyncio
+async def test_recall_tsquery_operator_tokens_are_sanitized(client):
+    """'a & b | c!' must not 500: operator tokens drop, 'c!' strips to 'c'."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [],  # AND-match: sparse → OR-broadening fires (multi-word)
+        [],  # OR-broadening (sanitized)
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "a & b | c!"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    or_args = conn.fetch.call_args_list[1].args
+    assert or_args[2] == "a | b | c"
+
+
+@pytest.mark.asyncio
+async def test_recall_tsquery_paren_token_is_sanitized(client):
+    """'foo(bar baz' must not 500: parens are stripped from the OR tokens."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [],
+        [],
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "foo(bar baz"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    or_args = conn.fetch.call_args_list[1].args
+    assert or_args[2] == "foobar | baz"
+
+
+@pytest.mark.asyncio
+async def test_recall_single_word_with_metachars_is_200(client):
+    """'foo(bar' is one word → no OR-broadening; plainto_tsquery handles it."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [[]]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "foo(bar"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    assert conn.fetch.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recall_all_operator_query_skips_or_broadening(client):
+    """A query that sanitizes to nothing ('& | !') skips the OR query entirely."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [[]]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "& | !"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    assert conn.fetch.call_count == 1, "no OR query when every token sanitizes away"
+
+
+@pytest.mark.asyncio
+async def test_recall_or_syntax_error_falls_back_to_and_rows(client):
+    """A residual PostgresSyntaxError in the OR query degrades to the AND rows."""
+    import asyncpg
+
+    ac, conn, app_mod = client
+    and_row = _make_memory_row(id=1, content="and match")
+    conn.fetch.side_effect = [
+        [and_row],  # AND-match succeeds
+        asyncpg.PostgresSyntaxError("syntax error in tsquery"),  # OR query dies
+        [],  # memory_links batch for the surviving AND rows
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "two words"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    memories = resp.json()["memories"]
+    assert [m["id"] for m in memories] == [1]
+
+
 # ─── Shared fused-recall helper (S8) ─────────────────────────────────────────
 #
 # api/recall._fused_recall is the ONE retrieval helper both recall entry points
