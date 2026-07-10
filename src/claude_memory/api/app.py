@@ -24,7 +24,7 @@ from claude_memory.api.database import close_pool, get_pool, init_pool
 from claude_memory.api.models import (
     LINK_TYPES, LinkCreate, MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
-    canonicalize_category,
+    canonicalize_category, validate_content_bound,
 )
 from claude_memory.api.permissions import check_memory_permission
 from claude_memory.api.recall import (
@@ -969,74 +969,43 @@ def _resolve_user_from_token(token: str) -> str | None:
 mcp_server = FastMCP("claude-memory")
 
 
-MAX_MEMORY_CHARS = 500
-
-
-def _split_content(text: str, max_chars: int = MAX_MEMORY_CHARS) -> list[str]:
-    """Split text into chunks on paragraph boundaries, each <= max_chars."""
-    if len(text) <= max_chars:
-        return [text]
-    paragraphs = text.split("\n\n")
-    chunks: list[str] = []
-    current = ""
-    for para in paragraphs:
-        candidate = f"{current}\n\n{para}".strip() if current else para
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            # If a single paragraph exceeds max_chars, hard-split it
-            while len(para) > max_chars:
-                chunks.append(para[:max_chars])
-                para = para[max_chars:]
-            current = para
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 @mcp_server.tool()
 async def memory_store(content: str, category: str = "facts", tags: str = "",
                        expanded_keywords: str = "", importance: float = 0.5) -> str:
-    """Store a new memory. Content over 500 chars is auto-split into multiple memories."""
-    # Same category canonicalization as the REST store path (ADR-0007); this
-    # entry point's error convention is a JSON error, not an HTTP 422.
+    """Store a new memory. Content over 1,400 chars is rejected (ADR-0007): split it into
+    a self-contained hub Memory plus part-of linked detail Memories."""
+    # Same category canonicalization + content bound as the REST store path (ADR-0007);
+    # this entry point's error convention is a JSON error, not an HTTP 422. The old
+    # 500-char _split_content auto-chopper is retired — mechanical chopping is what
+    # produced the part-N-of-M fragment pollution; splitting is a writing act.
     try:
         category = canonicalize_category(category)
+        validate_content_bound(content)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
     pool = await get_pool()
     user_id = _current_user.get()
-    chunks = _split_content(content)
 
-    created_ids = []
+    is_sensitive = _detect_sensitive(content)
+    stored = content if not is_sensitive else _redact_content(content)
     async with pool.acquire() as conn:
-        for i, chunk in enumerate(chunks):
-            is_sensitive = _detect_sensitive(chunk)
-            stored = chunk if not is_sensitive else _redact_content(chunk)
-            chunk_tags = f"{tags},part-{i + 1}-of-{len(chunks)}" if len(chunks) > 1 else tags
+        row = await conn.fetchrow(
+            """INSERT INTO memories (user_id, content, category, tags, expanded_keywords, importance, is_sensitive)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING id""",
+            user_id, stored, category, tags, expanded_keywords, importance, is_sensitive,
+        )
+        memory_id = row["id"]
 
-            row = await conn.fetchrow(
-                """INSERT INTO memories (user_id, content, category, tags, expanded_keywords, importance, is_sensitive)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)
-                   RETURNING id""",
-                user_id, stored, category, chunk_tags, expanded_keywords, importance, is_sensitive,
-            )
-            memory_id = row["id"]
-            created_ids.append(memory_id)
+        if is_sensitive and is_vault_configured():
+            vault_path = await store_secret(user_id, memory_id, content)
+            await conn.execute("UPDATE memories SET vault_path = $1 WHERE id = $2", vault_path, memory_id)
 
-            if is_sensitive and is_vault_configured():
-                vault_path = await store_secret(user_id, memory_id, chunk)
-                await conn.execute("UPDATE memories SET vault_path = $1 WHERE id = $2", vault_path, memory_id)
+        # Embed-on-write OFF the hot path (same shared helper as the REST store path):
+        # non-sensitive content only, flag-gated; does not block the store response.
+        schedule_embedding(pool, memory_id, content, is_sensitive=is_sensitive)
 
-            # Embed-on-write OFF the hot path (same shared helper as the REST store path):
-            # non-sensitive chunks only, flag-gated; does not block the store response.
-            schedule_embedding(pool, memory_id, chunk, is_sensitive=is_sensitive)
-
-    if len(created_ids) == 1:
-        return json.dumps({"id": created_ids[0], "category": category, "importance": importance})
-    return json.dumps({"ids": created_ids, "parts": len(created_ids), "category": category, "importance": importance})
+    return json.dumps({"id": memory_id, "category": category, "importance": importance})
 
 
 @mcp_server.tool()
@@ -1052,7 +1021,9 @@ async def memory_recall(context: str, expanded_query: str = "",
 
     # SAME shared retrieval helper as the REST recall_memories endpoint — the two paths
     # cannot drift. Flags off ⇒ verbatim current lexical SQL (no-op); embeddings flag adds
-    # the dense leg to a shared weighted-RRF pool (api/recall.py).
+    # the dense leg to a shared weighted-RRF pool (api/recall.py). Link semantics apply
+    # here exactly as on REST (ADR-0007): supersedes-redirect, resolved-by attach,
+    # links summary — the two recall surfaces must not differ in what truth they serve.
     async with pool.acquire() as conn:
         all_rows = await _fused_recall(
             conn,
@@ -1063,9 +1034,11 @@ async def memory_recall(context: str, expanded_query: str = "",
             limit=limit,
             pool=pool,
         )
+        linked = await apply_link_semantics(conn, user_id=user_id, rows=all_rows)
 
     results = []
-    for row in all_rows:
+    for item in linked:
+        row = item["row"]
         c = row["content"]
         if row["is_sensitive"]:
             c = f"[SENSITIVE - use secret_get(id={row['id']})]"
@@ -1076,7 +1049,12 @@ async def memory_recall(context: str, expanded_query: str = "",
             "owner": row["owner"],
             "created_at": row["created_at"].isoformat(),
             "updated_at": row["updated_at"].isoformat(),
+            "links": item["links"],
         }
+        if item["redirected_from"] is not None:
+            entry["redirected_from"] = item["redirected_from"]
+        if item["attached_via"] is not None:
+            entry["attached_via"] = item["attached_via"]
         if row["shared_by"]:
             entry["shared_by"] = row["shared_by"]
         results.append(entry)

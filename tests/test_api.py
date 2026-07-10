@@ -1,6 +1,7 @@
 """Tests for the Claude Memory API endpoints."""
 
 import importlib
+import json
 import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1439,3 +1440,93 @@ async def test_rest_store_sensitive_memory_is_not_embedded(client):
     assert resp.status_code == 200
     mock_sched.assert_called_once()
     assert mock_sched.call_args.kwargs["is_sensitive"] is True
+
+
+# ─── FastMCP write/read parity with REST (ADR-0007 follow-through) ───────────
+#
+# The FastMCP mount is a real write/read surface: it must enforce the same
+# 1,400-char bound as REST (no server-side chopping — the retired _split_content
+# produced the part-N-of-M fragment pollution) and serve the same link
+# semantics on recall.
+
+
+def _mcp_fn(tool):
+    """FastMCP's @tool() may wrap the fn; unwrap for direct invocation."""
+    return getattr(tool, "fn", tool)
+
+
+@pytest.mark.asyncio
+async def test_mcp_store_rejects_over_bound_no_chop(client):
+    from claude_memory.api.models import CONTENT_BOUND_MESSAGE
+
+    ac, conn, app_mod = client
+    app_mod._current_user.set("testuser")
+
+    pool = MagicMock()
+    acm = MagicMock()
+    acm.__aenter__ = AsyncMock(return_value=conn)
+    acm.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire.return_value = acm
+
+    with patch.object(app_mod, "get_pool", AsyncMock(return_value=pool)):
+        result = json.loads(await _mcp_fn(app_mod.memory_store)(content="x" * 1401))
+
+    assert result == {"error": CONTENT_BOUND_MESSAGE}
+    conn.fetchrow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_store_600_chars_is_one_memory_no_part_tags(client):
+    ac, conn, app_mod = client
+    app_mod._current_user.set("testuser")
+
+    pool = MagicMock()
+    acm = MagicMock()
+    acm.__aenter__ = AsyncMock(return_value=conn)
+    acm.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire.return_value = acm
+    conn.fetchrow.return_value = _make_memory_row(id=7)
+
+    content = "y" * 600  # over the RETIRED 500-char chop threshold, under the 1,400 bound
+    with patch.object(app_mod, "get_pool", AsyncMock(return_value=pool)), \
+         patch.object(app_mod, "schedule_embedding") as mock_sched:
+        result = json.loads(await _mcp_fn(app_mod.memory_store)(content=content, tags="t1"))
+
+    assert result.get("id") == 7
+    assert "ids" not in result and "parts" not in result
+    assert conn.fetchrow.call_count == 1
+    insert_args = conn.fetchrow.call_args.args
+    assert content in insert_args          # stored verbatim, unchopped
+    assert all("part-" not in str(a) for a in insert_args)  # no part-N-of-M tags
+    mock_sched.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_mcp_recall_serves_link_semantics_like_rest(client):
+    ac, conn, app_mod = client
+    app_mod._current_user.set("testuser")
+
+    pool = MagicMock()
+    acm = MagicMock()
+    acm.__aenter__ = AsyncMock(return_value=conn)
+    acm.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire.return_value = acm
+
+    row = _make_memory_row(id=1)
+    linked_item = {
+        "row": row,
+        "links": [{"type": "see-also", "dir": "out", "id": 9}],
+        "redirected_from": 4,
+        "attached_via": None,
+    }
+    with patch.object(app_mod, "get_pool", AsyncMock(return_value=pool)), \
+         patch.object(app_mod, "_fused_recall", AsyncMock(return_value=[row])) as mock_fused, \
+         patch.object(app_mod, "apply_link_semantics", AsyncMock(return_value=[linked_item])) as mock_links:
+        result = json.loads(await _mcp_fn(app_mod.memory_recall)(context="anything"))
+
+    mock_fused.assert_awaited_once()
+    mock_links.assert_awaited_once()
+    entry = result["memories"][0]
+    assert entry["links"] == [{"type": "see-also", "dir": "out", "id": 9}]
+    assert entry["redirected_from"] == 4
+    assert "attached_via" not in entry
