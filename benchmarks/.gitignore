@@ -6,6 +6,10 @@
 # `data` symlink and the real corpus could leak. Keep both forms.
 data/
 data
+# Post-cleanup store snapshots (scripts/snapshot_corpus.py) are ALSO the user's
+# real memories — same hard-rule, both forms kept for symlink safety.
+snapshots/
+snapshots
 .venv/
 cache/
 cache
