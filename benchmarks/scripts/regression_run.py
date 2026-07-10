@@ -648,8 +648,11 @@ def load_baselines(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     baselines = data.get("results", data)
     for name, entry in baselines.items():
-        if "overall" not in entry:
-            raise ValueError(f"baseline entry {name!r} in {path} has no 'overall' metrics")
+        if GATE_METRIC not in entry.get("overall", {}):
+            raise ValueError(
+                f"baseline entry {name!r} in {path} has no overall {GATE_METRIC!r} "
+                "(pass a previous regression_run --json output)"
+            )
     return baselines
 
 
