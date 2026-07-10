@@ -44,6 +44,22 @@ SQLITE_ONLY = not API_KEY
 DEFAULT_API_TIMEOUT = 15
 RECALL_TIMEOUT = int(os.environ.get("MEMORY_RECALL_TIMEOUT", "30"))
 
+# ADR-0007: hard bound on Memory content, in UNICODE CHARACTERS (not bytes). The API
+# rejects oversize store/update with HTTP 422; every first-party writer pre-validates
+# with the same guidance so the failure teaches the split-into-linked-memories pattern.
+MAX_CONTENT_CHARS = 1400
+
+
+def _content_bound_error(n_chars: int) -> str:
+    """The shared oversize-content guidance (mirrors the API's 422 detail)."""
+    return (
+        f"Content is {n_chars} characters — over the {MAX_CONTENT_CHARS:,}-character Memory "
+        "bound (ADR-0007: a recalled Memory must arrive whole). Split the knowledge into "
+        "several self-contained memories — each understandable on its own, never 'part N of M' "
+        "fragments — and link them (part-of → hub, see-also for related) instead of storing "
+        "one oversized entry."
+    )
+
 
 def _api_request(
     method: str, path: str, body: dict[str, Any] | None = None, timeout: int = DEFAULT_API_TIMEOUT
@@ -66,7 +82,14 @@ def _api_request(
             return result
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else str(e)
-        raise RuntimeError(f"API error {e.code}: {error_body}") from e
+        # FastAPI errors carry the human message in a JSON "detail" field (e.g. the
+        # 422 oversize-content guidance) — surface that instead of the raw envelope.
+        detail: Any = None
+        try:
+            detail = json.loads(error_body).get("detail")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise RuntimeError(f"API error {e.code}: {detail if detail else error_body}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"API connection error: {e.reason}") from e
 
@@ -201,7 +224,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "The fact or memory to store"},
+                "content": {
+                    "type": "string",
+                    "description": "The fact or memory to store (max 1,400 characters — split longer knowledge into several self-contained memories)",
+                },
                 "category": {
                     "type": "string",
                     "enum": ["facts", "preferences", "projects", "people", "decisions"],
@@ -248,8 +274,8 @@ TOOLS = [
                 "sort_by": {
                     "type": "string",
                     "enum": ["importance", "relevance"],
-                    "description": "Sort order",
-                    "default": "importance",
+                    "description": "Sort order (default: relevance — ADR-0005 amendment)",
+                    "default": "relevance",
                 },
                 "limit": {"type": "integer", "description": "Max results", "default": 10},
             },
@@ -371,7 +397,7 @@ SHARING_TOOLS = [
             "type": "object",
             "properties": {
                 "id": {"type": "integer", "description": "Memory ID to update"},
-                "content": {"type": "string", "description": "New content (optional)"},
+                "content": {"type": "string", "description": "New content (optional, max 1,400 characters)"},
                 "tags": {"type": "string", "description": "New tags (optional)"},
                 "importance": {"type": "number", "description": "New importance 0.0-1.0 (optional)", "minimum": 0.0, "maximum": 1.0},
                 "expanded_keywords": {"type": "string", "description": "New expanded keywords (optional)"},
@@ -440,6 +466,10 @@ class MemoryServer:
         content = args.get("content")
         if not content:
             raise ValueError("content is required")
+        if len(content) > MAX_CONTENT_CHARS:
+            # Validate before ANY write (local SQLite included) so oversize entries
+            # never enter the store — locally they would poison the sync push (422).
+            raise ValueError(_content_bound_error(len(content)))
         category = args.get("category", "facts")
         tags = args.get("tags", "")
         importance = max(0.0, min(1.0, float(args.get("importance", 0.5))))
@@ -475,7 +505,9 @@ class MemoryServer:
             raise ValueError("context is required")
         expanded_query = args.get("expanded_query", "")
         category = args.get("category")
-        sort_by = args.get("sort_by", "importance")
+        # Default flipped from "importance" per the ADR-0005 amendment — importance
+        # stays available explicitly but is no longer the default rank axis.
+        sort_by = args.get("sort_by", "relevance")
         limit = args.get("limit", 10)
 
         if HTTP_ONLY:
@@ -494,7 +526,7 @@ class MemoryServer:
         context = args.get("context")
         expanded_query = args.get("expanded_query", "")
         category = args.get("category")
-        sort_by = args.get("sort_by", "importance")
+        sort_by = args.get("sort_by", "relevance")
         limit = args.get("limit", 10)
 
         try:
@@ -695,6 +727,9 @@ class MemoryServer:
                 body[field] = args[field]
         if not body:
             raise ValueError("At least one field to update is required")
+        content = body.get("content")
+        if isinstance(content, str) and len(content) > MAX_CONTENT_CHARS:
+            raise ValueError(_content_bound_error(len(content)))
         _api_request("PUT", f"/api/memories/{memory_id}", body)
         return f"Updated memory #{memory_id}"
 

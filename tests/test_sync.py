@@ -177,6 +177,26 @@ class TestPushPendingOps:
         cursor = engine._conn.execute("SELECT COUNT(*) as cnt FROM pending_ops")
         assert cursor.fetchone()["cnt"] == 1
 
+    def test_push_store_422_drops_op_immediately(self, engine):
+        """A 422 (e.g. content over the 1,400-char bound, ADR-0007) is a permanent
+        rejection — the op is dropped on first sight instead of burning retries."""
+        import io
+
+        engine.enqueue_store(1, "x" * 2000, "facts", "", "kw", 0.5)
+
+        body = io.BytesIO(b'{"detail": "Content exceeds the 1,400-character bound"}')
+        with patch.object(engine, "_api_request") as mock_api:
+            mock_api.side_effect = urllib.error.HTTPError(
+                url="http://fake", code=422, msg="Unprocessable Entity", hdrs=None, fp=body
+            )
+            result = engine._push_pending_ops()
+
+        # Dropped from the queue (no retry_count churn), and the push is not a failure.
+        cursor = engine._conn.execute("SELECT COUNT(*) as cnt FROM pending_ops")
+        assert cursor.fetchone()["cnt"] == 0
+        assert result is True
+        mock_api.assert_called_once()
+
 
 class TestPullChanges:
     def test_pull_inserts_new_memories(self, engine):
@@ -297,6 +317,33 @@ class TestPullChanges:
 
 
 class TestTrySyncStore:
+    def test_422_not_enqueued(self, engine):
+        """A 422 rejection can never succeed on retry — do NOT poison the queue with it."""
+        import io
+
+        body = io.BytesIO(b'{"detail": "Content exceeds the 1,400-character bound"}')
+        with patch.object(engine, "_api_request") as mock_api:
+            mock_api.side_effect = urllib.error.HTTPError(
+                url="http://fake", code=422, msg="Unprocessable Entity", hdrs=None, fp=body
+            )
+            result = engine.try_sync_store(1, "x" * 2000, "facts", "", "kw", 0.5)
+
+        assert result is None
+        cursor = engine._conn.execute("SELECT COUNT(*) as cnt FROM pending_ops")
+        assert cursor.fetchone()["cnt"] == 0
+
+    def test_non_422_http_error_still_enqueues(self, engine):
+        """Transient HTTP failures (e.g. 500) keep the existing enqueue-for-retry path."""
+        with patch.object(engine, "_api_request") as mock_api:
+            mock_api.side_effect = urllib.error.HTTPError(
+                url="http://fake", code=500, msg="Internal Server Error", hdrs=None, fp=None
+            )
+            result = engine.try_sync_store(1, "test", "facts", "", "kw", 0.5)
+
+        assert result is None
+        cursor = engine._conn.execute("SELECT COUNT(*) as cnt FROM pending_ops")
+        assert cursor.fetchone()["cnt"] == 1
+
     def test_success_returns_server_id(self, engine, sqlite_conn):
         now = datetime.now(timezone.utc).isoformat()
         sqlite_conn.execute(

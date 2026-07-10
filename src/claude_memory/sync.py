@@ -386,6 +386,20 @@ class SyncEngine:
                     self._auth_failed = True
                     logger.warning("Auth failed (HTTP %d) — aborting push", e.code)
                     return False  # Abort entire push — no point retrying with bad key
+                if e.code == 422:
+                    # Permanent rejection (e.g. content over the 1,400-char bound,
+                    # ADR-0007) — deterministic, so retrying can never succeed.
+                    # Surface the server detail and drop the op instead of burning
+                    # MAX_OP_RETRIES cycles on it.
+                    detail = e.read().decode() if e.fp else str(e)
+                    logger.warning(
+                        "Op %d (%s) permanently rejected (HTTP 422): %s — dropping from queue",
+                        op_id, op_type, detail,
+                    )
+                    with self._lock:
+                        self._conn.execute("DELETE FROM pending_ops WHERE id = ?", (op_id,))
+                        self._conn.commit()
+                    continue
                 # Increment retry count for non-auth errors
                 with self._lock:
                     self._conn.execute(
@@ -552,6 +566,17 @@ class SyncEngine:
                     )
                     self._conn.commit()
             return server_id
+        except urllib.error.HTTPError as e:
+            if e.code == 422:
+                # Permanent rejection (ADR-0007 content bound) — queueing would only
+                # poison the retry queue with an op that can never succeed.
+                detail = e.read().decode() if e.fp else str(e)
+                logger.warning("Store rejected by server (HTTP 422): %s — not queued", detail)
+                return None
+            self.enqueue_store(
+                local_id, content, category, tags, expanded_keywords, importance, force_sensitive
+            )
+            return None
         except Exception:
             self.enqueue_store(
                 local_id, content, category, tags, expanded_keywords, importance, force_sensitive

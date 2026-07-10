@@ -656,6 +656,153 @@ class TestRecallProgressAndBounding:
         assert [s for s in sent if s["method"] == "notifications/progress"] == []
 
 
+class TestContentBound:
+    """ADR-0007: Memory content is hard-bounded at 1,400 UNICODE CHARACTERS (not bytes).
+
+    Every first-party writer validates client-side BEFORE any write/request — with
+    guidance to split into self-contained, linked memories — and a server-side 422
+    must surface its detail instead of crashing the tool call.
+    """
+
+    def test_store_over_bound_rejected_with_split_guidance(self, server):
+        import claude_memory.mcp_server as m
+
+        oversize = "x" * (m.MAX_CONTENT_CHARS + 1)
+        with pytest.raises(ValueError, match="1,400"):
+            server.memory_store({
+                "content": oversize,
+                "expanded_keywords": "bound oversize split memory test",
+            })
+        # The guidance teaches the split-into-self-contained-memories pattern.
+        with pytest.raises(ValueError, match="self-contained"):
+            server.memory_store({
+                "content": oversize,
+                "expanded_keywords": "bound oversize split memory test",
+            })
+        # Nothing was written locally.
+        assert _server_rows(server) == 0
+
+    def test_store_at_bound_accepted(self, server):
+        import claude_memory.mcp_server as m
+
+        result = server.memory_store({
+            "content": "x" * m.MAX_CONTENT_CHARS,
+            "expanded_keywords": "bound exact limit memory test",
+        })
+        assert "Stored memory #1" in result
+
+    def test_bound_counts_unicode_chars_not_bytes(self, server):
+        """1,400 two-byte characters (2,800 UTF-8 bytes) must be ACCEPTED — the bound
+        is unicode characters, not bytes."""
+        import claude_memory.mcp_server as m
+
+        result = server.memory_store({
+            "content": "щ" * m.MAX_CONTENT_CHARS,
+            "expanded_keywords": "unicode multibyte bound chars test",
+        })
+        assert "Stored memory #1" in result
+
+    def test_store_over_bound_via_tools_call_is_graceful(self, server):
+        """Through the MCP protocol the oversize rejection is an isError result, not a crash."""
+        import claude_memory.mcp_server as m
+
+        result = server.handle_tools_call({
+            "name": "memory_store",
+            "arguments": {
+                "content": "x" * (m.MAX_CONTENT_CHARS + 100),
+                "expanded_keywords": "bound oversize graceful test words",
+            },
+        })
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "1,400" in text
+        assert "self-contained" in text
+
+    def test_update_over_bound_rejected_before_request(self, server):
+        """memory_update validates content client-side and never sends the request."""
+        from unittest.mock import MagicMock
+
+        import claude_memory.mcp_server as m
+
+        mock_api = MagicMock()
+        with patch.object(m, "SQLITE_ONLY", False), patch.object(m, "_api_request", mock_api):
+            with pytest.raises(ValueError, match="1,400"):
+                server.memory_update({
+                    "id": 1,
+                    "content": "x" * (m.MAX_CONTENT_CHARS + 1),
+                })
+        mock_api.assert_not_called()
+
+    def test_api_request_surfaces_422_detail(self):
+        """A server 422 (e.g. oversize content) surfaces the JSON `detail` message,
+        not the raw JSON envelope."""
+        import io
+        import urllib.error
+
+        import claude_memory.mcp_server as m
+
+        detail = "Content exceeds the 1,400-character bound; split into self-contained memories."
+        body = io.BytesIO(json.dumps({"detail": detail}).encode())
+        err = urllib.error.HTTPError(
+            url="http://fake", code=422, msg="Unprocessable Entity", hdrs=None, fp=body
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            with pytest.raises(RuntimeError) as excinfo:
+                m._api_request("POST", "/api/memories", {"content": "x"})
+
+        message = str(excinfo.value)
+        assert "API error 422" in message
+        assert detail in message
+        assert '"detail"' not in message  # raw JSON envelope stripped
+
+
+class TestRelevanceDefaultSort:
+    """ADR-0005 amendment: the default sort_by flips from importance to relevance.
+
+    `sort_by="importance"` stays available explicitly; no first-party recall path
+    semantically requires the old importance-sorted default.
+    """
+
+    def test_tools_schema_recall_default_is_relevance(self):
+        import claude_memory.mcp_server as m
+
+        recall_tool = next(t for t in m.TOOLS if t["name"] == "memory_recall")
+        sort_schema = recall_tool["inputSchema"]["properties"]["sort_by"]
+        assert sort_schema["default"] == "relevance"
+
+    def test_sqlite_recall_defaults_to_relevance(self, server):
+        server.memory_store({
+            "content": "User works at Acme Corp",
+            "expanded_keywords": "acme corp company work employer",
+        })
+        result = server.memory_recall({
+            "context": "work",
+            "expanded_query": "company employer job",
+        })
+        assert "(by relevance)" in result
+
+    def test_remote_recall_defaults_to_relevance(self, server):
+        import claude_memory.mcp_server as m
+
+        with patch.object(m, "_api_request", return_value={"memories": []}) as mock_api:
+            server._recall_remote({"context": "x", "expanded_query": "a b c d e"})
+
+        body = mock_api.call_args[0][2]
+        assert body["sort_by"] == "relevance"
+
+    def test_recall_explicit_importance_still_respected(self, server):
+        server.memory_store({
+            "content": "User works at Acme Corp",
+            "expanded_keywords": "acme corp company work employer",
+        })
+        result = server.memory_recall({
+            "context": "work",
+            "expanded_query": "company employer job",
+            "sort_by": "importance",
+        })
+        assert "(by importance)" in result
+
+
 # ─── FastMCP Postgres-backed tools (api/app.py) wire through the shared helpers ──
 #
 # app.memory_recall / app.memory_store are the FastMCP (Postgres) tools — distinct
