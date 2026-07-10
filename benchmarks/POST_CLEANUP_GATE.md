@@ -48,15 +48,18 @@ deleted since the set was frozen on 2026-06-25) — expect exactly one query
 ## 3. Get the id-map from the cleanup report
 
 Gold ids that the cleanup **superseded must be mapped to their successors** — otherwise
-the gate penalises retrievers for correctly serving current truth. `store_cleanup.py
---report` emits this old→new mapping (in **remote** ids — the store the cleanup
-rewrote); `regression_run.py --id-map FILE` accepts the report directly. Accepted
-shapes: a flat JSON object `{"old": new, ...}`, a list of `[old, new]` pairs (or
-`{"old":…, "new":…}` objects), either optionally nested under an `id_map` /
-`superseded_by` / `supersessions` key, or plain `old new` text lines. Supersession
-chains (a→b→c) collapse to the final successor; a cycle is treated as a corrupt
-report and errors. The bridge runs first, then the id-map —
-gold: local id → *(bridge)* → remote id → *(id-map)* → successor.
+the gate penalises retrievers for correctly serving current truth. Pass the
+`store_cleanup.py --report` file directly as `--id-map`: the loader derives the
+old→new map (in **remote** ids — the store the cleanup rewrote) from the report's
+verified supersedes-link writes (`linked #<new> -supersedes-> #<old>` under
+`phases.*.units[].writes`, recorded only after write + read-back verification).
+Also accepted: a flat JSON object `{"old": new, ...}`, a list of `[old, new]` pairs
+(or `{"old":…, "new":…}` objects), either optionally under an `id_map` /
+`superseded_by` / `supersessions` key (which takes precedence over the writes-derived
+map), or plain `old new` text lines. Supersession chains (a→b→c) collapse to the
+final successor; a cycle is treated as a corrupt report and errors. The bridge runs
+first, then the id-map — gold: local id → *(bridge)* → remote id → *(id-map)* →
+successor.
 
 The map is applied on **both sides** of the eval:
 
