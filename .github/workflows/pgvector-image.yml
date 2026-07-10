@@ -19,14 +19,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Action versions deliberately match infra's proven build-authentik.yml
+      # (login@v3 + build-push@v6): the @v7/@v4 pair 403'd on cross-owner base-blob
+      # HEADs when pushing this cloudnative-pg-based image to a fresh ghcr package.
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@v6
         with:
           context: deploy/infra
           file: deploy/infra/Dockerfile.pgvector
