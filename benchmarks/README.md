@@ -26,10 +26,13 @@ benchmarks/
     test_harness.py        # unit tests (pytest)
   scripts/
     export_corpus.py       # SQLite -> data/corpus.jsonl (non-sensitive only)
+    snapshot_corpus.py     # API -> snapshots/<date>/corpus.jsonl (non-sensitive only)
+    regression_run.py      # post-cleanup gate: snapshot vs stored baseline (POST_CLEANUP_GATE.md)
     build_eval_set.py      # -> data/queries.jsonl + qrels.jsonl  [GITIGNORED]
     dataset_stats.py       # validate + print AGGREGATE stats (safe)
     run_eval.py            # CLI: run a retriever, print/save metrics
-  data/                    # [GITIGNORED] corpus.jsonl, queries.jsonl, qrels.jsonl
+  data/                    # [GITIGNORED] corpus.jsonl, queries.jsonl, qrels.jsonl (PRESERVED eval set)
+  snapshots/               # [GITIGNORED] dated post-cleanup corpus snapshots
   .venv/                   # [GITIGNORED]
 ```
 
