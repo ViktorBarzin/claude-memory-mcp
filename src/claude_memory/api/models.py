@@ -23,6 +23,43 @@ def validate_content_bound(content: str) -> str:
     return content
 
 
+# ── ADR-0007: category canonicalization on write ─────────────────────────────
+#: The closed canonical category set. Free vocabulary drifted into
+#: singular/plural twins that hid 97% of gotchas from exact-match filters, so
+#: writes are canonicalized server-side (the same drift lesson as link types).
+CANONICAL_CATEGORIES = frozenset({
+    "facts", "decisions", "projects", "preferences", "gotchas", "references",
+    "infrastructure", "runbook", "lessons", "operations", "post-mortems",
+    "people", "incidents", "feedback", "process", "architecture", "sessions",
+})
+
+#: Known drift twins, folded silently on write.
+CATEGORY_FOLD_MAP = {
+    "gotcha": "gotchas",
+    "project": "projects",
+    "reference": "references",
+    "infra": "infrastructure",
+    "bug": "gotchas",
+    "incident": "incidents",
+    "procedures": "runbook",
+}
+
+
+def canonicalize_category(category: str) -> str:
+    """Fold a written category to its canonical form, or raise listing the allowed set.
+
+    Case/whitespace are normalized first (``Facts`` → ``facts``), then the drift
+    fold map applies silently; anything still outside the canonical set is a
+    ``ValueError`` (→ 422 on the REST paths) naming every allowed value.
+    """
+    normalized = category.strip().lower()
+    folded = CATEGORY_FOLD_MAP.get(normalized, normalized)
+    if folded not in CANONICAL_CATEGORIES:
+        allowed = ", ".join(sorted(CANONICAL_CATEGORIES))
+        raise ValueError(f"category {category!r} is not canonical; allowed: {allowed}")
+    return folded
+
+
 class MemoryStore(BaseModel):
     content: str
     category: str = "facts"
@@ -35,6 +72,11 @@ class MemoryStore(BaseModel):
     @classmethod
     def _content_within_bound(cls, v: str) -> str:
         return validate_content_bound(v)
+
+    @field_validator("category")
+    @classmethod
+    def _category_canonical(cls, v: str) -> str:
+        return canonicalize_category(v)
 
 
 class MemoryRecall(BaseModel):
@@ -85,6 +127,7 @@ class UnshareTag(BaseModel):
 
 class MemoryUpdate(BaseModel):
     content: Optional[str] = None
+    category: Optional[str] = None
     tags: Optional[str] = None
     importance: Optional[float] = Field(None, ge=0.0, le=1.0)
     expanded_keywords: Optional[str] = None
@@ -95,3 +138,10 @@ class MemoryUpdate(BaseModel):
         if v is None:
             return v
         return validate_content_bound(v)
+
+    @field_validator("category")
+    @classmethod
+    def _category_canonical(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return canonicalize_category(v)

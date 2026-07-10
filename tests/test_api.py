@@ -813,6 +813,99 @@ async def test_update_content_at_bound_is_accepted(client):
     assert resp.status_code == 200
 
 
+# ─── ADR-0007: category canonicalization on write ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("written", "stored"),
+    [
+        ("gotcha", "gotchas"),
+        ("project", "projects"),
+        ("reference", "references"),
+        ("infra", "infrastructure"),
+        ("bug", "gotchas"),
+        ("incident", "incidents"),
+        ("procedures", "runbook"),
+        ("Facts", "facts"),  # case-folded before the map
+    ],
+)
+@pytest.mark.asyncio
+async def test_store_folds_category_silently(client, written, stored):
+    """Known drift twins fold silently to the canonical form (ADR-0007)."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=1, category=stored, importance=0.5)
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories",
+            json={"content": "categorised", "category": written},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    # INSERT args: (sql, user_id, content, category, ...)
+    assert conn.fetchrow.call_args.args[3] == stored
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_non_canonical_category_listing_allowed_set(client):
+    """Anything outside the canonical set (and fold map) is a 422 that LISTS the set."""
+    ac, conn, app_mod = client
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories",
+            json={"content": "x", "category": "musings"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 422
+    for canonical in (
+        "facts", "decisions", "projects", "preferences", "gotchas", "references",
+        "infrastructure", "runbook", "lessons", "operations", "post-mortems",
+        "people", "incidents", "feedback", "process", "architecture", "sessions",
+    ):
+        assert canonical in resp.text, f"422 detail must list {canonical}"
+
+
+@pytest.mark.asyncio
+async def test_update_folds_category_and_writes_it(client):
+    """The update path canonicalizes too, and category becomes updatable."""
+    ac, conn, app_mod = client
+
+    async def mock_check_permission(conn, memory_id, user_id, perm):
+        return (True, "testuser")
+
+    with patch("claude_memory.api.app.check_memory_permission", side_effect=mock_check_permission):
+        conn.execute.return_value = None
+        async with ac:
+            resp = await ac.put(
+                "/api/memories/10",
+                json={"category": "gotcha"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 200
+    sql = conn.execute.call_args.args[0]
+    assert "category = $" in sql
+    assert "gotchas" in conn.execute.call_args.args  # folded value bound
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_non_canonical_category(client):
+    ac, conn, app_mod = client
+
+    async with ac:
+        resp = await ac.put(
+            "/api/memories/10",
+            json={"category": "musings"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 422
+    assert "facts" in resp.text  # lists the allowed set
+
+
 # ─── ADR-0005 amendment: default sort_by flips to relevance ──────────────────
 
 

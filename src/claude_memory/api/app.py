@@ -23,6 +23,7 @@ from claude_memory.api.database import close_pool, get_pool, init_pool
 from claude_memory.api.models import (
     MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
+    canonicalize_category,
 )
 from claude_memory.api.permissions import check_memory_permission
 from claude_memory.api.recall import _fused_recall, schedule_embedding
@@ -751,6 +752,10 @@ async def update_memory(memory_id: int, body: MemoryUpdate, user: AuthUser = Dep
             updates.append(f"content = ${idx}")
             params.append(body.content)
             idx += 1
+        if body.category is not None:
+            updates.append(f"category = ${idx}")
+            params.append(body.category)
+            idx += 1
         if body.tags is not None:
             updates.append(f"tags = ${idx}")
             params.append(body.tags)
@@ -820,6 +825,12 @@ def _split_content(text: str, max_chars: int = MAX_MEMORY_CHARS) -> list[str]:
 async def memory_store(content: str, category: str = "facts", tags: str = "",
                        expanded_keywords: str = "", importance: float = 0.5) -> str:
     """Store a new memory. Content over 500 chars is auto-split into multiple memories."""
+    # Same category canonicalization as the REST store path (ADR-0007); this
+    # entry point's error convention is a JSON error, not an HTTP 422.
+    try:
+        category = canonicalize_category(category)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
     pool = await get_pool()
     user_id = _current_user.get()
     chunks = _split_content(content)

@@ -897,3 +897,28 @@ class TestFastMCPToolsShareHelpers:
 
         mock_sched.assert_called_once()
         assert mock_sched.call_args.kwargs["is_sensitive"] is True
+
+    @pytest.mark.asyncio
+    async def test_memory_store_folds_category(self, fastmcp_app):
+        """ADR-0007: the FastMCP store path canonicalizes categories like REST does."""
+        app_mod, conn = fastmcp_app
+        conn.fetchrow.return_value = {"id": 90}
+
+        with patch.object(app_mod, "schedule_embedding"):
+            out = await app_mod.memory_store(content="folded", category="gotcha")
+
+        assert json.loads(out)["category"] == "gotchas"
+        # INSERT args: (sql, user_id, content, category, ...)
+        assert conn.fetchrow.call_args.args[3] == "gotchas"
+
+    @pytest.mark.asyncio
+    async def test_memory_store_rejects_non_canonical_category(self, fastmcp_app):
+        """Non-canonical category → the FastMCP error convention (JSON error), no INSERT."""
+        app_mod, conn = fastmcp_app
+
+        out = await app_mod.memory_store(content="x", category="musings")
+
+        data = json.loads(out)
+        assert "error" in data
+        assert "facts" in data["error"]  # lists the allowed set
+        conn.fetchrow.assert_not_called()
