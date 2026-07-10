@@ -68,6 +68,12 @@ _DENSE_LIMIT = 50
 #: points so the lexical behaviour cannot drift between them.
 OR_BROADEN_MIN_RANK = 0.01
 
+# ── Link semantics (ADR-0007) ────────────────────────────────────────────────
+#: Max hops when walking a supersedes chain — shared by the recall redirect walk
+#: here and the link-create cycle check in ``api/app.py`` so the two bounds
+#: cannot drift.
+SUPERSEDES_DEPTH_CAP = 10
+
 
 def _flag_on(env_name: str) -> bool:
     """Interpret an on/off feature-flag env var. Truthy: 1/true/yes/on (case-insensitive)."""

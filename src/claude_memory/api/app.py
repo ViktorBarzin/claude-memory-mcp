@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
+import asyncpg  # type: ignore[import-untyped]
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -21,12 +22,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from claude_memory.api.auth import AuthUser, get_current_user, _key_to_user
 from claude_memory.api.database import close_pool, get_pool, init_pool
 from claude_memory.api.models import (
-    MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
+    LINK_TYPES, LinkCreate, MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
     canonicalize_category,
 )
 from claude_memory.api.permissions import check_memory_permission
-from claude_memory.api.recall import _fused_recall, schedule_embedding
+from claude_memory.api.recall import SUPERSEDES_DEPTH_CAP, _fused_recall, schedule_embedding
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -781,6 +782,169 @@ async def update_memory(memory_id: int, body: MemoryUpdate, user: AuthUser = Dep
         )
 
     return {"updated": memory_id}
+
+
+# --- Link endpoints (ADR-0007) ---
+#
+# Typed, directed Memory→Memory edges, scoped to the calling user (each user
+# writes their own edges). link_type is the closed enum of four; recall gives
+# each type its behaviour (supersedes redirects, resolved-by auto-attaches,
+# part-of / see-also are pointer-only) — see api/recall.apply_link_semantics.
+
+
+@app.post("/api/memories/{memory_id}/links")
+async def create_memory_link(
+    memory_id: int, body: LinkCreate, user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Create a typed link from this memory (src) to body.target_id (dst)."""
+    if body.target_id == memory_id:
+        raise HTTPException(status_code=422, detail="A memory cannot link to itself")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Both ends must exist and be readable by the caller (ownership or shared-read).
+        for mid in (memory_id, body.target_id):
+            allowed, owner_id = await check_memory_permission(conn, mid, user.user_id, "read")
+            if not allowed:
+                if owner_id is None:
+                    raise HTTPException(status_code=404, detail=f"Memory {mid} not found")
+                raise HTTPException(status_code=403, detail=f"Read permission required on memory {mid}")
+
+        if body.link_type == "supersedes":
+            # Reject a cycle: walking the target's OUTGOING supersedes chain must never
+            # reach the new source. Batched one query per hop, visited set, bounded depth
+            # (same cap as the recall redirect walk).
+            visited: set[int] = {body.target_id}
+            frontier: list[int] = [body.target_id]
+            for _ in range(SUPERSEDES_DEPTH_CAP):
+                if not frontier:
+                    break
+                hop_rows = await conn.fetch(
+                    """
+                    SELECT dst_id FROM memory_links
+                    WHERE user_id = $1 AND link_type = 'supersedes' AND src_id = ANY($2::int[])
+                    """,
+                    user.user_id,
+                    frontier,
+                )
+                next_frontier: list[int] = []
+                for r in hop_rows:
+                    dst = r["dst_id"]
+                    if dst == memory_id:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"supersedes cycle: memory {body.target_id} already "
+                                f"(transitively) supersedes memory {memory_id}"
+                            ),
+                        )
+                    if dst not in visited:
+                        visited.add(dst)
+                        next_frontier.append(dst)
+                frontier = next_frontier
+
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO memory_links (user_id, src_id, dst_id, link_type)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, created_at
+                """,
+                user.user_id,
+                memory_id,
+                body.target_id,
+                body.link_type,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(status_code=409, detail="Link already exists")
+
+    return {
+        "id": row["id"],
+        "src_id": memory_id,
+        "dst_id": body.target_id,
+        "link_type": body.link_type,
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+@app.delete("/api/memories/{memory_id}/links/{dst_id}/{link_type}")
+async def delete_memory_link(
+    memory_id: int, dst_id: int, link_type: str, user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Delete one of the caller's typed links."""
+    if link_type not in LINK_TYPES:
+        raise HTTPException(
+            status_code=422, detail=f"link_type must be one of: {', '.join(LINK_TYPES)}"
+        )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            "DELETE FROM memory_links WHERE user_id = $1 AND src_id = $2 AND dst_id = $3 AND link_type = $4",
+            user.user_id,
+            memory_id,
+            dst_id,
+            link_type,
+        )
+    if status == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Link not found")
+    return {"unlinked": {"src_id": memory_id, "dst_id": dst_id, "link_type": link_type}}
+
+
+@app.get("/api/memories/{memory_id}")
+async def get_memory(memory_id: int, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    """One full memory with the caller's links, both directions (ADR-0007 ``get <id>``).
+
+    NOTE: registered AFTER the literal /api/memories/* GET routes (sync,
+    shared-with-me, my-shares) so the path parameter cannot shadow them.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, content, category, tags, expanded_keywords, importance, is_sensitive,
+                   created_at, updated_at, user_id AS owner,
+                   CASE WHEN user_id = $2 THEN NULL ELSE user_id END AS shared_by
+            FROM memories
+            WHERE id = $1 AND deleted_at IS NULL
+            """,
+            memory_id,
+            user.user_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        edges = await conn.fetch(
+            """
+            SELECT src_id, dst_id, link_type FROM memory_links
+            WHERE user_id = $1 AND (src_id = $2 OR dst_id = $2)
+            ORDER BY created_at, id
+            """,
+            user.user_id,
+            memory_id,
+        )
+
+    content = row["content"]
+    if row["is_sensitive"]:
+        content = f"[SENSITIVE - use secret_get(id={row['id']})]"
+
+    return {
+        "id": row["id"],
+        "content": content,
+        "category": row["category"],
+        "tags": row["tags"],
+        "expanded_keywords": row["expanded_keywords"],
+        "importance": row["importance"],
+        "is_sensitive": row["is_sensitive"],
+        "owner": row["owner"],
+        "shared_by": row["shared_by"],
+        "created_at": row["created_at"].isoformat(),
+        "updated_at": row["updated_at"].isoformat(),
+        "links_out": [
+            {"id": e["dst_id"], "type": e["link_type"]} for e in edges if e["src_id"] == memory_id
+        ],
+        "links_in": [
+            {"id": e["src_id"], "type": e["link_type"]} for e in edges if e["dst_id"] == memory_id
+        ],
+    }
 
 
 # --- MCP SSE Transport ---

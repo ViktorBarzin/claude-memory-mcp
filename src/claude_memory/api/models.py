@@ -1,6 +1,14 @@
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, get_args
 
 from pydantic import BaseModel, Field, field_validator
+
+# ── ADR-0007: typed Memory→Memory links ──────────────────────────────────────
+#: The closed link-type enum. Each type has defined Recall behaviour
+#: (CONTEXT.md "Link"): supersedes redirects, resolved-by auto-attaches,
+#: part-of / see-also are pointer-only. No open vocabulary (the category-drift
+#: lesson).
+LinkType = Literal["part-of", "supersedes", "see-also", "resolved-by"]
+LINK_TYPES: tuple[str, ...] = get_args(LinkType)
 
 # ── ADR-0007: the Memory content bound ───────────────────────────────────────
 #: Hard bound on Memory content, in UNICODE CHARACTERS (not bytes). Derived from
@@ -123,6 +131,11 @@ class ShareTag(BaseModel):
 class UnshareTag(BaseModel):
     tag: str = Field(..., min_length=1, max_length=100)
     shared_with: str = Field(..., min_length=1, max_length=100)
+
+
+class LinkCreate(BaseModel):
+    target_id: int
+    link_type: LinkType
 
 
 class MemoryUpdate(BaseModel):
