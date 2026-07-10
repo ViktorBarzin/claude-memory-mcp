@@ -42,6 +42,12 @@ DEEP_EXTRACTION_INTERVAL = 5
 DEEP_WINDOW_SIZE = 5
 # Max chars per message in the context window
 MAX_MSG_CHARS = 3000
+# ADR-0007: hard bound on Memory content (unicode characters, not bytes). The API
+# rejects oversize stores with HTTP 422; validate before the request. The judge
+# prompts bound events at 300/500 chars, so an oversize event is judge malfunction —
+# skip it (conservative, like the rest of this hook) rather than store a chopped
+# fragment.
+MAX_CONTENT_CHARS = 1400
 # State directory
 STATE_DIR = Path.home() / ".claude" / "auto-learn-state"
 
@@ -432,6 +438,8 @@ def _store_events(events: list[dict], extracted_hashes: list[str]) -> list[str]:
         content = event.get("content", "")
         if not content:
             continue
+        if len(content) > MAX_CONTENT_CHARS:
+            continue  # would be rejected server-side (422) — see MAX_CONTENT_CHARS
 
         # Deduplication: skip if we've already extracted this
         h = _content_hash(content)

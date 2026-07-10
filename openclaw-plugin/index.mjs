@@ -7,6 +7,21 @@
 
 const PLUGIN_ID = "memory-api";
 
+// ADR-0007: hard bound on Memory content, in UNICODE CHARACTERS (code points, not
+// bytes and not UTF-16 units). The API rejects oversize stores with HTTP 422; the
+// plugin pre-validates with the same split-into-linked-memories guidance.
+const MAX_CONTENT_CHARS = 1400;
+
+function contentBoundMessage(nChars) {
+  return (
+    `Content is ${nChars} characters — over the 1,400-character Memory bound ` +
+    `(ADR-0007: a recalled Memory must arrive whole). Split the knowledge into ` +
+    `several self-contained memories — each understandable on its own, never ` +
+    `'part N of M' fragments — and link them (part-of → hub, see-also for ` +
+    `related) instead of storing one oversized entry.`
+  );
+}
+
 const memoryApiPlugin = {
   id: PLUGIN_ID,
   name: "Memory (API)",
@@ -35,7 +50,18 @@ const memoryApiPlugin = {
       const resp = await fetch(url, options);
       if (!resp.ok) {
         const text = await resp.text();
-        throw new Error(`API error ${resp.status}: ${text}`);
+        // FastAPI errors carry the human message in a JSON "detail" field (e.g. the
+        // 422 oversize-content guidance) — surface that instead of the raw envelope.
+        let detail = "";
+        try {
+          const parsed = JSON.parse(text);
+          if (typeof parsed?.detail === "string") detail = parsed.detail;
+        } catch {
+          // not JSON — fall through to the raw body
+        }
+        const err = new Error(`API error ${resp.status}: ${detail || text}`);
+        err.status = resp.status;
+        throw err;
       }
       return resp.json();
     }
@@ -49,7 +75,11 @@ const memoryApiPlugin = {
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "The fact or memory to store" },
+          content: {
+            type: "string",
+            description:
+              "The fact or memory to store (max 1,400 characters — split longer knowledge into several self-contained memories)",
+          },
           category: {
             type: "string",
             enum: ["facts", "preferences", "projects", "people", "decisions"],
@@ -71,13 +101,31 @@ const memoryApiPlugin = {
         required: ["content", "expanded_keywords"],
       },
       async execute(_toolCallId, params) {
-        const result = await apiRequest("POST", "/api/memories", {
-          content: params.content,
-          category: params.category || "facts",
-          tags: params.tags || "",
-          expanded_keywords: params.expanded_keywords || "",
-          importance: params.importance ?? 0.5,
-        });
+        // Count unicode code points (Array.from), not UTF-16 units (.length).
+        const nChars = Array.from(params.content ?? "").length;
+        if (nChars > MAX_CONTENT_CHARS) {
+          return {
+            content: [{ type: "text", text: `Cannot store: ${contentBoundMessage(nChars)}` }],
+          };
+        }
+        let result;
+        try {
+          result = await apiRequest("POST", "/api/memories", {
+            content: params.content,
+            category: params.category || "facts",
+            tags: params.tags || "",
+            expanded_keywords: params.expanded_keywords || "",
+            importance: params.importance ?? 0.5,
+          });
+        } catch (err) {
+          if (err?.status === 422) {
+            // Surface the server's guidance as a readable tool result, not a crash.
+            return {
+              content: [{ type: "text", text: `Memory rejected by server: ${err.message}` }],
+            };
+          }
+          throw err;
+        }
         return {
           content: [
             {
@@ -115,18 +163,20 @@ const memoryApiPlugin = {
           sort_by: {
             type: "string",
             enum: ["importance", "relevance"],
-            description: "Sort order",
+            description: "Sort order (default: relevance)",
           },
           limit: { type: "integer", description: "Max results" },
         },
         required: ["context", "expanded_query"],
       },
       async execute(_toolCallId, params) {
+        // Default flipped from "importance" per the ADR-0005 amendment.
+        const sortBy = params.sort_by || "relevance";
         const result = await apiRequest("POST", "/api/memories/recall", {
           context: params.context,
           expanded_query: params.expanded_query || "",
           category: params.category || null,
-          sort_by: params.sort_by || "importance",
+          sort_by: sortBy,
           limit: params.limit || 10,
         });
         const rows = result.memories || [];
@@ -138,8 +188,7 @@ const memoryApiPlugin = {
             ],
           };
         }
-        const sortDesc =
-          params.sort_by === "relevance" ? "by relevance" : "by importance";
+        const sortDesc = sortBy === "relevance" ? "by relevance" : "by importance";
         const filterDesc = params.category ? ` in '${params.category}'` : "";
         const lines = rows.map(
           (r) =>

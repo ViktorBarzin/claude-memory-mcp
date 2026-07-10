@@ -24,6 +24,11 @@ from pathlib import Path
 API_URL = os.environ.get("MEMORY_API_URL", os.environ.get("CLAUDE_MEMORY_API_URL", ""))
 API_KEY = os.environ.get("MEMORY_API_KEY", os.environ.get("CLAUDE_MEMORY_API_KEY", ""))
 
+# ADR-0007: hard bound on Memory content (unicode characters) — the API rejects
+# oversize stores with HTTP 422. The extraction filter already caps candidates well
+# below this (<500 chars); the guard keeps the invariant local to the writer.
+MAX_CONTENT_CHARS = 1400
+
 # Patterns that indicate something worth remembering
 KNOWLEDGE_PATTERNS = [
     # User explicitly says "remember"
@@ -54,6 +59,12 @@ def save_seen(seen: set) -> None:
 
 def api_store(content: str, category: str, importance: float, keywords: str) -> bool:
     if not API_URL or not API_KEY:
+        return False
+    if len(content) > MAX_CONTENT_CHARS:
+        print(
+            f"  Skipping oversize candidate ({len(content)} chars > {MAX_CONTENT_CHARS}, ADR-0007)",
+            file=sys.stderr,
+        )
         return False
     data = json.dumps({
         "content": content,
