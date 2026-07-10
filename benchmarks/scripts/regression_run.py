@@ -43,6 +43,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -103,13 +104,41 @@ DEFAULT_BASELINES: dict[str, dict[str, Any]] = {
 # ── id-map: loading, resolution, application (pure) ──────────────────────────
 
 
+# The verified-write line store_cleanup.py records per created supersedes link:
+# "linked #<new> -supersedes-> #<old>" (optionally suffixed "(already existed)").
+# Direction per ADR-0007: successor → superseded, so the id-map pair is (old, new).
+_SUPERSEDES_WRITE_RE = re.compile(r"^linked #(\d+) -supersedes-> #(\d+)")
+
+
+def _pairs_from_cleanup_report(data: Mapping[str, Any]) -> list[tuple[int, int]]:
+    """Extract (old, new) pairs from a store_cleanup.py --report's verified writes.
+
+    Walks ``phases.*.units[].writes[]`` for supersedes-link lines. Writes are only
+    recorded after the link op + read-back verification succeeded, so every pair
+    reflects a link that exists in the store (including ones a resumed run found
+    already present). A superseded id linked from several successors keeps the
+    last-seen successor.
+    """
+    pairs: list[tuple[int, int]] = []
+    for phase in data["phases"].values():
+        for unit in phase.get("units", []):
+            for line in unit.get("writes", []):
+                m = _SUPERSEDES_WRITE_RE.match(line)
+                if m:
+                    pairs.append((int(m.group(2)), int(m.group(1))))
+    return pairs
+
+
 def _pairs_from_json(data: Any) -> list[tuple[Any, Any]] | None:
     """Extract (old, new) pairs from the tolerated JSON shapes, or None."""
     if isinstance(data, Mapping):
-        # a full cleanup report: the map may sit under a conventional key.
+        # a structured map under a conventional key wins if present …
         for key in ("id_map", "superseded_by", "supersessions"):
             if key in data:
                 return _pairs_from_json(data[key])
+        # … else a full store_cleanup report: derive from the verified link writes.
+        if isinstance(data.get("phases"), Mapping):
+            return _pairs_from_cleanup_report(data)
         return list(data.items())
     if isinstance(data, list):
         pairs: list[tuple[Any, Any]] = []

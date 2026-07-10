@@ -235,6 +235,53 @@ class TestLoadIdMap:
         with pytest.raises(ValueError):
             regression_run.load_id_map(p)
 
+    def test_store_cleanup_report_via_supersedes_writes(self, tmp_path: Path) -> None:
+        # The ACTUAL store_cleanup.py --report shape: no structured map, but every
+        # verified write is recorded as "linked #<new> -supersedes-> #<old>".
+        report = {
+            "run_at": "2026-07-10T00:00:00+00:00",
+            "api_url": "https://claude-memory.example",
+            "user": "wizard",
+            "execute": True,
+            "phases": {
+                "reassemble": {
+                    "units": [
+                        {
+                            "status": "applied",
+                            "writes": [
+                                "stored reassembled series as #7501 (912 chars)",
+                                "linked #7501 -supersedes-> #85",
+                                "linked #7501 -supersedes-> #86 (already existed)",
+                                "linked #7501 -part-of-> #42",
+                            ],
+                        },
+                        {"status": "planned", "detail": "dry-run unit, no writes"},
+                    ],
+                },
+                "tombstone": {
+                    "units": [
+                        {"status": "applied", "writes": ["linked #7 -supersedes-> #99"]},
+                    ],
+                },
+            },
+        }
+        p = tmp_path / "report.json"
+        p.write_text(json.dumps(report))
+        assert regression_run.load_id_map(p) == {85: 7501, 86: 7501, 99: 7}
+
+    def test_store_cleanup_report_with_no_supersessions_is_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "report.json"
+        p.write_text(json.dumps({"run_at": "t", "phases": {"fold": {"units": []}}}))
+        assert regression_run.load_id_map(p) == {}
+
+    def test_structured_id_map_key_wins_over_writes(self, tmp_path: Path) -> None:
+        p = tmp_path / "report.json"
+        p.write_text(json.dumps({
+            "id_map": {"85": 9000},
+            "phases": {"x": {"units": [{"writes": ["linked #1 -supersedes-> #85"]}]}},
+        }))
+        assert regression_run.load_id_map(p) == {85: 9000}
+
 
 class TestResolveIdMap:
     def test_chain_collapses_to_final_successor(self) -> None:
