@@ -1,0 +1,41 @@
+name: pgvector operand image
+
+# Builds the CNPG PostGIS+pgvector operand image for the dbaas pg-cluster swap
+# (hybrid-recall promotion runbook Phase 0). Off-infra build per infra ADR-0002:
+# GitHub-hosted runner, push to ghcr — the homelab never sees build IO.
+# workflow_dispatch ONLY: an operand-image build is a deliberate promotion act,
+# never a side effect of a code push. No dispatch inputs — the pgvector minor is
+# pinned here AND in the Dockerfile ARG default; bump both together, in git.
+# Committed on the Forgejo side (the mirror is one-way; GitHub-side commits are
+# overwritten by the next sync).
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: deploy/infra
+          file: deploy/infra/Dockerfile.pgvector
+          push: true
+          platforms: linux/amd64
+          # Single-manifest image (no provenance/SBOM children) per ADR-0002.
+          provenance: false
+          tags: |
+            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:16-pgvector0.8.0
+      # The Dockerfile self-gates on vector.control being present, so a green
+      # build cannot be a silent pgvector-less no-op. Runbook Phase 0 still
+      # verifies the pushed image standalone before the cluster swap.
