@@ -462,8 +462,12 @@ class FakeClient:
 
     def get(self, memory_id):
         if memory_id not in self.memories:
-            raise sc.ClientError(f"GET /api/memories/{memory_id} -> 404")
-        return dict(self.memories[memory_id])
+            raise sc.ClientError(f"GET /api/memories/{memory_id} -> 404", status=404)
+        row = dict(self.memories[memory_id])
+        # Mirror the production GET /api/memories/{id} shape (links both directions).
+        row["links_out"] = [{"id": d, "type": t} for s, d, t in self.links if s == memory_id]
+        row["links_in"] = [{"id": s, "type": t} for s, d, t in self.links if d == memory_id]
+        return row
 
     def store(self, content, category, tags, importance, expanded_keywords=""):
         new_id = self.next_id
@@ -676,6 +680,34 @@ class TestRunnerPhases:
         new_id = client.stores[0]
         assert (new_id, sc.CORRUPTED_XML_BLOB_ID, "supersedes") in client.links
         assert client.memories[sc.CORRUPTED_XML_BLOB_ID]["importance"] == pytest.approx(0.1)
+
+    def test_link_not_visible_after_create_fails_unit(self):
+        class NoopLinkClient(FakeClient):
+            def create_link(self, src_id, target_id, link_type):
+                pass  # returns 2xx but the edge never lands -> links_out stays empty
+
+        old = mem(4, content="[SUPERSEDED] see #7", importance=0.8)
+        successor = mem(7, content="current truth")
+        client = NoopLinkClient([old, successor])
+        runner = make_runner(client)
+        summary = runner.run_phase("tombstones", client.list_all())
+        assert summary["failed"] == 1
+        assert summary["applied"] == 0
+
+    def test_duplicate_link_409_is_idempotent_success(self):
+        class DuplicateLinkClient(FakeClient):
+            def create_link(self, src_id, target_id, link_type):
+                raise sc.ClientError("duplicate edge", status=409)
+
+        old = mem(4, content="[SUPERSEDED] see #7", importance=0.8)
+        successor = mem(7, content="current truth")
+        client = DuplicateLinkClient([old, successor])
+        client.links.append((7, 4, "supersedes"))  # a previous interrupted run already created it
+        runner = make_runner(client)
+        summary = runner.run_phase("tombstones", client.list_all())
+        assert summary["applied"] == 1
+        assert summary["failed"] == 0
+        assert client.memories[4]["importance"] == pytest.approx(0.3)
 
     def test_verify_failure_marks_unit_failed(self):
         class LyingClient(FakeClient):

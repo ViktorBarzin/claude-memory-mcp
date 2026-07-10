@@ -119,7 +119,11 @@ PHASE_ORDER = ("series", "importance", "tombstones", "dupes", "categories", "cor
 
 
 class ClientError(RuntimeError):
-    """An API call failed."""
+    """An API call failed. `status` carries the HTTP code when one was received."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class VerifyError(RuntimeError):
@@ -712,7 +716,7 @@ class MemoryClient:
                 if exc.code == 429 and attempt < attempts:
                     time.sleep(2**attempt)
                     continue
-                raise ClientError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+                raise ClientError(f"{method} {path} -> HTTP {exc.code}: {detail}", status=exc.code) from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 if method == "GET" and attempt < attempts:
                     time.sleep(2**attempt)
@@ -887,16 +891,27 @@ class Runner:
         writes.append(f"updated #{memory_id}: {summary}")
 
     def _link(self, src_id: int, dst_id: int, link_type: str, writes: list[str]) -> None:
-        self.client.create_link(src_id, dst_id, link_type)
+        try:
+            self.client.create_link(src_id, dst_id, link_type)
+            existed = False
+        except ClientError as exc:
+            if exc.status != 409:
+                raise
+            existed = True  # duplicate edge — a previous interrupted run already created it
         self._sleep()
         self._verify_link(src_id, dst_id, link_type)
-        writes.append(f"linked #{src_id} -{link_type}-> #{dst_id}")
+        writes.append(f"linked #{src_id} -{link_type}-> #{dst_id}" + (" (already existed)" if existed else ""))
 
     def _verify_link(self, src_id: int, dst_id: int, link_type: str) -> None:
         got = self.client.get(src_id)
+        links_out = got.get("links_out")
+        if isinstance(links_out, list):
+            if not any(e.get("id") == dst_id and e.get("type") == link_type for e in links_out):
+                raise VerifyError(f"link #{src_id} -{link_type}-> #{dst_id} not in links_out after create")
+            return
         links = got.get("links")
         if links is None:
-            return  # GET does not expose links — the POST already returned 2xx
+            return  # GET exposes no link shape at all — the POST already returned 2xx
         blob = json.dumps(links)
         if str(dst_id) not in blob or link_type not in blob:
             raise VerifyError(f"link #{src_id} -{link_type}-> #{dst_id} not visible in GET after create")
