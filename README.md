@@ -61,6 +61,21 @@ Memories are organized into: `facts`, `preferences`, `projects`, `people`, `deci
 ### Sensitive Memory Support
 Mark memories as sensitive with `force_sensitive: true`. When Vault is configured, sensitive content is encrypted at rest and only decryptable via `secret_get`.
 
+## Bounded Memories & Typed Links
+
+Per [ADR-0007](docs/adr/0007-bounded-self-contained-memories-with-typed-links.md), a Memory is the only stored unit and its content is **hard-bounded at 1,400 unicode characters** — sized so a recalled Memory always arrives whole within the recall hook's injection budget. The API rejects oversize store/update with **HTTP 422**; first-party clients (MCP server, hooks, OpenClaw plugin) pre-validate with the same message. Knowledge too large for one Memory is split *by the writer* into several **self-contained** Memories — each understandable on its own, never "part N of M" fragments.
+
+Memories are joined by **typed, directed links** (closed enum of four), each with defined recall behaviour:
+
+| Link type | Direction | Recall behaviour |
+|-----------|-----------|------------------|
+| `supersedes` | new → old | Successor is served **in place of** the old entry whenever the old one would rank (redirect) |
+| `resolved-by` | symptom → current truth | Target is **auto-attached** when the source ranks — the answer arrives without a second lookup |
+| `part-of` | detail → hub | One-line pointer in both directions; content fetched on demand |
+| `see-also` | related | One-line pointer; no other behaviour |
+
+`GET /api/memories/{id}` returns one full entry with its links in both directions. Links are a PostgreSQL/API feature ([ADR-0002](docs/adr/0002-api-postgres-first-sqlite-stays-lexical.md) keeps SQLite lexical): **links do not sync to SQLite mode** — memory rows sync as before; link edges live only on the server.
+
 ## Architecture
 
 ```
@@ -166,9 +181,9 @@ fts_query = " OR ".join(f'"{w}"' for w in words if w)
 # Example: "kubernetes" OR "deployment" OR "pod" OR "scaling" OR "replicas"
 ```
 
-**Ranking:** Two sort modes:
-- `sort_by="relevance"` — `ORDER BY bm25(memories_fts), importance DESC` — FTS5's built-in BM25 relevance score, with importance as tiebreaker
-- `sort_by="importance"` (default) — `ORDER BY importance DESC, created_at DESC` — user-assigned importance score, with recency as tiebreaker
+**Ranking:** Two sort modes (default `relevance`, per the ADR-0005 amendment):
+- `sort_by="relevance"` (default) — `ORDER BY (-bm25(memories_fts) * 0.7 + importance * 0.3) DESC` — FTS5's built-in BM25 relevance score dominates, with importance as a prior
+- `sort_by="importance"` — `ORDER BY (-bm25(memories_fts) * 0.4 + importance * 0.6) DESC` — user-assigned importance dominates, with relevance as tiebreaker
 
 **Fallback:** If the FTS5 MATCH query fails (e.g. syntax error from special characters), the search falls back to a `LIKE %query%` scan against `content` and `tags` columns.
 
@@ -217,7 +232,7 @@ FROM memories, plainto_tsquery('english', $2) query
 WHERE user_id = $1
   AND deleted_at IS NULL
   AND (search_vector @@ query OR $2 = '')
-ORDER BY importance DESC, ts_rank(search_vector, query) DESC
+ORDER BY (ts_rank(search_vector, query) * 0.7 + importance * 0.3) DESC
 LIMIT $3
 ```
 
@@ -225,9 +240,9 @@ LIMIT $3
 
 [`ts_rank`](https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-RANKING) scores each match considering the weight of the matched field — a match in `content` (weight A) scores higher than a match in `tags` (weight C).
 
-**Sort modes:**
-- `sort_by="importance"` (default) — `ORDER BY importance DESC, ts_rank(search_vector, query) DESC`
-- `sort_by="relevance"` — `ORDER BY ts_rank(search_vector, query) DESC`
+**Sort modes** (default `relevance`, per the ADR-0005 amendment — importance stays available explicitly):
+- `sort_by="relevance"` (default) — `ORDER BY (ts_rank(search_vector, query) * 0.7 + importance * 0.3) DESC`
+- `sort_by="importance"` — `ORDER BY (ts_rank(search_vector, query) * 0.4 + importance * 0.6) DESC`
 - `sort_by="recency"` — `ORDER BY created_at DESC`
 
 **Result limit:** `limit` defaults to **30** — recall returns a small top-N of the most relevant matches, not the whole store. The ceiling is 10000 for callers that explicitly opt into more.
@@ -257,6 +272,7 @@ These keywords are indexed alongside the memory content. When a future `memory_r
 | Query syntax | Quoted OR terms (`"word1" OR "word2"`) | `plainto_tsquery` with implicit AND |
 | Fallback | LIKE scan on failure | None needed (robust parser) |
 | Maintenance | Triggers sync content ↔ FTS table | Generated column, auto-maintained |
+| Typed links (ADR-0007) | No — links do not sync to SQLite mode | Yes (`memory_links`, followed at recall) |
 
 ## Operating Modes
 
@@ -456,7 +472,9 @@ In hybrid mode, a `SyncEngine` runs in a daemon thread with its own SQLite conne
 
 **Push cycle:** Reads the `pending_ops` queue (SQLite table) and sends each operation to the API. On success, removes the operation from the queue and updates the local `server_id` mapping. On failure, the operation stays queued for the next cycle.
 
-**Pull cycle:** Calls `GET /api/memories/sync?since=<last_sync_ts>` for incremental changes. Server wins on conflicts — remote updates overwrite local rows (matched by `server_id`). Soft-deleted rows on the server are hard-deleted locally.
+**Pull cycle:** Calls `GET /api/memories/sync?since=<last_sync_ts>` for incremental changes. Server wins on conflicts — remote updates overwrite local rows (matched by `server_id`). Soft-deleted rows on the server are hard-deleted locally. Only memory rows sync: **typed links (ADR-0007) do not sync to SQLite mode** — they are an API/PostgreSQL feature and are followed server-side at recall.
+
+**Permanent rejections:** a push answered with HTTP 422 (e.g. content over the 1,400-character bound) is deterministic — the op is dropped immediately with the server's detail logged, instead of burning retry cycles. Client-side pre-validation in `memory_store`/`memory_update` prevents oversize rows from entering the local store in the first place.
 
 **Write path:** Every `memory_store` first writes to local SQLite (instant), then attempts an immediate sync to the API. If the immediate sync fails, the write is enqueued in `pending_ops` for the next background cycle.
 
@@ -468,10 +486,11 @@ In hybrid mode, a `SyncEngine` runs in a daemon thread with its own SQLite conne
 |----------|--------|-------------|
 | `/health` | GET | Health check (unauthenticated) |
 | `/api/auth-check` | GET | Validate API key without side effects |
-| `/api/memories` | POST | Store a memory |
+| `/api/memories` | POST | Store a memory (content > 1,400 chars → 422 with split guidance) |
 | `/api/memories` | GET | List memories (`?category=facts&limit=20`) |
-| `/api/memories/recall` | POST | Search memories by context and expanded query |
-| `/api/memories/{id}` | PUT | Update a memory (owner or write-shared user) |
+| `/api/memories/recall` | POST | Search memories by context and expanded query (default `sort_by=relevance`) |
+| `/api/memories/{id}` | GET | Get one memory in full, with its typed links in both directions |
+| `/api/memories/{id}` | PUT | Update a memory (owner or write-shared user; same 1,400-char bound) |
 | `/api/memories/{id}` | DELETE | Soft-delete a memory (owner only) |
 | `/api/memories/{id}/share` | POST | Share a memory with a user |
 | `/api/memories/{id}/share/{user_id}` | DELETE | Revoke sharing from a user |
