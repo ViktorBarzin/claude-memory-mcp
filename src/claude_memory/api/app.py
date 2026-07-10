@@ -855,7 +855,7 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
 
 @mcp_server.tool()
 async def memory_recall(context: str, expanded_query: str = "",
-                        category: str | None = None, sort_by: str = "importance",
+                        category: str | None = None, sort_by: str = "relevance",
                         limit: int = 30) -> str:
     """Recall memories by semantic search."""
     pool = await get_pool()

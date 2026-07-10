@@ -713,6 +713,152 @@ async def test_update_shared_memory_without_write_fails(client):
     assert resp.status_code == 403
 
 
+# ─── ADR-0007: the 1,400-char Memory bound (store + update) ──────────────────
+
+BOUND_MSG = (
+    "content exceeds the 1,400-char Memory bound; split into a self-contained "
+    "hub Memory plus part-of linked detail Memories (see ADR-0007)"
+)
+
+
+@pytest.mark.asyncio
+async def test_store_content_at_bound_is_accepted(client):
+    """Exactly 1,400 characters is inside the bound."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=1, category="facts", importance=0.5)
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories",
+            json={"content": "x" * 1400},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_store_content_over_bound_is_422_with_split_guidance(client):
+    """1,401 characters is rejected with the exact ADR-0007 split guidance."""
+    ac, conn, app_mod = client
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories",
+            json={"content": "x" * 1401},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 422
+    assert BOUND_MSG in resp.text
+
+
+@pytest.mark.asyncio
+async def test_store_bound_counts_unicode_chars_not_bytes(client):
+    """The bound is 1,400 UNICODE CHARACTERS: 1,400 two-byte chars (2,800 UTF-8
+    bytes) pass; 1,401 of them fail."""
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=1, category="facts", importance=0.5)
+
+    async with ac:
+        ok = await ac.post(
+            "/api/memories",
+            json={"content": "я" * 1400},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        too_long = await ac.post(
+            "/api/memories",
+            json={"content": "я" * 1401},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert ok.status_code == 200
+    assert too_long.status_code == 422
+    assert BOUND_MSG in too_long.text
+
+
+@pytest.mark.asyncio
+async def test_update_content_over_bound_is_422_with_split_guidance(client):
+    """The update path enforces the same bound with the same guidance."""
+    ac, conn, app_mod = client
+
+    async with ac:
+        resp = await ac.put(
+            "/api/memories/10",
+            json={"content": "x" * 1401},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 422
+    assert BOUND_MSG in resp.text
+
+
+@pytest.mark.asyncio
+async def test_update_content_at_bound_is_accepted(client):
+    """Exactly 1,400 characters updates fine."""
+    ac, conn, app_mod = client
+
+    async def mock_check_permission(conn, memory_id, user_id, perm):
+        return (True, "testuser")
+
+    with patch("claude_memory.api.app.check_memory_permission", side_effect=mock_check_permission):
+        conn.execute.return_value = None
+        async with ac:
+            resp = await ac.put(
+                "/api/memories/10",
+                json={"content": "x" * 1400},
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 200
+
+
+# ─── ADR-0005 amendment: default sort_by flips to relevance ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_recall_default_sort_is_relevance(client):
+    """With no sort_by in the request, recall must rank by RELEVANCE (the
+    ts_rank*0.7 + importance*0.3 blend), not by the importance blend — the
+    ADR-0005 amendment protects every caller that forgets the flag."""
+    ac, conn, app_mod = client
+    conn.fetch.return_value = []
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "singleword"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    sql = conn.fetch.call_args_list[0].args[0]
+    assert "ts_rank(search_vector, query) * 0.7 + importance * 0.3" in sql, (
+        "default recall must use the relevance blend"
+    )
+    assert "ts_rank(search_vector, query) * 0.4 + importance * 0.6" not in sql, (
+        "default recall must no longer use the importance blend"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_sort_by_importance_stays_available(client):
+    """sort_by=importance remains an explicit option (only the DEFAULT flips)."""
+    ac, conn, app_mod = client
+    conn.fetch.return_value = []
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "singleword", "sort_by": "importance"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    sql = conn.fetch.call_args_list[0].args[0]
+    assert "ts_rank(search_vector, query) * 0.4 + importance * 0.6" in sql
+
+
 # ─── Shared fused-recall helper (S8) ─────────────────────────────────────────
 #
 # api/recall._fused_recall is the ONE retrieval helper both recall entry points
