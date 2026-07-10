@@ -405,6 +405,10 @@ def _build_dense_retriever() -> object:
         if os.environ.pop(key, None) is not None:
             print(f"[regression] ignoring {key}: dense leg pinned to local bge-large "
                   "(the fixed baseline model)")
+    # With the model already cached, force hub-offline so the run cannot silently
+    # pull a different model revision than the one the baseline was cut with.
+    if _bge_in_hub_cache(os.environ):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
     from retrievers.hybrid import HybridRetriever
 
     r = HybridRetriever()
