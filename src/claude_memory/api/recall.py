@@ -74,6 +74,11 @@ OR_BROADEN_MIN_RANK = 0.01
 #: cannot drift.
 SUPERSEDES_DEPTH_CAP = 10
 
+#: Cap on resolved-by auto-attachments per recall response. Attachments arrive
+#: BEYOND the caller's limit, so an unbounded fan-out would flood the 5-slot
+#: hook injection — the truncation problem ADR-0007 exists to fix.
+MAX_RESOLVED_BY_ATTACHMENTS = 3
+
 
 def _flag_on(env_name: str) -> bool:
     """Interpret an on/off feature-flag env var. Truthy: 1/true/yes/on (case-insensitive)."""
@@ -316,6 +321,233 @@ async def _fused_recall(
 
     # graph leg: phase-2 (MEMORY_GRAPH_ENABLED) — production graph module lands later.
     return _fuse(lexical_rows, dense_rows, limit=limit)
+
+
+# ── ADR-0007 link semantics: recall post-processing ─────────────────────────
+
+
+async def _fetch_edges_touching(conn: Any, user_id: str, ids: list[int]) -> list[Any]:
+    """One batched query for every edge of ``ids`` (either direction, all four types)."""
+    return list(
+        await conn.fetch(
+            """
+            SELECT id, src_id, dst_id, link_type, created_at
+            FROM memory_links
+            WHERE user_id = $1 AND (src_id = ANY($2::int[]) OR dst_id = ANY($2::int[]))
+            """,
+            user_id,
+            ids,
+        )
+    )
+
+
+async def apply_link_semantics(
+    conn: Any,
+    *,
+    user_id: str,
+    rows: list[Any],
+    max_attachments: int = MAX_RESOLVED_BY_ATTACHMENTS,
+) -> list[dict[str, Any]]:
+    """Post-ranking step giving each ADR-0007 link type its Recall behaviour.
+
+    Runs AFTER retrieval on the already-ranked ``rows`` (so every sort mode and
+    every fusion path gets it) and returns one result dict per served memory:
+    ``{"row": <record>, "redirected_from": id|None, "attached_via": {...}|None,
+    "links": [{"type", "dir", "id"}, ...]}``. The caller keeps its own
+    response-shaping (sensitive redaction applies uniformly to every served row).
+
+    (a) **supersedes redirects**: a ranked memory with an INCOMING supersedes
+        edge is replaced by its chain head (newest superseder at each fan-in;
+        visited set + depth cap), at the same rank, marked ``redirected_from``;
+        if the head also ranked, the duplicate folds into the best rank.
+    (b) **resolved-by auto-attaches**: each surviving result's outgoing
+        resolved-by targets are APPENDED as extra results (never consuming the
+        caller's limit), marked ``attached_via``, capped per response.
+    (c) **links summary**: every served result lists its edges, all four types,
+        both directions.
+
+    Edge lookups are batched — ONE touching-query for the ranked set, plus one
+    per supersedes hop / new-node group — never per-row N+1. The no-links common
+    case costs exactly one query.
+    """
+    if not rows:
+        return []
+
+    ids0 = [r["id"] for r in rows]
+    row_by_id: dict[int, Any] = {r["id"]: r for r in rows}
+
+    edges_seen: set[int] = set()
+    incoming_sup: dict[int, list[Any]] = {}  # dst -> incoming supersedes edges
+    outgoing_res: dict[int, list[Any]] = {}  # src -> outgoing resolved-by edges
+    touching: dict[int, list[Any]] = {}  # node -> every edge touching it
+
+    def _ingest(fetched: list[Any]) -> None:
+        for e in fetched:
+            if e["id"] in edges_seen:
+                continue
+            edges_seen.add(e["id"])
+            if e["link_type"] == "supersedes":
+                incoming_sup.setdefault(e["dst_id"], []).append(e)
+            elif e["link_type"] == "resolved-by":
+                outgoing_res.setdefault(e["src_id"], []).append(e)
+            touching.setdefault(e["src_id"], []).append(e)
+            touching.setdefault(e["dst_id"], []).append(e)
+
+    _ingest(await _fetch_edges_touching(conn, user_id, ids0))
+
+    # Pull the supersedes chains hop by hop (batched per hop, capped) so each
+    # per-memory walk below has its full chain in hand.
+    chain_nodes_fetched: set[int] = set(ids0)
+    for _ in range(SUPERSEDES_DEPTH_CAP):
+        frontier = sorted(
+            {e["src_id"] for es in incoming_sup.values() for e in es} - chain_nodes_fetched
+        )
+        if not frontier:
+            break
+        _ingest(
+            list(
+                await conn.fetch(
+                    """
+                    SELECT id, src_id, dst_id, link_type, created_at
+                    FROM memory_links
+                    WHERE user_id = $1 AND link_type = 'supersedes' AND dst_id = ANY($2::int[])
+                    """,
+                    user_id,
+                    frontier,
+                )
+            )
+        )
+        chain_nodes_fetched.update(frontier)
+
+    def _chain_head(start: int) -> int:
+        """Follow incoming supersedes edges to the newest chain head (bounded)."""
+        current = start
+        visited = {start}
+        for _ in range(SUPERSEDES_DEPTH_CAP):
+            sups = incoming_sup.get(current)
+            if not sups:
+                break
+            newest = max(sups, key=lambda e: (e["created_at"], e["id"]))
+            nxt = newest["src_id"]
+            if nxt in visited:  # pre-existing cycle in data: stop where we are
+                break
+            visited.add(nxt)
+            current = nxt
+        return current
+
+    # (a) substitute heads in place, then dedupe keeping the best (earliest) rank.
+    slots: list[tuple[int, Optional[int]]] = []
+    for r in rows:
+        head = _chain_head(r["id"])
+        slots.append((head, r["id"] if head != r["id"] else None))
+    served: set[int] = set()
+    final_slots: list[tuple[int, Optional[int]]] = []
+    for fid, redirected_from in slots:
+        if fid in served:
+            continue
+        served.add(fid)
+        final_slots.append((fid, redirected_from))
+
+    # Heads that never ranked need their edges (links summary + their own
+    # resolved-by fan-out) — one batched query.
+    head_ids_new = [fid for fid, _ in final_slots if fid not in row_by_id]
+    if head_ids_new:
+        _ingest(await _fetch_edges_touching(conn, user_id, head_ids_new))
+
+    # (b) resolved-by attachments from every SURVIVING result, capped per response.
+    final_ids = {fid for fid, _ in final_slots}
+    attachments: list[tuple[int, int]] = []  # (target_id, source_id)
+    attached: set[int] = set()
+    for fid, _ in final_slots:
+        if len(attachments) >= max_attachments:
+            break
+        for e in sorted(outgoing_res.get(fid, ()), key=lambda e: (e["created_at"], e["id"])):
+            if len(attachments) >= max_attachments:
+                break
+            target = e["dst_id"]
+            if target in final_ids or target in attached:
+                continue
+            attachments.append((target, fid))
+            attached.add(target)
+
+    # Attach targets outside every set fetched so far still need their edges.
+    edges_covered = set(ids0) | set(head_ids_new)
+    attach_ids_uncovered = [t for t, _ in attachments if t not in edges_covered]
+    if attach_ids_uncovered:
+        _ingest(await _fetch_edges_touching(conn, user_id, attach_ids_uncovered))
+
+    # One row fetch for every served id that wasn't in the ranked set. Uses the
+    # same projection as the retrieval legs (rank 0.0: these rows earned their
+    # slot via a link, not a lexical score).
+    missing_row_ids = [
+        mid
+        for mid in [fid for fid, _ in final_slots] + [t for t, _ in attachments]
+        if mid not in row_by_id
+    ]
+    if missing_row_ids:
+        fetched_rows = await conn.fetch(
+            """
+            SELECT id, content, category, tags, importance, is_sensitive,
+                   0.0::float4 AS rank,
+                   created_at, updated_at, user_id AS owner,
+                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
+            FROM memories
+            WHERE deleted_at IS NULL AND id = ANY($2::int[])
+            """,
+            user_id,
+            missing_row_ids,
+        )
+        for r in fetched_rows:
+            row_by_id[r["id"]] = r
+
+    def _links_summary(mid: int) -> list[dict[str, Any]]:
+        summary = []
+        for e in sorted(touching.get(mid, ()), key=lambda e: (e["created_at"], e["id"])):
+            if e["src_id"] == mid:
+                summary.append({"type": e["link_type"], "dir": "out", "id": e["dst_id"]})
+            else:
+                summary.append({"type": e["link_type"], "dir": "in", "id": e["src_id"]})
+        return summary
+
+    results: list[dict[str, Any]] = []
+    for fid, redirected_from in final_slots:
+        row = row_by_id.get(fid)
+        if row is None:
+            # The head row is gone (deleted after linking). Fall back to the
+            # superseded original — it ranked; better stale than a dropped slot.
+            if redirected_from is not None and redirected_from in row_by_id:
+                results.append(
+                    {
+                        "row": row_by_id[redirected_from],
+                        "redirected_from": None,
+                        "attached_via": None,
+                        "links": _links_summary(redirected_from),
+                    }
+                )
+            continue
+        results.append(
+            {
+                "row": row,
+                "redirected_from": redirected_from,
+                "attached_via": None,
+                "links": _links_summary(fid),
+            }
+        )
+
+    for target, source in attachments:
+        row = row_by_id.get(target)
+        if row is None:
+            continue  # dangling resolved-by to a deleted memory
+        results.append(
+            {
+                "row": row,
+                "redirected_from": None,
+                "attached_via": {"type": "resolved-by", "source": source},
+                "links": _links_summary(target),
+            }
+        )
+
+    return results
 
 
 async def _embed_and_persist(pool: Any, memory_id: int, content: str, embedder: Embedder) -> None:

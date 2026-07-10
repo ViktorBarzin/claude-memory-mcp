@@ -27,7 +27,9 @@ from claude_memory.api.models import (
     canonicalize_category,
 )
 from claude_memory.api.permissions import check_memory_permission
-from claude_memory.api.recall import SUPERSEDES_DEPTH_CAP, _fused_recall, schedule_embedding
+from claude_memory.api.recall import (
+    SUPERSEDES_DEPTH_CAP, _fused_recall, apply_link_semantics, schedule_embedding,
+)
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -217,27 +219,36 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             limit=body.limit,
             pool=pool,
         )
+        # ADR-0007 link semantics as a POST-ranking step, so every sort mode and
+        # fusion path gets it: supersedes-redirect, resolved-by auto-attach, and
+        # a links summary on every result (api/recall.py).
+        linked = await apply_link_semantics(conn, user_id=user.user_id, rows=all_rows)
 
     results = []
-    for row in all_rows:
+    for item in linked:
+        row = item["row"]
         content = row["content"]
         if row["is_sensitive"]:
             content = f"[SENSITIVE - use secret_get(id={row['id']})]"
-        results.append(
-            {
-                "id": row["id"],
-                "content": content,
-                "category": row["category"],
-                "tags": row["tags"],
-                "importance": row["importance"],
-                "is_sensitive": row["is_sensitive"],
-                "rank": float(row["rank"]),
-                "owner": row["owner"],
-                "created_at": row["created_at"].isoformat(),
-                "updated_at": row["updated_at"].isoformat(),
-                "shared_by": row["shared_by"],
-            }
-        )
+        entry: dict[str, Any] = {
+            "id": row["id"],
+            "content": content,
+            "category": row["category"],
+            "tags": row["tags"],
+            "importance": row["importance"],
+            "is_sensitive": row["is_sensitive"],
+            "rank": float(row["rank"]),
+            "owner": row["owner"],
+            "created_at": row["created_at"].isoformat(),
+            "updated_at": row["updated_at"].isoformat(),
+            "shared_by": row["shared_by"],
+            "links": item["links"],
+        }
+        if item["redirected_from"] is not None:
+            entry["redirected_from"] = item["redirected_from"]
+        if item["attached_via"] is not None:
+            entry["attached_via"] = item["attached_via"]
+        results.append(entry)
 
     return {"memories": results}
 

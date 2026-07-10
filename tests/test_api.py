@@ -142,9 +142,11 @@ async def test_store_memory_creates_record_with_user_id(client):
 @pytest.mark.asyncio
 async def test_recall_returns_all_memories(client):
     ac, conn, app_mod = client
-    # recall now runs a single query (all memories are public)
-    conn.fetch.return_value = [
-        _make_memory_row(id=1, content="user memory", is_sensitive=False, owner="testuser", shared_by=None),
+    conn.fetch.side_effect = [
+        # lexical AND-match (all memories are public)
+        [_make_memory_row(id=1, content="user memory", is_sensitive=False, owner="testuser", shared_by=None)],
+        [],  # OR-broadening (sparse AND-match, multi-word query)
+        [],  # memory_links batch (ADR-0007 post-processing)
     ]
 
     async with ac:
@@ -170,7 +172,10 @@ async def test_recall_default_limit_is_capped(client):
     the default was 10000, so a default call returned everything.
     """
     ac, conn, app_mod = client
-    conn.fetch.return_value = [_make_memory_row(id=1)]
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1)],  # lexical AND-match
+        [],                        # memory_links batch (ADR-0007 post-processing)
+    ]
 
     async with ac:
         resp = await ac.post(
@@ -196,6 +201,7 @@ async def test_recall_or_broadening_is_relevance_bounded(client):
     conn.fetch.side_effect = [
         [_make_memory_row(id=1)],  # AND-match: 1 row (< limit -> triggers OR)
         [_make_memory_row(id=2)],  # OR-broadening result
+        [],                        # memory_links batch (ADR-0007 post-processing)
     ]
 
     async with ac:
@@ -206,7 +212,7 @@ async def test_recall_or_broadening_is_relevance_bounded(client):
         )
 
     assert resp.status_code == 200
-    assert len(conn.fetch.call_args_list) == 2, "OR-broadening query should fire"
+    assert len(conn.fetch.call_args_list) == 3, "AND, OR-broadening, then the links batch"
     or_sql = conn.fetch.call_args_list[1].args[0]
     assert "ts_rank(search_vector, query) DESC" in or_sql, "OR matches must be ordered by relevance"
     assert "ts_rank(search_vector, query) >" in or_sql, "OR matches must have a minimum-rank floor"
@@ -215,8 +221,9 @@ async def test_recall_or_broadening_is_relevance_bounded(client):
 @pytest.mark.asyncio
 async def test_recall_redacts_sensitive_memories(client):
     ac, conn, app_mod = client
-    conn.fetch.return_value = [
-        _make_memory_row(id=5, content="[REDACTED]", is_sensitive=True, owner="testuser", shared_by=None),
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=5, content="[REDACTED]", is_sensitive=True, owner="testuser", shared_by=None)],
+        [],  # memory_links batch (ADR-0007 post-processing)
     ]
 
     async with ac:
@@ -645,11 +652,15 @@ async def test_my_shares_returns_outgoing_shares(client):
 async def test_recall_includes_all_users_memories(client):
     """POST /api/memories/recall returns all users' memories with owner field."""
     ac, conn, app_mod = client
-    # Single query returns all memories (public by default)
-    conn.fetch.return_value = [
-        _make_memory_row(id=1, content="own memory", owner="testuser", shared_by=None),
-        _make_memory_row(id=2, content="other memory", owner="owner1", shared_by="owner1"),
-        _make_memory_row(id=3, content="another memory", owner="owner2", shared_by="owner2"),
+    # Single lexical query returns all memories (public by default)
+    conn.fetch.side_effect = [
+        [
+            _make_memory_row(id=1, content="own memory", owner="testuser", shared_by=None),
+            _make_memory_row(id=2, content="other memory", owner="owner1", shared_by="owner1"),
+            _make_memory_row(id=3, content="another memory", owner="owner2", shared_by="owner2"),
+        ],
+        [],  # OR-broadening (sparse AND-match, multi-word query)
+        [],  # memory_links batch (ADR-0007 post-processing)
     ]
 
     async with ac:
@@ -1254,6 +1265,7 @@ async def test_schedule_embedding_does_not_block_and_persists_off_hot_path():
 async def test_rest_recall_delegates_to_shared_fused_recall(client):
     """(f) REST recall_memories must retrieve via the shared _fused_recall helper."""
     ac, conn, app_mod = client
+    conn.fetch.return_value = []  # the ADR-0007 links batch after retrieval
     captured = {}
 
     async def fake_fused(conn_arg, **kwargs):
