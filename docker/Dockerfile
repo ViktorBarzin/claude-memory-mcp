@@ -6,7 +6,7 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY src/ src/
 COPY migrations/ migrations/
 
-RUN pip install --no-cache-dir ".[api]"
+RUN pip install --no-cache-dir ".[api,embeddings]" --extra-index-url https://download.pytorch.org/whl/cpu
 
 RUN useradd -r -u 1000 app
 USER app
