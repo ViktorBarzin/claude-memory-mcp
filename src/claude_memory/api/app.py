@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
 import asyncpg  # type: ignore[import-untyped]
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +21,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from claude_memory.api import metrics
 from claude_memory.api.auth import AuthUser, get_current_user, _key_to_user
 from claude_memory.api.database import close_pool, get_pool, init_pool
 from claude_memory.api.models import (
@@ -94,6 +97,30 @@ def _redact_content(content: str) -> str:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_with_bound_metric(request: Request, exc: RequestValidationError) -> Response:
+    """Default 422 behaviour + a counter when the ADR-0007 content bound rejects a write."""
+    if any("1,400-char Memory bound" in str(e.get("msg", "")) for e in exc.errors()):
+        metrics.BOUND_REJECTS.labels(surface="rest").inc()
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus exposition (annotation-scraped in-cluster; aggregate counters only)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        pending = await conn.fetchval(
+            "SELECT count(*) FROM memories"
+            " WHERE embedding IS NULL AND NOT is_sensitive AND deleted_at IS NULL"
+        )
+        total = await conn.fetchval("SELECT count(*) FROM memories WHERE deleted_at IS NULL")
+    metrics.EMBEDDINGS_PENDING.set(pending or 0)
+    metrics.MEMORIES_TOTAL.set(total or 0)
+    payload, content_type = metrics.exposition()
+    return Response(content=payload, media_type=content_type)
 
 
 @app.get("/api/auth-check")
@@ -196,11 +223,13 @@ async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_u
     # Returns immediately; the response is never blocked on the embedding compute.
     schedule_embedding(pool, memory_id, body.content, is_sensitive=is_sensitive)
 
+    metrics.STORES.labels(surface="rest", outcome="ok").inc()
     return MemoryResponse(id=row["id"], category=row["category"], importance=row["importance"])
 
 
 @app.post("/api/memories/recall")
 async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    t0 = time.perf_counter()
     pool = await get_pool()
 
     query_text = f"{body.context} {body.expanded_query}".strip()
@@ -209,20 +238,24 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
     # lexical→hybrid logic cannot drift. Flags off ⇒ verbatim current lexical SQL (no-op);
     # the embeddings flag adds the dense leg to a shared weighted-RRF pool with importance
     # as a post-fusion multiplier (api/recall.py).
-    async with pool.acquire() as conn:
-        all_rows = await _fused_recall(
-            conn,
-            user_id=user.user_id,
-            query_text=query_text,
-            sort_by=body.sort_by,
-            category=body.category,
-            limit=body.limit,
-            pool=pool,
-        )
-        # ADR-0007 link semantics as a POST-ranking step, so every sort mode and
-        # fusion path gets it: supersedes-redirect, resolved-by auto-attach, and
-        # a links summary on every result (api/recall.py).
-        linked = await apply_link_semantics(conn, user_id=user.user_id, rows=all_rows)
+    try:
+        async with pool.acquire() as conn:
+            all_rows = await _fused_recall(
+                conn,
+                user_id=user.user_id,
+                query_text=query_text,
+                sort_by=body.sort_by,
+                category=body.category,
+                limit=body.limit,
+                pool=pool,
+            )
+            # ADR-0007 link semantics as a POST-ranking step, so every sort mode and
+            # fusion path gets it: supersedes-redirect, resolved-by auto-attach, and
+            # a links summary on every result (api/recall.py).
+            linked = await apply_link_semantics(conn, user_id=user.user_id, rows=all_rows)
+    except Exception:
+        metrics.RECALL_ERRORS.labels(surface="rest").inc()
+        raise
 
     results = []
     for item in linked:
@@ -250,6 +283,8 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             entry["attached_via"] = item["attached_via"]
         results.append(entry)
 
+    metrics.RECALL_REQUESTS.labels(surface="rest", sort=body.sort_by).inc()
+    metrics.RECALL_LATENCY.labels(surface="rest").observe(time.perf_counter() - t0)
     return {"memories": results}
 
 
@@ -869,6 +904,7 @@ async def create_memory_link(
         except asyncpg.UniqueViolationError:
             raise HTTPException(status_code=409, detail="Link already exists")
 
+    metrics.LINKS_CREATED.labels(link_type=body.link_type).inc()
     return {
         "id": row["id"],
         "src_id": memory_id,
@@ -982,6 +1018,10 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
         category = canonicalize_category(category)
         validate_content_bound(content)
     except ValueError as exc:
+        if "Memory bound" in str(exc):
+            metrics.BOUND_REJECTS.labels(surface="mcp").inc()
+        else:
+            metrics.STORES.labels(surface="mcp", outcome="category_rejected").inc()
         return json.dumps({"error": str(exc)})
     pool = await get_pool()
     user_id = _current_user.get()
@@ -1005,6 +1045,7 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
         # non-sensitive content only, flag-gated; does not block the store response.
         schedule_embedding(pool, memory_id, content, is_sensitive=is_sensitive)
 
+    metrics.STORES.labels(surface="mcp", outcome="ok").inc()
     return json.dumps({"id": memory_id, "category": category, "importance": importance})
 
 
@@ -1013,6 +1054,7 @@ async def memory_recall(context: str, expanded_query: str = "",
                         category: str | None = None, sort_by: str = "relevance",
                         limit: int = 30) -> str:
     """Recall memories by semantic search."""
+    t0 = time.perf_counter()
     pool = await get_pool()
     user_id = _current_user.get()
     query_text = f"{context} {expanded_query}".strip()
@@ -1024,17 +1066,21 @@ async def memory_recall(context: str, expanded_query: str = "",
     # the dense leg to a shared weighted-RRF pool (api/recall.py). Link semantics apply
     # here exactly as on REST (ADR-0007): supersedes-redirect, resolved-by attach,
     # links summary — the two recall surfaces must not differ in what truth they serve.
-    async with pool.acquire() as conn:
-        all_rows = await _fused_recall(
-            conn,
-            user_id=user_id,
-            query_text=query_text,
-            sort_by=sort_by,
-            category=category,
-            limit=limit,
-            pool=pool,
-        )
-        linked = await apply_link_semantics(conn, user_id=user_id, rows=all_rows)
+    try:
+        async with pool.acquire() as conn:
+            all_rows = await _fused_recall(
+                conn,
+                user_id=user_id,
+                query_text=query_text,
+                sort_by=sort_by,
+                category=category,
+                limit=limit,
+                pool=pool,
+            )
+            linked = await apply_link_semantics(conn, user_id=user_id, rows=all_rows)
+    except Exception:
+        metrics.RECALL_ERRORS.labels(surface="mcp").inc()
+        raise
 
     results = []
     for item in linked:
@@ -1059,6 +1105,8 @@ async def memory_recall(context: str, expanded_query: str = "",
             entry["shared_by"] = row["shared_by"]
         results.append(entry)
 
+    metrics.RECALL_REQUESTS.labels(surface="mcp", sort=sort_by).inc()
+    metrics.RECALL_LATENCY.labels(surface="mcp").observe(time.perf_counter() - t0)
     return json.dumps({"memories": results})
 
 

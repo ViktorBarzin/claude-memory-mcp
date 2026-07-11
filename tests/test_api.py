@@ -1530,3 +1530,101 @@ async def test_mcp_recall_serves_link_semantics_like_rest(client):
     assert entry["links"] == [{"type": "see-also", "dir": "out", "id": 9}]
     assert entry["redirected_from"] == 4
     assert "attached_via" not in entry
+
+
+# ─── Prometheus metrics (observability for "is memory working better?") ──────
+
+
+def _sample(name, labels=None):
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_exposition_and_gauges(client):
+    ac, conn, app_mod = client
+    conn.fetchval = AsyncMock(side_effect=[7, 8700])  # pending, total
+    async with ac:
+        resp = await ac.get("/metrics")
+    assert resp.status_code == 200
+    body = resp.text
+    for name in (
+        "memory_recall_requests_total",
+        "memory_recall_seconds",
+        "memory_link_redirects_total",
+        "memory_embed_write_total",
+        "memory_embeddings_pending",
+    ):
+        assert name in body
+    assert 'memory_embeddings_pending 7.0' in body
+    assert 'memory_entries_total 8700.0' in body
+
+
+@pytest.mark.asyncio
+async def test_store_and_recall_increment_counters(client):
+    ac, conn, app_mod = client
+    conn.fetchrow.return_value = _make_memory_row(id=41)
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=41)],  # lexical AND-match (sparse -> OR-broaden fires)
+        [_make_memory_row(id=41)],  # OR-broaden result
+        [],  # memory_links batch (no links)
+    ]
+    before_store = _sample("memory_store_total", {"surface": "rest", "outcome": "ok"})
+    before_recall = _sample(
+        "memory_recall_requests_total", {"surface": "rest", "sort": "relevance"}
+    )
+    async with ac:
+        r1 = await ac.post(
+            "/api/memories",
+            json={"content": "metrics probe", "category": "facts"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        r2 = await ac.post(
+            "/api/memories/recall",
+            json={"context": "metrics probe", "limit": 5},
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert _sample("memory_store_total", {"surface": "rest", "outcome": "ok"}) == before_store + 1
+    assert (
+        _sample("memory_recall_requests_total", {"surface": "rest", "sort": "relevance"})
+        == before_recall + 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_bound_reject_increments_counter(client):
+    ac, conn, app_mod = client
+    before = _sample("memory_bound_rejects_total", {"surface": "rest"})
+    async with ac:
+        resp = await ac.post(
+            "/api/memories",
+            json={"content": "x" * 1401, "category": "facts"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert resp.status_code == 422
+    assert _sample("memory_bound_rejects_total", {"surface": "rest"}) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_link_create_increments_counter(client):
+    ac, conn, app_mod = client
+    # permission checks for both ends, then the INSERT RETURNING row
+    with patch(
+        "claude_memory.api.app.check_memory_permission",
+        AsyncMock(return_value=(True, "testuser")),
+    ):
+        conn.fetch.return_value = []  # supersedes cycle walk: no outgoing edges
+        conn.fetchrow.return_value = MockRow(
+            {"id": 99, "created_at": datetime(2026, 7, 11, tzinfo=timezone.utc)}
+        )
+        before = _sample("memory_links_created_total", {"link_type": "see-also"})
+        async with ac:
+            resp = await ac.post(
+                "/api/memories/1/links",
+                json={"target_id": 2, "link_type": "see-also"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+    assert resp.status_code == 200
+    assert _sample("memory_links_created_total", {"link_type": "see-also"}) == before + 1

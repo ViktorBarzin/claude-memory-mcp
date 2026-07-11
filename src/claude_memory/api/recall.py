@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 import asyncpg  # type: ignore[import-untyped]
 
+from claude_memory.api import metrics
 from claude_memory.embeddings import Embedder, select_embedder
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,19 @@ def _fuse(
         return scores[mid] * (0.7 + 0.3 * importance)
 
     ordered_ids = sorted(scores, key=final_score, reverse=True)
+
+    # Observability: the dense leg's live contribution (production counterpart of
+    # the offline paraphrase-win). Counted at the single fusion point so both
+    # recall surfaces are covered identically.
+    if dense_rows:
+        metrics.DENSE_CANDIDATE_RECALLS.inc()
+        lexical_ids = {r["id"] for r in lexical_rows}
+        dense_only_served = sum(
+            1 for mid in ordered_ids[: min(5, limit)] if mid not in lexical_ids
+        )
+        if dense_only_served:
+            metrics.DENSE_ONLY_TOP5.inc(dense_only_served)
+
     return [row_by_id[mid] for mid in ordered_ids[:limit]]
 
 
@@ -575,6 +589,16 @@ async def apply_link_semantics(
             }
         )
 
+    # Observability: link semantics firing in production — each redirect is
+    # stale vocabulary landing on current truth; each attach is a symptom query
+    # delivered its root cause without a second lookup.
+    redirects_served = sum(1 for r in results if r["redirected_from"] is not None)
+    attaches_served = sum(1 for r in results if r["attached_via"] is not None)
+    if redirects_served:
+        metrics.LINK_REDIRECTS.inc(redirects_served)
+    if attaches_served:
+        metrics.LINK_ATTACHES.inc(attaches_served)
+
     return results
 
 
@@ -595,7 +619,9 @@ async def _embed_and_persist(pool: Any, memory_id: int, content: str, embedder: 
                 _vector_literal(vec),
                 memory_id,
             )
+        metrics.EMBED_WRITE.labels(status="ok").inc()
     except Exception as exc:  # noqa: BLE001 - never break the store on an embed failure
+        metrics.EMBED_WRITE.labels(status="failed").inc()
         logger.warning("embed-on-write failed for memory %s: %s", memory_id, exc)
 
 
