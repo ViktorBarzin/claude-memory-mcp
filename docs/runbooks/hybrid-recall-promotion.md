@@ -234,3 +234,40 @@ Full-cluster restore (last resort) is the standard CNPG path:
 - `src/claude_memory/api/recall.py` — `_fused_recall` / `_dense_recall` / `schedule_embedding`.
 - `src/claude_memory/embeddings.py` — `select_embedder` (Voyage-3.5 / bge-large).
 - `docs/adr/0002`–`0006` — the decisions this promotion realises.
+
+---
+
+## As executed (2026-07-10 → 2026-07-11)
+
+Phases 0–6 ran to completion; dense leg LIVE and verified (embed-on-write; a
+zero-lexical-overlap probe served the target at rank 1). Corrections future
+re-runs need, discovered during execution:
+
+- **Phase 3 mechanics:** `alembic upgrade head` can NOT re-run an
+  already-stamped availability-gated migration. The working replay is
+  `alembic stamp 004 && alembic upgrade head` — safe because 005 AND 006 are
+  idempotent (existence-guarded); verified it preserves live `memory_links`
+  rows. Also `CREATE EXTENSION vector` was pre-created as postgres.
+- **Phase 5 runtime traps (three, stacked — the embed path had never actually
+  run in prod):** (1) the API image shipped only the `[api]` extra, so the
+  lazy `sentence_transformers` import failed and both embed-on-write and
+  query-side dense embedding silently degraded to lexical; (2) with the extra
+  installed, the 128Mi pod limit OOM-killed the torch import (exit 137) — now
+  512Mi/2560Mi burstable (bge holds ~1.8Gi resident); (3) the runtime system
+  user has no writable HOME, so the HuggingFace cache mkdir PermissionErrors
+  and the model can never download at runtime — the model is now BAKED into
+  the image at build time (`ENV HF_HOME=/opt/hf-cache` + a build-time
+  `SentenceTransformer()` call; `chmod a+rwX` for the read-path `.locks`).
+- **Phase 4 at scale:** `embed_document` encodes one text per call
+  (batch_size=1) — a bulk backfill must batch via
+  `embedder.model.encode(texts, batch_size=64)` + the module's
+  `_l2_normalise` (identical math, ~25× faster). Piping the whole result
+  through one `kubectl exec -i` stream dies with an apiserver i/o timeout on
+  ~60MB — chunk stdin (500 rows/exec) with an idempotent
+  `UPDATE … WHERE embedding IS NULL` writer.
+- **Observability landed with the flip:** `/metrics` on the API (recall
+  rate/latency/errors, dense-only-top5 contribution, link redirects/attaches,
+  embed-write status, pending gauge) + Prometheus alerts + a weekly offline
+  regression timer on the devvm (`memory-regression-weekly`, Sun 03:07 UTC).
+  NOTE the infra Prometheus endpoints-job keep-whitelist: an app's metric
+  prefix must be admitted or every series is silently dropped at ingestion.
