@@ -250,13 +250,37 @@ class VoyageEmbedder:
         return self._embed(query, input_type="query")
 
 
+#: Process-wide embedder singletons, keyed on the selection input (Voyage key present
+#: → hosted, else local). select_embedder() is called on EVERY recall AND every
+#: embed-on-write; the heavy part of a backend is the model/client it lazily loads on
+#: first embed (bge-large is ~1.3GB). Returning a FRESH backend per call therefore
+#: re-instantiated the model on every recall — the 2026-07 latency regression (~5s
+#: recalls, OOM when two loads overlapped). One cached instance per backend choice
+#: makes the model load exactly once per process and be reused everywhere.
+_embedder_cache: "dict[bool, Embedder]" = {}
+
+
 def select_embedder() -> Embedder:
-    """Choose the production embedding backend per the FINAL DESIGN rule.
+    """Choose the production embedding backend per the FINAL DESIGN rule, returning a
+    process-wide singleton so the heavy model loads once (not once per call).
 
     Hosted ``voyage-3.5`` iff ``VOYAGE_API_KEY`` is set and non-empty; otherwise the
     local ``bge-large`` fallback. Selection is cheap and imports NO heavy deps — the
-    backend's dependency is imported only on its first ``embed_*`` call.
+    backend's dependency is imported only on its first ``embed_*`` call. The chosen
+    backend is CACHED per selection (keyed on Voyage-key presence): recall and
+    embed-on-write reuse one loaded model instead of re-instantiating the ~1.3GB
+    bge-large model on every call. In production the env is fixed for the process
+    lifetime, so exactly one instance is ever built.
     """
-    if os.environ.get(VOYAGE_API_KEY_ENV):
-        return VoyageEmbedder()
-    return BgeEmbedder()
+    use_voyage = bool(os.environ.get(VOYAGE_API_KEY_ENV))
+    embedder = _embedder_cache.get(use_voyage)
+    if embedder is None:
+        embedder = VoyageEmbedder() if use_voyage else BgeEmbedder()
+        _embedder_cache[use_voyage] = embedder
+    return embedder
+
+
+def reset_embedder_cache() -> None:
+    """Drop the cached embedder singletons; the next :func:`select_embedder` rebuilds
+    lazily. Used by tests for isolation — the loaded model is otherwise process-global."""
+    _embedder_cache.clear()

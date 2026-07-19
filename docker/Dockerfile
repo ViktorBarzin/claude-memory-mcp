@@ -18,6 +18,14 @@ ENV HF_HOME=/opt/hf-cache
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5')" \
     && chmod -R a+rwX /opt/hf-cache
 
+# The model is baked into the cache above, so the runtime never needs the HuggingFace
+# Hub. Force offline mode: otherwise sentence-transformers issues a network round-trip
+# to huggingface.co on every model load to revalidate cached files (seen in prod recall
+# logs) — added latency plus a hard startup dependency on HF being reachable. Set AFTER
+# the build-time bake, which needs the network to download.
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
 RUN useradd -r -u 1000 app
 USER app
 

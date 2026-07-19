@@ -113,6 +113,15 @@ def _reset_voyage_calls() -> Iterator[None]:
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_embedder_singletons() -> Iterator[None]:
+    """select_embedder() now caches one backend instance per process; clear it around
+    every test so each starts with a fresh, un-loaded backend (test isolation)."""
+    emb.reset_embedder_cache()
+    yield
+    emb.reset_embedder_cache()
+
+
 @pytest.fixture
 def fake_local(monkeypatch: pytest.MonkeyPatch) -> type[_FakeSentenceTransformer]:
     """Inject a fake ``sentence_transformers`` module so the local backend never loads
@@ -322,3 +331,45 @@ def test_voyage_input_type_routing(monkeypatch: pytest.MonkeyPatch, fake_voyage:
     kinds = {text: itype for text, itype in _FakeVoyageClient.calls}
     assert kinds["doc text"] == "document"
     assert kinds["query text"] == "query"
+
+
+# ── 7. process singleton: the heavy model loads ONCE, not per recall ─────────────
+# Regression for the 2026-07 recall-latency incident. select_embedder() returned a
+# FRESH backend on every call, and the recall hot path (api/recall.py:_fused_recall)
+# calls it per request — so the ~1.3GB bge-large model was re-instantiated on EVERY
+# recall (prod evidence: 87 model-loads for 91 recalls, avg recall 5.1s, OOMKill when
+# two loads overlapped). The contract locked in here: one process → one model load,
+# reused across every recall and every embed-on-write.
+
+
+def test_local_model_loads_once_across_recalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Five recalls (select_embedder() + embed_query(), exactly as _fused_recall does
+    per request) must construct the bge model ONCE — not once per recall."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    constructions: list[str] = []
+
+    class _CountingSentenceTransformer(_FakeSentenceTransformer):
+        def __init__(self, model_name: str, device: str = "cpu") -> None:
+            constructions.append(model_name)
+            super().__init__(model_name, device=device)
+
+    fake_mod = ModuleType("sentence_transformers")
+    fake_mod.SentenceTransformer = _CountingSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_mod)
+
+    for i in range(5):
+        emb.select_embedder().embed_query(f"recall query {i}")
+
+    assert len(constructions) == 1, (
+        f"bge-large re-instantiated {len(constructions)}x across 5 recalls — the "
+        "per-call model-reload regression is back (recall latency ~5s, OOM risk)"
+    )
+
+
+def test_select_embedder_returns_process_singleton(
+    monkeypatch: pytest.MonkeyPatch, fake_local: type[_FakeSentenceTransformer]
+) -> None:
+    """Repeated select_embedder() calls return the SAME instance for a given backend
+    choice, so the lazily-loaded model is shared rather than reloaded."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    assert emb.select_embedder() is emb.select_embedder()

@@ -1,5 +1,6 @@
 """Claude Memory API -- shared persistent memory with PostgreSQL full-text search."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -31,8 +32,10 @@ from claude_memory.api.models import (
 )
 from claude_memory.api.permissions import check_memory_permission
 from claude_memory.api.recall import (
-    SUPERSEDES_DEPTH_CAP, _fused_recall, apply_link_semantics, schedule_embedding,
+    SUPERSEDES_DEPTH_CAP, _fused_recall, apply_link_semantics, embeddings_enabled,
+    schedule_embedding,
 )
+from claude_memory.embeddings import select_embedder
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -46,9 +49,29 @@ logger = logging.getLogger(__name__)
 _current_user: ContextVar[str] = ContextVar("_current_user", default="default")
 
 
+async def _warm_embedder() -> None:
+    """Load the dense-leg embedding model ONCE at startup (best-effort).
+
+    ``select_embedder`` caches a process singleton, but the model still loads lazily on
+    the first embed. Doing that here — before the pod serves traffic — keeps the first
+    real recall from paying the ~2-4s cold model load and removes any first-hit load
+    race between concurrent recalls. Guarded: recall already degrades to lexical on any
+    dense-leg failure (api/recall.py), so a warmup failure must never block or crash
+    startup. No-op when the dense leg is disabled.
+    """
+    if not embeddings_enabled():
+        return
+    try:
+        await asyncio.to_thread(select_embedder().embed_query, "warmup")
+        logger.info("dense-leg embedder warmed at startup (model resident)")
+    except Exception as exc:  # noqa: BLE001 - best-effort; recall degrades to lexical
+        logger.warning("embedder warmup failed; recall will degrade to lexical: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_pool()
+    await _warm_embedder()
     async with streamable_session_mgr.run():
         yield
     await close_pool()
