@@ -339,8 +339,8 @@ def test_onnx_satisfies_the_embedder_protocol() -> None:
 
 
 def test_every_provider_maps_to_a_baked_graph() -> None:
-    """The image bakes one fp16 graph; if a provider is added to the default list its
+    """The image bakes one gated graph; if a provider is added to the default list its
     graph must be baked too, or the pod fails at first embed rather than at build."""
     for provider in emb.ONNX_PROVIDERS_DEFAULT.split(","):
         assert provider.strip() in emb.ONNX_FILE_BY_PROVIDER
-    assert set(emb.ONNX_FILE_BY_PROVIDER.values()) == {"model_fp16.onnx"}
+    assert set(emb.ONNX_FILE_BY_PROVIDER.values()) == {"model.onnx"}

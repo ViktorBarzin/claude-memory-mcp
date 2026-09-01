@@ -21,7 +21,7 @@ build unless every probe clears MIN_COSINE. A graph that would rank badly can no
 reach a registry.
 
 Output, into $OUT_DIR:
-  model_fp16.onnx       half-precision graph, what the CUDA provider loads
+  model.onnx            the gated graph (plus model.onnx_data when split)
   tokenizer.json        the fast tokenizer, loaded directly by `tokenizers`
 """
 
@@ -104,21 +104,18 @@ def _only_onnx(directory: Path) -> Path:
     return graphs[0]
 
 
-def _stage(src_dir: Path, graph: Path, name: str) -> Path:
-    """Copy a graph plus the tokenizer into a directory the embedder can load.
+def _stage(src_dir: Path) -> Path:
+    """Copy the exported graph and a tokenizer into a directory the embedder can load.
 
-    Every ``.onnx*`` file keeps its ORIGINAL name, and the graph is then additionally
-    copied to the name production expects. A large export is split into ``model.onnx``
-    plus ``model.onnx_data``, and that reference is stored INSIDE the graph by filename:
-    renaming the graph alone leaves it pointing at a data file that is not there, which
-    fails with "External data path does not exist". Keeping both names side by side lets
-    the reference resolve while still presenting the filename the embedder loads.
+    Names are preserved exactly. A large export is split into ``model.onnx`` plus
+    ``model.onnx_data``, and that reference is stored INSIDE the graph by filename, so
+    renaming the graph leaves it pointing at a data file that is not there. Production
+    loads ``model.onnx`` for the same reason: no renaming anywhere in the pipeline.
     """
-    staged = WORK / f"staged-{name}"
+    staged = WORK / "staged"
     staged.mkdir(parents=True, exist_ok=True)
     for original in src_dir.glob("*.onnx*"):
         shutil.copyfile(original, staged / original.name)
-    shutil.copyfile(graph, staged / "model_fp16.onnx")
     from transformers import AutoTokenizer
 
     AutoTokenizer.from_pretrained(MODEL).save_pretrained(staged)
@@ -138,39 +135,16 @@ def main() -> int:
     print(f"[export] tracing {MODEL} to ONNX", flush=True)
     ORTModelForFeatureExtraction.from_pretrained(MODEL, export=True).save_pretrained(fp32_dir)
 
-    # Gate fp32 FIRST. If this fails, the export itself is wrong and no choice of
-    # precision downstream can rescue it — which is precisely the question the first
-    # failed attempt left open.
-    _check(_stage(fp32_dir, _only_onnx(fp32_dir), "fp32"), "fp32 export", reference)
+    # fp32 is what ships. fp16 was attempted and abandoned on 2026-09-01: converting this
+    # graph with onnxconverter_common fails both ways round. With shape inference on it
+    # cannot serialise, because the fp32 model is ~2.4 GB and protobuf refuses past 2 GB;
+    # with inference off the converter cannot place casts and emits a type-inconsistent
+    # graph that onnxruntime rejects at load ("Type parameter (T) of Optype (Add) bound to
+    # different types"). A T4 runs fp32 on a 0.6B model comfortably, and this artifact is
+    # the one the gate has actually accepted, so it is worth the larger image.
+    _check(_stage(fp32_dir), "fp32 export", reference)
 
-    print("[export] converting to fp16", flush=True)
-    import onnx
-    from onnxconverter_common import float16
-
-    fp16_dir = WORK / "fp16"
-    fp16_dir.mkdir(parents=True, exist_ok=True)
-    model = onnx.load(str(_only_onnx(fp32_dir)))
-    # keep_io_types: inputs/outputs stay fp32 so the production feed and the pooling code
-    # need no change; only the internal weights and maths become half precision.
-    # External data, not one file: protobuf refuses to serialize past 2 GB, and the
-    # converted graph retains enough fp32 (convert_float_to_float16 leaves blocked ops
-    # alone) to cross it. The sidecar is named to match the graph, so the reference
-    # inside it resolves wherever the pair is copied.
-    onnx.save(
-        # disable_shape_infer: convert_float_to_float16 runs onnx.shape_inference by
-        # default, which serialises the whole model in memory. This graph is ~2.4 GB in
-        # fp32, past protobuf's 2 GB message ceiling, so leaving inference on fails with
-        # "Failed to serialize proto" before any conversion happens.
-        float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True),
-        str(fp16_dir / "model_fp16.onnx"),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location="model_fp16.onnx_data",
-        size_threshold=1024,
-    )
-    _check(_stage(fp16_dir, fp16_dir / "model_fp16.onnx", "fp16"), "fp16 graph", reference)
-
-    for produced in fp16_dir.glob("*.onnx*"):
+    for produced in fp32_dir.glob("*.onnx*"):
         shutil.copyfile(produced, OUT_DIR / produced.name)
     AutoTokenizer.from_pretrained(MODEL).save_pretrained(OUT_DIR)
     if not (OUT_DIR / "tokenizer.json").exists():

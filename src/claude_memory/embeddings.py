@@ -89,11 +89,19 @@ ONNX_PROVIDERS_DEFAULT = "CPUExecutionProvider"
 #: looking healthy. The exporter now gates fidelity at >=0.99 before a graph can be
 #: baked, so a repeat cannot reach a registry.
 #:
-#: fp16 is the T4's natural precision. The CPU fallback loads the same graph; onnxruntime
-#: inserts casts and runs it more slowly, which is acceptable for a degraded path.
+#: fp16 was then attempted and abandoned the same day: converting a graph this size with
+#: onnxconverter_common fails whichever way round it is run — with shape inference on it
+#: cannot serialise (the fp32 model is ~2.4 GB, past protobuf's 2 GB ceiling), and with
+#: inference off the converter cannot place casts and emits a graph onnxruntime rejects at
+#: load. So fp32 ships. A T4 runs fp32 on a 0.6B model comfortably, and it is the artifact
+#: the fidelity gate has actually accepted, at cosine 1.00000 on every probe.
+#:
+#: The filename is the exporter's own, unrenamed: a large export splits into
+#: ``model.onnx`` plus ``model.onnx_data`` and stores that reference inside the graph by
+#: filename, so renaming it anywhere breaks the pair.
 ONNX_FILE_BY_PROVIDER = {
-    "CUDAExecutionProvider": "model_fp16.onnx",
-    "CPUExecutionProvider": "model_fp16.onnx",
+    "CUDAExecutionProvider": "model.onnx",
+    "CPUExecutionProvider": "model.onnx",
 }
 
 #: Selects the backend explicitly. Unset keeps the historical rule (Voyage when keyed,

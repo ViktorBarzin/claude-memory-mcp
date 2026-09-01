@@ -13,7 +13,7 @@ FROM python:3.12-slim AS exporter
 
 RUN pip install --no-cache-dir \
       "optimum[onnxruntime]>=1.24" "transformers>=4.45" "torch>=2.4" \
-      "sentence-transformers>=3.0" "onnxconverter-common>=1.14" "tokenizers>=0.20" \
+      "sentence-transformers>=3.0" "tokenizers>=0.20" \
       --extra-index-url https://download.pytorch.org/whl/cpu
 
 # The gate runs the REAL embedder, so the package has to be importable here.
