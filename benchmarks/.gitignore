@@ -24,6 +24,11 @@ triples_*.jsonl
 # LOCAL-ONLY, never commit. Regenerates data/ from corpus.jsonl. The HARNESS
 # itself (harness/*.py, the other scripts) contains NO real content and is safe.
 scripts/build_eval_set.py
+# Same reason: the Cyrillic generator embeds the authored query TEXT plus notes
+# describing what each target memory says, so it is memory-derived content and
+# local-only. The pattern is a glob rather than a filename so the next eval-set
+# generator is covered by default instead of needing someone to remember.
+scripts/build_*_eval_set.py
 
 # Python noise
 __pycache__/

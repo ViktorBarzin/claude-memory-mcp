@@ -73,9 +73,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--k", type=int, default=20)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="alternate eval set (corpus/queries/qrels .jsonl); default is benchmarks/data",
+    )
     args = parser.parse_args()
 
-    dataset = load_dataset()
+    if args.data_dir:
+        dataset = load_dataset(
+            corpus_path=args.data_dir / "corpus.jsonl",
+            queries_path=args.data_dir / "queries.jsonl",
+            qrels_path=args.data_dir / "qrels.jsonl",
+        )
+    else:
+        dataset = load_dataset()
     print(f"corpus {len(dataset.corpus)} docs, {len(dataset.queries)} queries", flush=True)
 
     retriever = OnnxHybridRetriever()
@@ -92,6 +105,7 @@ def main() -> int:
     # separately so the multilingual claim is measured rather than assumed.
     cyr = [q.query_id for q in dataset.queries if CYRILLIC.search(q.text)]
     payload["cyrillic_query_ids"] = cyr
+    payload["data_dir"] = str(args.data_dir) if args.data_dir else "benchmarks/data"
     if not cyr:
         payload["cyrillic_note"] = (
             "The preserved eval set contains no Cyrillic queries (its corpus snapshot has 28 "
