@@ -1,6 +1,6 @@
 # Plan: GPU-served query embeddings for claude-memory recall
 
-**Status:** approved, not started · **Date:** 2026-08-31 · **Owner:** Viktor Barzin
+**Status:** done · **Date:** 2026-08-31, execution log 2026-09-01 · **Owner:** Viktor Barzin
 
 Recall currently spends most of its time embedding the query on a CPU, and about
 one recall in fifteen takes longer than the client is willing to wait. This plan
@@ -14,7 +14,7 @@ corpus.
 0.95 s | recall p50
 4.98 s | recall p90
 6.5 % | recalls lost to the 6 s deadline
-9.2 % | memories containing Cyrillic
+6.1 % | memories containing Cyrillic
 ```
 
 Measured on 2026-08-31 from the live pod and Prometheus, over 647 recalls across
@@ -53,11 +53,15 @@ deadline that contention on this scale would not reach it.
 
 ### A quality gap, separate from speed
 
-`BAAI/bge-large-en-v1.5` is an English-only model. A 400-memory sample found
-**9.2 % of memories contain Cyrillic**, mostly Bulgarian technical notes. Those
-are currently embedded by a model with no representation for them, which the
-lexical leg partly covers and the dense leg does not. Changing model addresses
-this independently of latency.
+`BAAI/bge-large-en-v1.5` is an English-only model. Counted across the whole
+corpus on 2026-09-01, **663 of 10,914 memories (6.1 %) contain Cyrillic**,
+mostly Bulgarian technical notes, and the share is rising: **16.5 % of the 400
+most recent**. Those are currently embedded by a model with no representation
+for them, which the lexical leg partly covers and the dense leg does not.
+Changing model addresses this independently of latency.
+
+(An earlier draft said 9.2 %, from a 400-memory sample rather than the full
+count. 6.1 % is the corpus figure and 16.5 % the recent rate.)
 
 The dense leg is worth keeping. `memory_recall_dense_only_top5_total` is 672
 against 647 recalls, so on average more than one served top-5 result per recall
@@ -70,7 +74,7 @@ Settled in the grilling session of 2026-08-31.
 | # | Decision | Rationale |
 |---|---|---|
 | 1 | VRAM governance is out of scope | Handled by a separate agent. This plan treats free VRAM as a precondition for its final step only. |
-| 2 | Model becomes `Qwen/Qwen3-Embedding-0.6B` | Native 1024-d, so `halfvec(1024)` and the HNSW index are unchanged. Apache-2.0. Multilingual, which addresses the 9.2 %. 509M parameters. |
+| 2 | Model becomes `Qwen/Qwen3-Embedding-0.6B` | Native 1024-d, so `halfvec(1024)` and the HNSW index are unchanged. Apache-2.0. Multilingual, which addresses the 6.1 %. 509M parameters. |
 | 3 | Serving is in-process `onnxruntime-gpu` | One library, one model artifact, provider list `CUDA` then `CPU`. `torch` and `sentence-transformers` are removed. Chosen for simplicity over a separate TEI service, accepting that requesting a GPU hard-pins the pod to node1. |
 | 4 | CPU fallback is the same ONNX model on the CPU provider | One vector space, no ranking incoherence, and the fallback is the same code path with a different provider. |
 | 5 | Re-embed is in-place over the existing column | No schema change is needed at 1024-d. |
@@ -187,6 +191,164 @@ Recall p90 above 500 ms, and any fallback-to-CPU serving, into `#alerts`. The
 `memory_recall_seconds` histogram already exists and is scraped; nothing
 references it yet.
 
+## Execution log, 2026-09-01
+
+| Step | State |
+|---|---|
+| ONNX backend + 20 tests | landed, `claude-memory-mcp d740f6c` |
+| Image: exporter stage, torch removed | landed, building on GHA |
+| Pod on `k8s-node1` with `gpu=1 gpumem=1200` | live, `infra b6e3fbea` |
+| Recall alerting (4 rules) | live, `infra 4fc234da` |
+| First deployed image | **rejected on measurement**, see below |
+| Re-embed | not run, deliberately |
+| Eval gate | not run |
+| Dense leg | `MEMORY_EMBEDDINGS_ENABLED=0`, the cutover state |
+
+### Done, 2026-09-01
+
+Live and measured through the real CLI path — full recall including HTTP, GPU
+embed, vector search, fusion and link semantics:
+
+| query | recall time |
+|---|---|
+| "which DNS server do we use at home" | 0.11 s |
+| "how do I stop a GPU tenant eating all the VRAM" | 0.14 s |
+| "what breaks when the loader path is wrong" | 0.17 s |
+| "кой DNS сървър използваме" | 0.10 s |
+
+| | before | after |
+|---|---|---|
+| recall p50 | 0.95 s | ~0.12 s |
+| recall p90 | 4.98 s | under the 0.5 s alert threshold |
+| recalls past the 6 s hook deadline | 6.5 % | none at these latencies |
+| query embed | 250-900 ms (CPU) | 21-27 ms (T4) |
+
+Backfill: 10,892 of 10,892 non-sensitive memories in 22.8 minutes at 8.0/s, zero
+sensitive rows embedded, `memory_embeddings_pending` back to 0, and rows at both
+ends of the id range reproducing a fresh Qwen embed at cosine 1.00000.
+
+Serving verified by the `provider` label rather than by inference:
+`memory_embed_seconds{provider="cuda"}` is populated and
+`memory_embed_fallbacks_total` has no series at all.
+
+**The eval gate passed as parity, not improvement.** A paired bootstrap against
+the stored bge baseline puts every metric's 95 % CI across zero in every stratum
+(recall@5 −0.0015, nDCG@10 +0.0091, MRR +0.0132). The apparent −0.025 paraphrase
+dip and +0.021 multihop gain are both inside noise on 40-query strata. So the
+swap is justified by latency and language coverage, not by English retrieval
+quality.
+
+**What is still unproven.** The multilingual gain, which is what drove the model
+choice, remains unmeasured: the preserved 119-query eval set contains no Cyrillic
+queries. Building that stratum is the honest follow-up, and until it exists the
+6.1 % Cyrillic argument is a reasoned expectation rather than a result.
+
+### Measured on the T4, 2026-09-01
+
+The GPU serves. All figures from the deployed pod, same graph, same probes.
+
+| path | embed p50 | host RSS | VRAM |
+|---|---|---|---|
+| **CUDA (primary)** | **21-24 ms** | 1,062 MiB | 3,212 MiB under load |
+| CPU (fallback) | 595 ms | 1,877 MiB | none |
+| bge-large on CPU torch (what production ran) | 250-900 ms | ~1.8 GiB | none |
+
+So the primary path is 10-40x the outgoing one, and the fallback lands at about
+today's production performance rather than worse — which is what makes the
+CPU-fallback choice hold up.
+
+**Every GPU failure had one cause: `LD_LIBRARY_PATH` was unset.** The nvidia pip
+wheels install their shared objects under `site-packages/nvidia/<lib>/lib/`,
+which is not on the default loader path, so onnxruntime could not `dlopen` its
+own CUDA provider. It reported `libcublasLt.so.NN: cannot open shared object
+file` and silently served on the CPU. `find` located the library exactly where
+the wheel puts it while the loader path was empty. Fixed with
+`ort.preload_dlls()` rather than a hand-set path.
+
+That correction matters for two earlier conclusions on this page. The
+onnxruntime version pin was right for a different reason than diagnosed (1.29
+targets CUDA 13, node1 runs 12.8), and the claim that ORT's `[cuda,cudnn]`
+extras omit cuBLAS was probably wrong — the operative fault was always the
+loader path. Both were diagnosed from error text rather than from checking
+whether the file existed.
+
+**VRAM, measured rather than estimated.** With the model resident the pod reads
+3,260 MiB, so the 3,200 declaration was 60 MiB *under* actual — it would have
+left claude-memory permanently over budget and therefore the watchdog's first
+recycle candidate under contention. Now declared at 4,000 (~23% margin).
+Sampling note: the pod reads ~100 MiB, the CUDA context alone, until the model
+actually loads.
+
+**A fallback bug worth recording.** `_primary()` retried a failed provider on
+every embed, and only successes were cached — so with CUDA unavailable each call
+rebuilt the 2.4 GB session purely to raise again. Measured 12.4 s per row, which
+would have made this backfill 37 hours. Found by dry-running five rows, not by
+reading the code. Failures are now cached alongside sessions.
+
+**One outage, self-inflicted.** Raising the container memory limit to 6 GiB
+exceeded the tier-4-aux LimitRange ceiling of 4 GiB, so no pod could be created
+and the service had zero pods for about six minutes. `terraform validate` passes
+on a value admission will reject. The limit is 4 GiB, which measurement shows is
+enough for both paths.
+
+### The first image was wrong three ways
+
+Deployed, measured, and rejected before it served anything. The dense leg stayed
+off throughout and the re-embed never ran, so the stored bge vectors are intact
+and recall has been on the lexical path.
+
+**The GPU was never used.** onnxruntime-gpu 1.29 failed to load its CUDA provider
+(`libcublasLt.so.13: cannot open shared object file`). Releases from 1.27 are
+built against CUDA 13; node1 runs driver 570 with CUDA 12.8. Measured speedup was
+1.0x, because both "providers" ran on the CPU. Fixed by pinning to 1.26.x, the
+last release built for CUDA 12.8.
+
+**The provider metric reported a GPU that was not serving.** onnxruntime does not
+raise when a requested provider is unavailable; it logs a warning, falls back to
+CPU, and returns a working session. Treating construction success as proof of
+serving would have held `memory_embed_fallbacks_total` at zero and made the new
+fallback alert unfireable. The embedder now believes `get_providers()`. The unit
+test missed it because the fake raised where the real library does not, so the
+fake now models both behaviours.
+
+**The int8 graph produced unusable vectors.** Cosine 0.16-0.37 against the
+sentence-transformers reference for identical text, where a faithful export
+scores above 0.99, with the embedding space collapsed into a 0.89-0.95 band that
+fp32 separates as 0.571 against 0.205. Every cheap check passed on those vectors:
+1024 dimensions, unit norm, correct conventions, plausible latency.
+
+The last one changed how this ships. The exporter now computes reference vectors
+with sentence-transformers, embeds the same probes through the production
+embedder rather than a reimplementation, and **fails the build** unless every
+probe clears 0.99. It gates fp32 first, which answers whether the export or the
+quantisation was at fault, then gates fp16 and bakes that. Probes include
+Bulgarian. The graph is fp16 rather than int8, so `gpumem` moves 1,200 to 2,000.
+
+Four things the plan got wrong, corrected here rather than left standing.
+
+**ADR-0016 is fully deployed.** The plan said decisions 2 and 3 were never built.
+`gpu-vram-watchdog` runs as a Deployment in the `nvidia` namespace with
+`DRY_RUN=false` and `FLOOR_MIB=1536`, and the alerting exists as Loki rules. The
+original check looked only at CronJobs in that namespace, which the watchdog is
+not.
+
+**No capacity change was needed.** The 2026-08-31 re-basing of every tenant to
+measured footprints had already dropped declared budgets to 7,684 of the 14,000
+advertised, so 1,200 fit in existing headroom. Advertised capacity stays at
+14,000 and the driver reserve is untouched.
+
+**The image grows rather than shrinks.** Removing CPU torch saves roughly 800 MB,
+but onnxruntime's CUDA and cuDNN libraries are 1.4 GB of wheels. Only the int8
+graph is baked; fp16 for CUDA would add ~1.2 GB and waits on a measurement.
+
+**The eval gate cannot measure the multilingual claim.** Memory ids were
+reassigned after the eval set was built in June, so its qrels no longer join to
+the live store; they remain self-consistent with the preserved corpus snapshot,
+which is what the gate scores. That snapshot contains 28 Cyrillic documents out
+of 5,452 and no Cyrillic queries at all. So the gate can show whether Qwen3
+regresses English retrieval, and cannot yet show the multilingual gain. Measuring
+that needs an eval set rebuilt against current ids.
+
 ## Correctness risks
 
 > [!WARNING]
@@ -215,7 +377,9 @@ references it yet.
   numbers.
 - The 1,200 MiB budget is an estimate. onnxruntime's CUDA arena behaviour on a T4
   under this workload is unmeasured, and the declaration is a hard reservation.
-- The 9.2 % Cyrillic share comes from a 400-memory sample, not all 10,890.
+- The Cyrillic share is now counted across the full corpus (6.1 %), not
+  sampled. What is still unmeasured is how much recall quality that actually
+  costs today, which the new `cyrillic` eval stratum is there to answer.
 - Whether the p90 tail above 6 s is fully explained by CPU contention. The GPU
   move should make it moot either way, and the `provider` label will show if
   something else is contributing.
