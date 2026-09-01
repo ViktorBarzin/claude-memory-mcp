@@ -35,6 +35,13 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY src/ src/
 COPY migrations/ migrations/
 
+# nvidia-cublas-cu12 is listed EXPLICITLY because onnxruntime does not depend on it.
+# Its [cuda,cudnn] extras pull nvrtc, cuda-runtime, cufft, curand and cudnn — and not
+# cuBLAS, which the CUDA execution provider nonetheless links. Measured twice: the
+# provider failed to load with "libcublasLt.so.13: cannot open shared object file" on
+# ORT 1.29 and again with "libcublasLt.so.12" on 1.26, and in both cases onnxruntime
+# silently served every embed on the CPU rather than erroring.
+#
 # onnxruntime-gpu is PINNED to 1.26.x on purpose. From 1.27 the GPU wheel is built
 # against CUDA 13, and k8s-node1 runs driver 570 / CUDA 12.8 — 1.29 installed cleanly and
 # then failed at runtime with "libcublasLt.so.13: cannot open shared object file",
@@ -43,7 +50,8 @@ COPY migrations/ migrations/
 # container runtime injects only the driver. One wheel serves both the GPU path and its
 # CPU fallback. No torch, no sentence-transformers.
 RUN pip install --no-cache-dir ".[api]" \
-    && pip install --no-cache-dir "onnxruntime-gpu[cuda,cudnn]~=1.26.0" "tokenizers>=0.20" "numpy>=1.26"
+    && pip install --no-cache-dir "onnxruntime-gpu[cuda,cudnn]~=1.26.0" \
+         "nvidia-cublas-cu12~=12.0" "tokenizers>=0.20" "numpy>=1.26"
 
 # The gated graph + tokenizer, baked in: a pod start needs no network and no PVC, and the
 # model version is pinned by the image tag rather than by whatever the Hub serves.
