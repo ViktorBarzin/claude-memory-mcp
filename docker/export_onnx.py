@@ -157,7 +157,11 @@ def main() -> int:
     # alone) to cross it. The sidecar is named to match the graph, so the reference
     # inside it resolves wherever the pair is copied.
     onnx.save(
-        float16.convert_float_to_float16(model, keep_io_types=True),
+        # disable_shape_infer: convert_float_to_float16 runs onnx.shape_inference by
+        # default, which serialises the whole model in memory. This graph is ~2.4 GB in
+        # fp32, past protobuf's 2 GB message ceiling, so leaving inference on fails with
+        # "Failed to serialize proto" before any conversion happens.
+        float16.convert_float_to_float16(model, keep_io_types=True, disable_shape_infer=True),
         str(fp16_dir / "model_fp16.onnx"),
         save_as_external_data=True,
         all_tensors_to_one_file=True,
