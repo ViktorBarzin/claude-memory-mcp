@@ -216,7 +216,12 @@ async def test_recall_or_broadening_is_relevance_bounded(client):
     assert len(conn.fetch.call_args_list) == 3, "AND, OR-broadening, then the links batch"
     or_sql = conn.fetch.call_args_list[1].args[0]
     assert "ts_rank(search_vector, query) DESC" in or_sql, "OR matches must be ordered by relevance"
-    assert "ts_rank(search_vector, query) >" in or_sql, "OR matches must have a minimum-rank floor"
+    # The floor is enforced in Python rather than as a WHERE predicate — see
+    # test_or_broaden_sql_has_no_rank_floor_predicate for why, and
+    # test_or_broaden_still_drops_sub_floor_rows for the behaviour it preserves.
+    from claude_memory.api import recall as recall_mod
+
+    assert recall_mod.OR_BROADEN_MIN_RANK > 0, "OR matches must have a minimum-rank floor"
 
 
 @pytest.mark.asyncio
@@ -1158,7 +1163,9 @@ async def test_fused_recall_flags_off_or_broaden_preserved():
     assert conn.fetch.call_count == 2, "OR-broaden must still fire when AND-match is sparse"
     or_sql = conn.fetch.call_args_list[1].args[0]
     assert "ts_rank(search_vector, query) DESC" in or_sql
-    assert "ts_rank(search_vector, query) >" in or_sql
+    # The relevance floor moved from this WHERE clause into Python (same rows, one
+    # ts_rank evaluation per row instead of two) — the row set below is what matters.
+    assert recall_mod.OR_BROADEN_MIN_RANK > 0
     assert {r["id"] for r in out} == {1, 2}
 
 
@@ -1628,3 +1635,97 @@ async def test_link_create_increments_counter(client):
             )
     assert resp.status_code == 200
     assert _sample("memory_links_created_total", {"link_type": "see-also"}) == before + 1
+
+
+# ── OR-broaden cost (2026-09-01) ─────────────────────────────────────────────
+# EXPLAIN ANALYZE on the live store showed the broaden was a SEQUENTIAL SCAN
+# computing ts_rank on all ~11k rows — 536ms of a 548ms query — because a long
+# prompt ORs enough terms to match 95% of the corpus, at which point a seq scan
+# genuinely is cheaper than the GIN index. Two changes cut that without altering
+# a single returned row:
+#
+#   * the rank floor moved out of the WHERE clause. Ordering by rank DESC and
+#     taking the top N, then dropping sub-floor rows in Python, is EXACTLY
+#     equivalent: if >=N rows clear the floor the top N all clear it, and if
+#     fewer do, the Python filter removes the same rows the SQL predicate would.
+#     Postgres had been evaluating ts_rank twice per row, once to filter and
+#     once to sort.
+#   * duplicate tokens are dropped. `a | a` is the same tsquery as `a`, so this
+#     one is free by construction.
+#
+# Measured over the 25 real prompts (of 40 sampled) carrying >=20 terms:
+# 135.1ms -> 84.3ms mean, identical top-10 on 25 of 25. The worst prompt, at
+# 124 terms, went 416ms -> 287ms.
+
+
+@pytest.mark.asyncio
+async def test_or_broaden_sql_has_no_rank_floor_predicate(client):
+    """The floor must NOT be a WHERE predicate — that is the double ts_rank."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [],                          # AND-match: sparse -> OR-broaden fires
+        [_make_memory_row(id=2)],    # OR-broaden result
+        [],                          # memory_links batch
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "two words"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    or_sql = conn.fetch.call_args_list[1].args[0]
+    assert "ts_rank(search_vector, query) DESC" in or_sql, "still ordered by relevance"
+    assert "ts_rank(search_vector, query) >" not in or_sql, (
+        "the rank floor must not be a WHERE predicate — Postgres then evaluates "
+        "ts_rank once to filter and again to sort, over a full sequential scan"
+    )
+
+
+@pytest.mark.asyncio
+async def test_or_broaden_still_drops_sub_floor_rows(client):
+    """Moving the floor must not stop it being enforced."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [],  # AND-match: sparse -> OR-broaden fires
+        [    # OR-broaden: one relevant row, one sharing only a stray word
+            _make_memory_row(id=2, rank=0.4),
+            _make_memory_row(id=3, rank=0.0001),
+        ],
+        [],  # memory_links batch
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "two words"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    ids = [m["id"] for m in resp.json()["memories"]]
+    assert ids == [2], "the sub-floor row must still be dropped, just in Python"
+
+
+@pytest.mark.asyncio
+async def test_or_broaden_dedupes_repeated_tokens(client):
+    """`a | a | b` is the same tsquery as `a | b`, and costs less to run."""
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [],  # AND-match: sparse -> OR-broaden fires
+        [],  # OR-broaden
+    ]
+
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "recall recall latency Recall"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert resp.status_code == 200
+    assert conn.fetch.call_args_list[1].args[2] == "recall | latency", (
+        "repeated tokens must collapse, case-insensitively, keeping first-seen order"
+    )

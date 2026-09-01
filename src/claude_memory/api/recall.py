@@ -69,6 +69,12 @@ _DENSE_LIMIT = 50
 #: to fill results, but only with rows whose relevance (ts_rank) clears this floor. Below
 #: it a row merely contains one query word incidentally — noise. Shared by both entry
 #: points so the lexical behaviour cannot drift between them.
+#:
+#: Applied in Python, AFTER the query's ``ORDER BY rank DESC ... LIMIT``, which is exactly
+#: equivalent to filtering in SQL: when at least ``limit`` rows clear the floor the top
+#: ``limit`` by rank all clear it, and when fewer do the Python filter drops precisely the
+#: rows the WHERE predicate would have. As a WHERE predicate it made Postgres evaluate
+#: ts_rank twice for every candidate row, once to filter and once to sort.
 OR_BROADEN_MIN_RANK = 0.01
 
 # ── Link semantics (ADR-0007) ────────────────────────────────────────────────
@@ -91,9 +97,28 @@ _TSQUERY_STRIP_TABLE = str.maketrans("", "", "&|!():*'\"<>[]{}")
 
 
 def _sanitize_tsquery_tokens(words: list[str]) -> list[str]:
-    """Strip tsquery metacharacters from each token and drop empties."""
+    """Strip tsquery metacharacters from each token, drop empties, drop repeats.
+
+    Deduplication is free by construction: ``a | a`` is the same tsquery as ``a``, so
+    collapsing repeats cannot change which rows match or how they rank. It does shrink
+    the query Postgres has to evaluate — a long prompt repeats common words heavily
+    (one real 124-term prompt carried ``question`` four times and ``one`` five), and
+    every duplicate is another term the OR has to scan for.
+
+    First-seen order is kept so the tsquery stays readable in a log line or an EXPLAIN.
+    """
     cleaned = (w.translate(_TSQUERY_STRIP_TABLE) for w in words)
-    return [w for w in cleaned if w]
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in cleaned:
+        if not w:
+            continue
+        key = w.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+    return out
 
 
 def _flag_on(env_name: str) -> bool:
@@ -193,7 +218,6 @@ async def _lexical_recall(
                     FROM memories, to_tsquery('english', $2) query
                     WHERE deleted_at IS NULL
                       AND search_vector @@ query
-                      AND ts_rank(search_vector, query) > {OR_BROADEN_MIN_RANK}
                       {or_cat_filter}
                     ORDER BY ts_rank(search_vector, query) DESC
                     LIMIT $3
@@ -207,7 +231,14 @@ async def _lexical_recall(
                     exc,
                 )
                 or_rows = []
-            all_rows = all_rows + [r for r in or_rows if r["id"] not in seen_ids]
+            # The relevance floor, applied here rather than in the WHERE clause — see
+            # OR_BROADEN_MIN_RANK for why the two are equivalent and why this one is
+            # cheaper. `rank` is NULL-free: the query always selects ts_rank.
+            all_rows = all_rows + [
+                r
+                for r in or_rows
+                if r["id"] not in seen_ids and r["rank"] > OR_BROADEN_MIN_RANK
+            ]
             all_rows = all_rows[:limit]
 
     return all_rows
