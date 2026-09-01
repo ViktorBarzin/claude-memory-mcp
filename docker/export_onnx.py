@@ -152,10 +152,17 @@ def main() -> int:
     model = onnx.load(str(_only_onnx(fp32_dir)))
     # keep_io_types: inputs/outputs stay fp32 so the production feed and the pooling code
     # need no change; only the internal weights and maths become half precision.
+    # External data, not one file: protobuf refuses to serialize past 2 GB, and the
+    # converted graph retains enough fp32 (convert_float_to_float16 leaves blocked ops
+    # alone) to cross it. The sidecar is named to match the graph, so the reference
+    # inside it resolves wherever the pair is copied.
     onnx.save(
         float16.convert_float_to_float16(model, keep_io_types=True),
         str(fp16_dir / "model_fp16.onnx"),
-        save_as_external_data=False,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location="model_fp16.onnx_data",
+        size_threshold=1024,
     )
     _check(_stage(fp16_dir, fp16_dir / "model_fp16.onnx", "fp16"), "fp16 graph", reference)
 
