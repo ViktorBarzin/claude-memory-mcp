@@ -35,7 +35,7 @@ from claude_memory.api.recall import (
     SUPERSEDES_DEPTH_CAP, _fused_recall, apply_link_semantics, embeddings_enabled,
     schedule_embedding,
 )
-from claude_memory.embeddings import select_embedder
+from claude_memory.embeddings import select_embedder, set_embed_observer
 from claude_memory.api.vault_service import (
     delete_secret,
     get_secret,
@@ -47,6 +47,19 @@ logger = logging.getLogger(__name__)
 
 # Context variable for MCP SSE multi-user support
 _current_user: ContextVar[str] = ContextVar("_current_user", default="default")
+
+
+def _record_embed(provider: str, seconds: float, fell_back_from: str | None) -> None:
+    """Observer for the ONNX backend: which execution provider served, and how long.
+
+    Registered at startup so ``claude_memory.embeddings`` never imports ``api.metrics``
+    — that module has to keep importing with no optional extras installed (ADR-0002).
+    A non-zero ``memory_embed_fallbacks_total`` rate is the signal that the GPU path is
+    degraded and the CPU fallback is carrying recall.
+    """
+    metrics.EMBED_LATENCY.labels(provider=provider).observe(seconds)
+    if fell_back_from is not None:
+        metrics.EMBED_FALLBACKS.labels(from_provider=fell_back_from, to_provider=provider).inc()
 
 
 async def _warm_embedder() -> None:
@@ -62,8 +75,9 @@ async def _warm_embedder() -> None:
     if not embeddings_enabled():
         return
     try:
-        await asyncio.to_thread(select_embedder().embed_query, "warmup")
-        logger.info("dense-leg embedder warmed at startup (model resident)")
+        embedder = select_embedder()
+        await asyncio.to_thread(embedder.embed_query, "warmup")
+        logger.info("dense-leg embedder warmed at startup (%s, model resident)", embedder.backend_label)
     except Exception as exc:  # noqa: BLE001 - best-effort; recall degrades to lexical
         logger.warning("embedder warmup failed; recall will degrade to lexical: %s", exc)
 
@@ -71,6 +85,7 @@ async def _warm_embedder() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_pool()
+    set_embed_observer(_record_embed)
     await _warm_embedder()
     async with streamable_session_mgr.run():
         yield
