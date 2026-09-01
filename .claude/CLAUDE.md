@@ -79,6 +79,16 @@ The last line is the check: the path it prints must contain `.worktrees/`.
   (`a | a` is the same tsquery as `a`). Capping the term COUNT is not in that class — it
   changes which rows come back, and `benchmarks/data` tops out at 19 terms so the offline
   eval cannot measure the long-prompt regime a cap would affect.
+- **Capping the OR-broaden's term count was measured and DECLINED on 2026-09-01. Don't
+  re-propose it without new relevance evidence.** Measured over 40 real prompts through the
+  full fused path, with query vectors embedded once so every arm shared identical dense
+  input. Against the uncapped baseline: a 48-term cap moved the fused top-5 on 4 of 40
+  prompts for 12 ms of p90, a 32-term cap on 6 of 40 for 97 ms, a 20-term cap on **14 of
+  40** for 102 ms. Warm p90 uncapped is 203 ms while the live p90 is ~1,050 ms and the alert
+  fires at 2,500 ms, so nearly all of the live tail is cold-start rather than this query and
+  a cap cannot reach it. Beware measuring the lexical leg alone: in isolation a 20-term cap
+  looks like 287 ms → 66 ms and only 10-of-25 row identity, both of which overstate the case
+  because the dense leg absorbs much of the change and pays none of the cost.
 
 ## CI/CD
 - **Build**: GitHub Actions → `ghcr.io/viktorbarzin/claude-memory-mcp` (ADR-0002, off-infra;
