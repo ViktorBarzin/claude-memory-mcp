@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-api = ["fastapi>=0.115", "asyncpg>=0.30", "uvicorn>=0.34", "pydantic>=2.0", "alembic>=1.14", "sqlalchemy>=2.0", "psycopg2-binary>=2.9", "mcp>=1.0.0", "prometheus-client>=0.20"]
+api = ["fastapi>=0.115", "asyncpg>=0.30", "uvicorn>=0.34", "pydantic>=2.0", "alembic>=1.14", "sqlalchemy>=2.0", "psycopg2-binary>=2.9", "mcp>=1.0.0,<2", "prometheus-client>=0.20"]
 vault = ["hvac>=2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "httpx>=0.28", "cryptography>=43.0", "hypothesis>=6.0"]
 # PRODUCTION dense-embedding backends (src/claude_memory/embeddings.py). OPTIONAL —
@@ -54,6 +54,14 @@ packages = ["src/claude_memory"]
 target-version = "py311"
 line-length = 120
 
+# Pin the RULE SET, not the ruff version. This repo previously relied on ruff's implicit
+# defaults, so ruff 0.16 widening those defaults turned CI red (214 findings across code
+# that had not changed) without any commit causing it. These four are exactly the
+# historical default set — pycodestyle errors plus pyflakes — so lint stays reproducible
+# across ruff upgrades. Widening the set is a deliberate, separate change.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
@@ -75,6 +83,13 @@ module = [
     "voyageai.*",
     "numpy",
     "numpy.*",
+    # The ONNX backend's lazy deps, treated the same way: embeddings.py wraps both in its
+    # own local Protocols (_OrtSession / _Tokenizer) and casts at the boundary, so none of
+    # their type information is relied on. onnxruntime-gpu ships no stubs at all.
+    "onnxruntime",
+    "onnxruntime.*",
+    "tokenizers",
+    "tokenizers.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"

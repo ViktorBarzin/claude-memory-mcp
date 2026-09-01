@@ -34,7 +34,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Protocol, cast, runtime_checkable
+import time
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 #: The hosted (Voyage) model. voyage-3.5 defaults to 1024-d; we pin it explicitly so a
 #: future default change cannot silently break the ``halfvec(1024)`` contract.
@@ -52,6 +56,42 @@ BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages
 #: The fixed embedding dimensionality. Both backends are pinned to it; it equals the
 #: ``halfvec(1024)`` column width and the HNSW index dimension.
 EMBEDDING_DIM = 1024
+
+#: The ONNX-served local model (ADR-0016 GPU plan, 2026-08-31). 509M params, native
+#: 1024-d so it reuses the existing ``halfvec(1024)`` column and HNSW index unchanged,
+#: Apache-2.0, and multilingual — 9.2% of the corpus carries Cyrillic that the
+#: English-only bge-large cannot represent.
+ONNX_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+
+#: Qwen3-Embedding's OWN retrieval convention, taken verbatim from the model's
+#: ``config_sentence_transformers.json`` prompts["query"]. It is NOT bge's prefix, and
+#: documents take NO instruction. Omitting it costs ~1-5% retrieval per the model card.
+ONNX_QUERY_INSTRUCTION = (
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+)
+
+#: Directory holding the exported ONNX graphs + ``tokenizer.json``, baked into the image.
+ONNX_MODEL_DIR_ENV = "MEMORY_ONNX_MODEL_DIR"
+ONNX_MODEL_DIR_DEFAULT = "/opt/onnx-embed"
+
+#: Ordered onnxruntime execution providers. Default is CPU-only so a deploy of this code
+#: changes nothing about scheduling; the GPU flip is this one env var.
+ONNX_PROVIDERS_ENV = "MEMORY_ONNX_PROVIDERS"
+ONNX_PROVIDERS_DEFAULT = "CPUExecutionProvider"
+
+#: Per-provider graph file. Both point at the int8 export for now: it is the precision
+#: the CPU path needs, and whether the CUDA provider serves int8 well is unmeasured on
+#: our Turing T4. If the in-cluster measurement shows CUDA int8 is slow, the follow-up is
+#: to bake ``model_fp16.onnx`` and point CUDA at it — this mapping is the seam for that,
+#: and it costs ~1.2 GB of image, so it is not paid until measurement says it is needed.
+ONNX_FILE_BY_PROVIDER = {
+    "CUDAExecutionProvider": "model_int8.onnx",
+    "CPUExecutionProvider": "model_int8.onnx",
+}
+
+#: Selects the backend explicitly. Unset keeps the historical rule (Voyage when keyed,
+#: else bge-large), so landing this module changes no running behaviour.
+BACKEND_ENV = "MEMORY_EMBEDDING_BACKEND"
 
 #: Env var that selects the hosted backend when set (and non-empty).
 VOYAGE_API_KEY_ENV = "VOYAGE_API_KEY"
@@ -185,6 +225,201 @@ class BgeEmbedder:
         return self._encode(BGE_QUERY_INSTRUCTION + query, normalize=True)
 
 
+class _OrtNode(Protocol):
+    """One input node of an onnxruntime graph — we only read its name."""
+
+    name: str
+
+
+class _OrtSession(Protocol):
+    """The minimal ``onnxruntime.InferenceSession`` surface this module uses."""
+
+    def run(self, output_names: None, input_feed: dict[str, object]) -> list[object]: ...
+    def get_inputs(self) -> list[_OrtNode]: ...
+    def get_providers(self) -> list[str]: ...
+
+
+class _NDArray(Protocol):
+    """The slice of a numpy array the ONNX path touches."""
+
+    shape: tuple[int, ...]
+
+    def __getitem__(self, index: object) -> _NDArray: ...
+    def tolist(self) -> object: ...
+
+
+class _NumpyModule(Protocol):
+    """The two numpy constructors the ONNX path needs.
+
+    Reached through ``importlib`` rather than ``import numpy`` on purpose: a direct import
+    makes mypy resolve numpy's bundled stubs, which use Python-3.12-only ``type``
+    statements and fail under this project's pinned ``python_version = "3.11"``. Every
+    other optional dep in this module is kept behind a local Protocol for the same
+    reason — we rely on none of their type information.
+    """
+
+    int64: object
+
+    def array(self, obj: object, dtype: object = ...) -> _NDArray: ...
+    def asarray(self, obj: object) -> _NDArray: ...
+
+
+class _Encoding(Protocol):
+    """The slice of a ``tokenizers.Encoding`` this module reads."""
+
+    ids: list[int]
+    attention_mask: list[int]
+
+
+class _Tokenizer(Protocol):
+    """The minimal ``tokenizers.Tokenizer`` surface this module uses."""
+
+    def encode(self, sequence: str) -> _Encoding: ...
+
+
+def short_provider(provider: str) -> str:
+    """``CUDAExecutionProvider`` -> ``cuda``. The metric label form."""
+    stripped = provider.lower().removesuffix("executionprovider")
+    return stripped or provider.lower()
+
+
+class OnnxEmbedder:
+    """LOCAL backend: ``Qwen/Qwen3-Embedding-0.6B`` served by onnxruntime.
+
+    One exported graph per execution provider (fp16 for CUDA, int8 for CPU), both from
+    the same weights. Providers are tried in order: the first one whose session builds
+    becomes the primary, and if a primary embed raises at runtime the next provider in
+    the list serves that call instead. That is the plan's "CPU fallback" — it keeps dense
+    recall available through a GPU outage rather than dropping to lexical.
+
+    The model's conventions differ from bge's and both are load-bearing: last-token (EOS)
+    pooling rather than CLS, and the query instruction in
+    :data:`ONNX_QUERY_INSTRUCTION` applied to queries only. Neither mistake raises; both
+    produce vectors that look valid and rank badly, so both are test-covered.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_dir: str | None = None,
+        providers: list[str] | None = None,
+        observer: object | None = None,
+    ) -> None:
+        self.backend_label = f"onnx:{ONNX_MODEL}"
+        self.dim = EMBEDDING_DIM
+        self.model_dir = model_dir or os.environ.get(ONNX_MODEL_DIR_ENV, ONNX_MODEL_DIR_DEFAULT)
+        raw = os.environ.get(ONNX_PROVIDERS_ENV, ONNX_PROVIDERS_DEFAULT) if providers is None else ",".join(providers)
+        self.providers = [p.strip() for p in raw.split(",") if p.strip()]
+        self._observer = observer
+        self._sessions: dict[str, _OrtSession] = {}
+        self._tokenizer: _Tokenizer | None = None
+
+    # ── lazy resources ────────────────────────────────────────────────────────
+    def _tok(self) -> _Tokenizer:
+        if self._tokenizer is None:
+            from tokenizers import Tokenizer  # lazy by design (ADR-0002)
+
+            self._tokenizer = cast(_Tokenizer, Tokenizer.from_file(os.path.join(self.model_dir, "tokenizer.json")))
+        return self._tokenizer
+
+    def _session(self, provider: str) -> _OrtSession:
+        """Build (once) the session for ``provider``. Raises if it cannot be built."""
+        cached = self._sessions.get(provider)
+        if cached is not None:
+            return cached
+        import onnxruntime as ort  # lazy by design (ADR-0002)
+
+        path = os.path.join(self.model_dir, ONNX_FILE_BY_PROVIDER[provider])
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session = cast(_OrtSession, ort.InferenceSession(path, opts, providers=[provider]))
+        self._sessions[provider] = session
+        return session
+
+    def warm(self) -> str:
+        """Build the primary session and run one embed. Returns the serving provider.
+
+        Called from the readiness probe so a restarting pod never serves a cold model.
+        """
+        self.embed_query("warmup")
+        return short_provider(self._primary())
+
+    def _primary(self) -> str:
+        """The first provider whose session builds. Why each earlier one did not build is
+        kept and reported if none do, so a misconfigured image says which library was
+        missing rather than just "no provider"."""
+        reasons: list[str] = []
+        for provider in self.providers:
+            try:
+                self._session(provider)
+            except Exception as exc:  # noqa: BLE001 — an unavailable provider is expected; try the next
+                reasons.append(f"{provider}: {exc}")
+                continue
+            return provider
+        detail = "; ".join(reasons) or "none configured"
+        raise RuntimeError(
+            f"no usable onnxruntime provider among {self.providers} in {self.model_dir} ({detail})"
+        )
+
+    # ── inference ─────────────────────────────────────────────────────────────
+    def _numpy(self) -> _NumpyModule:
+        import importlib  # lazy by design (ADR-0002)
+
+        return cast(_NumpyModule, importlib.import_module("numpy"))
+
+    def _forward(self, session: _OrtSession, text: str) -> list[float]:
+        np = self._numpy()
+        enc = self._tok().encode(text)
+        token_count = len(enc.ids)
+        feed: dict[str, object] = {
+            "input_ids": np.array([enc.ids], dtype=np.int64),
+            "attention_mask": np.array([enc.attention_mask], dtype=np.int64),
+        }
+        if any(node.name == "position_ids" for node in session.get_inputs()):
+            feed["position_ids"] = np.array([list(range(token_count))], dtype=np.int64)
+        hidden = np.asarray(session.run(None, feed)[0])
+        # Last-token (EOS) pooling: batch size is 1 and nothing is padded, so the final
+        # ATTENDED position is the pooled one. Pooling index 0 here would be CLS pooling,
+        # which this model was not trained for — it does not raise, it just ranks badly.
+        last = sum(enc.attention_mask) - 1
+        pooled = cast("list[float]", hidden[0][last].tolist())
+        return [float(x) for x in pooled]
+
+    def _embed(self, text: str) -> list[float]:
+        primary = self._primary()
+        order = [primary, *(p for p in self.providers if p != primary)]
+        last_error: Exception | None = None
+        for index, provider in enumerate(order):
+            started = time.perf_counter()
+            try:
+                vec = self._forward(self._session(provider), text)
+            except Exception as exc:  # noqa: BLE001 — fall through to the next provider
+                last_error = exc
+                continue
+            self._observe(provider, time.perf_counter() - started, order[0] if index else None)
+            return _l2_normalise(vec)
+        raise RuntimeError(f"all onnx providers failed for {self.backend_label}") from last_error
+
+    def _observe(self, provider: str, seconds: float, fell_back_from: str | None) -> None:
+        target = self._observer if self._observer is not None else _embed_observer
+        if target is None:
+            return
+        observer = cast("Callable[[str, float, str | None], None]", target)
+        observer(
+            short_provider(provider),
+            seconds,
+            short_provider(fell_back_from) if fell_back_from else None,
+        )
+
+    def embed_document(self, content: str, *, is_sensitive: bool) -> list[float] | None:
+        if is_sensitive:
+            return None  # sensitive rows are never embedded (column stays NULL)
+        return self._embed(content)  # documents take NO instruction
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed(ONNX_QUERY_INSTRUCTION + query)
+
+
 class _VoyageResult(Protocol):
     """The slice of ``voyageai`` embed results this module reads — a list of vectors,
     one per input text (each vector a sequence of floats)."""
@@ -257,26 +492,54 @@ class VoyageEmbedder:
 #: re-instantiated the model on every recall — the 2026-07 latency regression (~5s
 #: recalls, OOM when two loads overlapped). One cached instance per backend choice
 #: makes the model load exactly once per process and be reused everywhere.
-_embedder_cache: "dict[bool, Embedder]" = {}
+_embedder_cache: dict[str, Embedder] = {}
+
+#: Process-wide embed observer, installed by the API layer via :func:`set_embed_observer`.
+_embed_observer: object | None = None
+
+
+def set_embed_observer(observer: object | None) -> None:
+    """Register the process-wide embed observer (provider, seconds, fell_back_from).
+
+    Set once at API startup so :class:`OnnxEmbedder` can report which execution provider
+    served each embed WITHOUT this module importing ``api.metrics`` — embeddings.py has
+    to keep importing with no optional extras installed (ADR-0002).
+    """
+    global _embed_observer
+    _embed_observer = observer
 
 
 def select_embedder() -> Embedder:
-    """Choose the production embedding backend per the FINAL DESIGN rule, returning a
-    process-wide singleton so the heavy model loads once (not once per call).
+    """Choose the production embedding backend, returning a process-wide singleton so the
+    heavy model loads once (not once per call).
 
-    Hosted ``voyage-3.5`` iff ``VOYAGE_API_KEY`` is set and non-empty; otherwise the
-    local ``bge-large`` fallback. Selection is cheap and imports NO heavy deps — the
-    backend's dependency is imported only on its first ``embed_*`` call. The chosen
-    backend is CACHED per selection (keyed on Voyage-key presence): recall and
-    embed-on-write reuse one loaded model instead of re-instantiating the ~1.3GB
-    bge-large model on every call. In production the env is fixed for the process
-    lifetime, so exactly one instance is ever built.
+    ``MEMORY_EMBEDDING_BACKEND`` selects explicitly (``onnx`` | ``voyage`` | ``bge``).
+    Unset keeps the historical rule — hosted ``voyage-3.5`` iff ``VOYAGE_API_KEY`` is set
+    and non-empty, else local ``bge-large`` — so deploying the ONNX backend changes no
+    running behaviour until the env says so. That is the flag the GPU cutover flips, and
+    flipping it back is the model-side rollback.
+
+    Selection is cheap and imports NO heavy deps: a backend's dependency is imported only
+    on its first ``embed_*`` call. The chosen backend is CACHED per selection, so recall
+    and embed-on-write reuse one loaded model rather than re-instantiating it per call.
     """
-    use_voyage = bool(os.environ.get(VOYAGE_API_KEY_ENV))
-    embedder = _embedder_cache.get(use_voyage)
+    explicit = os.environ.get(BACKEND_ENV, "").strip().lower()
+    if explicit:
+        key = explicit
+    else:
+        key = "voyage" if os.environ.get(VOYAGE_API_KEY_ENV) else "bge"
+
+    embedder = _embedder_cache.get(key)
     if embedder is None:
-        embedder = VoyageEmbedder() if use_voyage else BgeEmbedder()
-        _embedder_cache[use_voyage] = embedder
+        if key == "onnx":
+            embedder = OnnxEmbedder()
+        elif key == "voyage":
+            embedder = VoyageEmbedder()
+        elif key == "bge":
+            embedder = BgeEmbedder()
+        else:
+            raise ValueError(f"{BACKEND_ENV}={explicit!r} is not one of: onnx, voyage, bge")
+        _embedder_cache[key] = embedder
     return embedder
 
 

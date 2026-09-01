@@ -68,6 +68,25 @@ EMBED_WRITE = Counter(
     "memory_embed_write_total", "Embed-on-write outcomes", ["status"]
 )
 
+#: Which execution provider actually served a query embedding, and how long it took.
+#: Deliberately NOT extra labels on RECALL_LATENCY: that histogram backs the recall
+#: p90 alert, and splitting its series by provider would change what the alert reads.
+#: `provider` is the onnxruntime provider name lowercased and stripped of the
+#: "executionprovider" suffix, so "cuda" / "cpu".
+EMBED_LATENCY = Histogram(
+    "memory_embed_seconds",
+    "Query-embedding latency, by serving execution provider",
+    ["provider"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+)
+#: A non-zero rate here means the GPU path is degraded and the CPU fallback is
+#: carrying recall — the condition the plan's alerting watches for.
+EMBED_FALLBACKS = Counter(
+    "memory_embed_fallbacks_total",
+    "Query embeddings that fell back to another provider after the primary raised",
+    ["from_provider", "to_provider"],
+)
+
 #: Backfill / embed-lag visibility: set at scrape time by the /metrics handler.
 EMBEDDINGS_PENDING = Gauge(
     "memory_embeddings_pending",
