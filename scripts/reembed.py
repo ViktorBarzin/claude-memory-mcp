@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 import time
 
 from claude_memory.api.database import close_pool, get_pool, init_pool
+from claude_memory.api.recall import _vector_literal, embeddings_enabled
 from claude_memory.embeddings import select_embedder
 
 SELECT_BATCH = """
@@ -38,7 +38,10 @@ SELECT_BATCH = """
 async def _run(batch: int, dry_run: bool, limit: int | None) -> int:
     embedder = select_embedder()
     print(f"backend: {embedder.backend_label} dim={embedder.dim}", flush=True)
-    if os.environ.get("MEMORY_EMBEDDINGS_ENABLED", "").lower() in {"1", "true", "yes"}:
+    # Ask the API layer rather than re-parsing the env var: recall.py accepts 1/true/yes/on,
+    # and a guard recognising fewer of those would let a re-embed run against a LIVE dense
+    # leg, which is the one thing it exists to prevent.
+    if embeddings_enabled():
         print(
             "REFUSING: MEMORY_EMBEDDINGS_ENABLED is on. Disable the dense leg first, or"
             " recall will rank queries against a half-migrated index.",
@@ -62,10 +65,13 @@ async def _run(batch: int, dry_run: bool, limit: int | None) -> int:
                     continue
                 if not dry_run:
                     async with pool.acquire() as conn:
+                        # Same literal rendering the write path uses, imported rather
+                        # than re-derived: two SQL bodies that must agree are exactly how
+                        # the dense leg drifted before.
                         await conn.execute(
-                            "UPDATE memories SET embedding = $2::halfvec WHERE id = $1",
+                            "UPDATE memories SET embedding = $1 WHERE id = $2",
+                            _vector_literal(vector),
                             row["id"],
-                            str(vector),
                         )
                 done += 1
                 if done % 100 == 0:
