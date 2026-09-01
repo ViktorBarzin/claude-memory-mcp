@@ -276,6 +276,34 @@ def test_falls_back_when_the_gpu_provider_raises_at_inference() -> None:
     assert [(p, f) for p, _, f in seen] == [("cpu", "cuda")]
 
 
+def test_an_unusable_provider_is_attempted_once_not_per_call() -> None:
+    """Caching the FAILURE matters as much as caching the session.
+
+    Building a session reads the whole graph (~2.4 GB for this model), so retrying a
+    doomed provider on every embed costs a full model load per call. Measured before this
+    was fixed: with CUDA unavailable the re-embed ran at 0.1 memories/s (12.4 s each)
+    against the CPU path's ~0.2 s, because each call rebuilt the CUDA session just to
+    raise again.
+    """
+    builds: list[str] = []
+    UNAVAILABLE.add("CUDAExecutionProvider")
+
+    def _counting_session(path: str, opts: object, providers: list[str]) -> _FakeSession:
+        builds.append(providers[0])
+        return _FakeSession(providers[0])
+
+    mod = sys.modules["onnxruntime"]
+    mod.InferenceSession = _counting_session  # type: ignore[attr-defined]
+
+    e = _both()
+    for _ in range(5):
+        e.embed_query("repeatedly")
+
+    cuda_builds = builds.count("CUDAExecutionProvider")
+    assert cuda_builds == 1, f"the unusable provider was rebuilt {cuda_builds} times, expected 1"
+    assert builds.count("CPUExecutionProvider") == 1, "the serving session must be cached too"
+
+
 def test_raises_when_every_provider_fails() -> None:
     UNSESSIONABLE.update({"CUDAExecutionProvider", "CPUExecutionProvider"})
     with pytest.raises(RuntimeError, match="no usable onnxruntime provider"):

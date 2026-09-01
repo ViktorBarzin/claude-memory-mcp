@@ -327,6 +327,14 @@ class OnnxEmbedder:
         self.providers = [p.strip() for p in raw.split(",") if p.strip()]
         self._observer = observer
         self._sessions: dict[str, _OrtSession] = {}
+        #: Providers whose session could not be built. Caching the FAILURE matters as much
+        #: as caching the session: building a session for this model reads a ~2.4 GB graph,
+        #: so retrying a doomed provider on every call costs a full model load per embed.
+        #: Measured 2026-09-01 before this existed — with CUDA unavailable the re-embed ran
+        #: at 0.1 memories/s (12.4 s each) instead of the CPU path's ~0.2 s, because each
+        #: call rebuilt the CUDA session from scratch just to raise again. A pod restart is
+        #: the retry point, which is also when the startup warm-up runs.
+        self._unavailable: set[str] = set()
         self._tokenizer: _Tokenizer | None = None
 
     # ── lazy resources ────────────────────────────────────────────────────────
@@ -353,6 +361,8 @@ class OnnxEmbedder:
         cached = self._sessions.get(provider)
         if cached is not None:
             return cached
+        if provider in self._unavailable:
+            raise RuntimeError(f"{provider} was already found unusable in this process")
         import onnxruntime as ort  # lazy by design (ADR-0002)
 
         # Put the CUDA and cuDNN shared libraries on the loader path before building a
@@ -398,6 +408,7 @@ class OnnxEmbedder:
                 self._session(provider)
             except Exception as exc:  # noqa: BLE001 — an unavailable provider is expected; try the next
                 reasons.append(f"{provider}: {exc}")
+                self._unavailable.add(provider)
                 continue
             return provider
         detail = "; ".join(reasons) or "none configured"
