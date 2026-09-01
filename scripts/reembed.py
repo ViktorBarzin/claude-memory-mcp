@@ -35,9 +35,11 @@ SELECT_BATCH = """
 """
 
 
-async def _run(batch: int, dry_run: bool, limit: int | None) -> int:
+async def _run(batch: int, dry_run: bool, limit: int | None, start_after: int) -> int:
     embedder = select_embedder()
     print(f"backend: {embedder.backend_label} dim={embedder.dim}", flush=True)
+    if start_after:
+        print(f"resuming after id {start_after}", flush=True)
     # Ask the API layer rather than re-parsing the env var: recall.py accepts 1/true/yes/on,
     # and a guard recognising fewer of those would let a re-embed run against a LIVE dense
     # leg, which is the one thing it exists to prevent.
@@ -51,7 +53,11 @@ async def _run(batch: int, dry_run: bool, limit: int | None) -> int:
 
     await init_pool()
     pool = await get_pool()
-    started, done, after = time.perf_counter(), 0, 0
+    # `after` is the id cursor. Seeding it lets an interrupted run resume instead of
+    # redoing everything: a pod restart mid-backfill (a CI deploy will do it) otherwise
+    # costs the whole pass again. Rows are processed in id order, so the last id the log
+    # reported is a safe resume point.
+    started, done, after = time.perf_counter(), 0, start_after
     try:
         while True:
             async with pool.acquire() as conn:
@@ -95,8 +101,14 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=64, help="rows fetched per round trip")
     parser.add_argument("--limit", type=int, default=None, help="stop after N rows (for a timed sample)")
     parser.add_argument("--dry-run", action="store_true", help="embed but do not write")
+    parser.add_argument(
+        "--start-after",
+        type=int,
+        default=0,
+        help="resume from this memory id (exclusive); use the last id the previous run logged",
+    )
     args = parser.parse_args()
-    return asyncio.run(_run(args.batch, args.dry_run, args.limit))
+    return asyncio.run(_run(args.batch, args.dry_run, args.limit, args.start_after))
 
 
 if __name__ == "__main__":
