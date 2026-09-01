@@ -355,6 +355,18 @@ class OnnxEmbedder:
             return cached
         import onnxruntime as ort  # lazy by design (ADR-0002)
 
+        # Put the CUDA and cuDNN shared libraries on the loader path before building a
+        # session. The nvidia pip wheels install their .so files under
+        # site-packages/nvidia/<lib>/lib/, which is NOT on the default loader path, so
+        # without this onnxruntime cannot dlopen its own CUDA provider and reports
+        # "libcublasLt.so.12: cannot open shared object file" — then silently serves the
+        # request on the CPU. Measured 2026-09-01: with the libraries installed but
+        # unreachable the CUDA provider never registered; calling this made the same pod
+        # serve at 21 ms instead of 175 ms. onnxruntime's own helper is used rather than
+        # a hand-set LD_LIBRARY_PATH so the paths stay the library's business.
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+
         path = os.path.join(self.model_dir, ONNX_FILE_BY_PROVIDER[provider])
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
