@@ -71,7 +71,7 @@ Settled in the grilling session of 2026-08-31.
 |---|---|---|
 | 1 | VRAM governance is out of scope | Handled by a separate agent. This plan treats free VRAM as a precondition for its final step only. |
 | 2 | Model becomes `Qwen/Qwen3-Embedding-0.6B` | Native 1024-d, so `halfvec(1024)` and the HNSW index are unchanged. Apache-2.0. Multilingual, which addresses the 9.2 %. 509M parameters. |
-| 3 | Serving is in-process `onnxruntime-gpu` | One library, one model artifact, provider list `CUDA` then `CPU`. `torch` and `sentence-transformers` are removed. |
+| 3 | Serving is in-process `onnxruntime-gpu` | One library, one model artifact, provider list `CUDA` then `CPU`. `torch` and `sentence-transformers` are removed. Chosen for simplicity over a separate TEI service, accepting that requesting a GPU hard-pins the pod to node1. |
 | 4 | CPU fallback is the same ONNX model on the CPU provider | One vector space, no ranking incoherence, and the fallback is the same code path with a different provider. |
 | 5 | Re-embed is in-place over the existing column | No schema change is needed at 1024-d. |
 | 6 | Rollback is `MEMORY_EMBEDDINGS_ENABLED=false` | An in-place re-embed leaves no old vectors to restore, so rollback uses the flag instead. `recall.py` documents that path as a true no-op to lexical FTS. |
@@ -134,8 +134,11 @@ behind `embed_query`, and which device runs it.
    `Instruct: {task}\nQuery:{text}` with documents embedded raw. Both are
    test-covered, because getting either wrong yields plausible-but-wrong vectors
    rather than an error.
-4. Remove `torch` and `sentence-transformers`. The image is 1,232 MB today, of
-   which roughly 800 MB is CPU torch, so the net size change should be small.
+4. Remove `torch` and `sentence-transformers`. Measured during implementation:
+   removing CPU torch saves roughly 800 MB of the current 1,232 MB image, but the
+   CUDA and cuDNN libraries onnxruntime needs are 1.4 GB of wheels on their own,
+   so the image grows rather than shrinks. Only the int8 graph is baked (~600 MB);
+   fp16 for CUDA would add ~1.2 GB and is deferred until a measurement asks for it.
 5. Gate readiness on one completed embed, so a restart never serves a cold model.
 6. Add a `provider` label to the recall metrics, so GPU and fallback serving are
    distinguishable in Prometheus.
@@ -160,9 +163,12 @@ Deployable on its own. Running the CPU provider alone should take the embed from
 > This is the only phase gated on the VRAM stream. Phases 1, 2 and 4 land
 > independently.
 
-Requires the VRAM stream to have freed budget. Declared totals go from 13,600 to
-14,800 MiB against 14,000 advertised, so either immich-ml returns inside its
-1,800 MiB declaration or the advertised node capacity is raised.
+Requires scheduling capacity. Declared budgets already total 13,984 MiB against
+14,000 advertised, and the three measured tenants each peak above their own
+declaration (llama-swap 6,992 against 5,000; immich-ml 3,264; frigate 2,713), so
+there is no slack to reclaim from another tenant. The agreed route is to raise
+advertised capacity to 15,200, declare 1,200 here, then tighten both numbers to
+measured reality in a follow-up.
 
 1. Add `nvidia.com/gpu: 1`, `viktorbarzin.me/gpumem: 1200`, the
    `nvidia.com/gpu.present` node selector and the GPU toleration, following the
@@ -218,8 +224,12 @@ references it yet.
 
 ## Out of scope
 
-- VRAM governance: ADR-0016 decisions 2 (runtime watchdog) and 3 (VRAM alerting)
-  are not built. That work sits with another agent and is a precondition for
-  phase 3 only.
+- VRAM governance sits with another agent. Correction (2026-09-01): an earlier
+  draft of this plan said ADR-0016 decisions 2 and 3 were never built. They are
+  both live — `gpu-vram-watchdog` runs as a Deployment in the `nvidia` namespace
+  (not a CronJob, which is why a `get cronjob` check missed it) with
+  `DRY_RUN=false` and `FLOOR_MIB=1536`, and the alerting exists as Loki rules in
+  `monitoring/modules/monitoring/loki.tf`. What phase 3 needs from that stream is
+  scheduling capacity, not new machinery.
 - A server-side deadline degrading to lexical results. Considered, not chosen.
 - Any schema or dimension change. Not needed at 1024-d.
