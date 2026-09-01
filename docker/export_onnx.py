@@ -105,12 +105,20 @@ def _only_onnx(directory: Path) -> Path:
 
 
 def _stage(src_dir: Path, graph: Path, name: str) -> Path:
-    """Copy a graph plus the tokenizer into a directory the embedder can load."""
+    """Copy a graph plus the tokenizer into a directory the embedder can load.
+
+    Every ``.onnx*`` file keeps its ORIGINAL name, and the graph is then additionally
+    copied to the name production expects. A large export is split into ``model.onnx``
+    plus ``model.onnx_data``, and that reference is stored INSIDE the graph by filename:
+    renaming the graph alone leaves it pointing at a data file that is not there, which
+    fails with "External data path does not exist". Keeping both names side by side lets
+    the reference resolve while still presenting the filename the embedder loads.
+    """
     staged = WORK / f"staged-{name}"
     staged.mkdir(parents=True, exist_ok=True)
+    for original in src_dir.glob("*.onnx*"):
+        shutil.copyfile(original, staged / original.name)
     shutil.copyfile(graph, staged / "model_fp16.onnx")
-    for extra in src_dir.glob("*.onnx_data"):
-        shutil.copyfile(extra, staged / "model_fp16.onnx_data")
     from transformers import AutoTokenizer
 
     AutoTokenizer.from_pretrained(MODEL).save_pretrained(staged)
@@ -151,7 +159,8 @@ def main() -> int:
     )
     _check(_stage(fp16_dir, fp16_dir / "model_fp16.onnx", "fp16"), "fp16 graph", reference)
 
-    shutil.copyfile(fp16_dir / "model_fp16.onnx", OUT_DIR / "model_fp16.onnx")
+    for produced in fp16_dir.glob("*.onnx*"):
+        shutil.copyfile(produced, OUT_DIR / produced.name)
     AutoTokenizer.from_pretrained(MODEL).save_pretrained(OUT_DIR)
     if not (OUT_DIR / "tokenizer.json").exists():
         raise SystemExit(f"{MODEL} produced no fast tokenizer.json; the runtime cannot tokenise")
