@@ -79,14 +79,21 @@ ONNX_MODEL_DIR_DEFAULT = "/opt/onnx-embed"
 ONNX_PROVIDERS_ENV = "MEMORY_ONNX_PROVIDERS"
 ONNX_PROVIDERS_DEFAULT = "CPUExecutionProvider"
 
-#: Per-provider graph file. Both point at the int8 export for now: it is the precision
-#: the CPU path needs, and whether the CUDA provider serves int8 well is unmeasured on
-#: our Turing T4. If the in-cluster measurement shows CUDA int8 is slow, the follow-up is
-#: to bake ``model_fp16.onnx`` and point CUDA at it — this mapping is the seam for that,
-#: and it costs ~1.2 GB of image, so it is not paid until measurement says it is needed.
+#: Per-provider graph file. One fp16 graph serves both providers.
+#:
+#: int8 was tried first and rejected on measurement (2026-09-01): dynamic int8
+#: quantisation of this 0.6B decoder-only model produced vectors scoring cosine 0.16-0.37
+#: against the sentence-transformers reference, with the whole embedding space collapsed
+#: into a 0.89-0.95 band. It passed every cheap check — 1024-d, unit norm, correct
+#: conventions, plausible latency — and would have ranked badly in production while
+#: looking healthy. The exporter now gates fidelity at >=0.99 before a graph can be
+#: baked, so a repeat cannot reach a registry.
+#:
+#: fp16 is the T4's natural precision. The CPU fallback loads the same graph; onnxruntime
+#: inserts casts and runs it more slowly, which is acceptable for a degraded path.
 ONNX_FILE_BY_PROVIDER = {
-    "CUDAExecutionProvider": "model_int8.onnx",
-    "CPUExecutionProvider": "model_int8.onnx",
+    "CUDAExecutionProvider": "model_fp16.onnx",
+    "CPUExecutionProvider": "model_fp16.onnx",
 }
 
 #: Selects the backend explicitly. Unset keeps the historical rule (Voyage when keyed,
@@ -323,7 +330,18 @@ class OnnxEmbedder:
         return self._tokenizer
 
     def _session(self, provider: str) -> _OrtSession:
-        """Build (once) the session for ``provider``. Raises if it cannot be built."""
+        """Build (once) the session for ``provider``, or raise if ``provider`` is not
+        the one actually serving it.
+
+        onnxruntime does NOT raise when a requested execution provider is unavailable.
+        It logs a warning to stderr, silently falls back to CPU, and hands back a working
+        session. Measured 2026-09-01: a pod whose image was missing ``libcublasLt`` built
+        a "CUDA" session that ran every embed on the CPU, and construction success alone
+        reported it as GPU-served — so the fallback counter stayed at zero and the alert
+        for exactly that condition could never fire.
+
+        ``get_providers()`` reports what actually registered, so that is what decides.
+        """
         cached = self._sessions.get(provider)
         if cached is not None:
             return cached
@@ -333,6 +351,12 @@ class OnnxEmbedder:
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         session = cast(_OrtSession, ort.InferenceSession(path, opts, providers=[provider]))
+        registered = session.get_providers()
+        if provider not in registered:
+            raise RuntimeError(
+                f"{provider} did not register (onnxruntime fell back to {registered}); "
+                "the provider's libraries are missing from the image"
+            )
         self._sessions[provider] = session
         return session
 

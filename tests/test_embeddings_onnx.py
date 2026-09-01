@@ -33,8 +33,11 @@ if TYPE_CHECKING:
 
 EXPECTED_DIM = 1024
 
-#: Providers whose session construction should fail, and whose run() should raise.
+#: Providers whose LIBRARIES are missing — onnxruntime silently serves these on CPU.
 UNAVAILABLE: set[str] = set()
+#: Providers whose session cannot be built at all (unreadable graph) — these do raise.
+UNSESSIONABLE: set[str] = set()
+#: Providers whose session builds but whose run() raises, e.g. VRAM pressure mid-request.
 BROKEN: set[str] = set()
 
 
@@ -68,15 +71,22 @@ class _FakeSession:
     from CLS pooling.
     """
 
-    def __init__(self, provider: str) -> None:
-        self.provider = provider
+    def __init__(self, requested: str) -> None:
+        # Model onnxruntime's REAL behaviour: an unavailable provider does not raise,
+        # it silently falls back to CPU and the session still constructs. Measured
+        # 2026-09-01 — a pod missing libcublasLt built a "CUDA" session that ran on the
+        # CPU. An earlier version of this fake raised instead, which is why the original
+        # provider-detection bug shipped: the fake encoded the assumption under test.
+        self.requested = requested
+        self.provider = "CPUExecutionProvider" if requested in UNAVAILABLE else requested
         self.runs = 0
 
     def get_inputs(self) -> list[SimpleNamespace]:
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="attention_mask")]
 
     def get_providers(self) -> list[str]:
-        return [self.provider]
+        # Always includes the CPU fallback, as onnxruntime does.
+        return [self.provider] if self.provider == "CPUExecutionProvider" else [self.provider, "CPUExecutionProvider"]
 
     def run(self, output_names: None, input_feed: dict[str, object]) -> list[object]:
         import numpy as np
@@ -100,10 +110,13 @@ def _fake_ort_module() -> ModuleType:
         graph_optimization_level: object = None
 
     def _inference_session(path: str, opts: object, providers: list[str]) -> _FakeSession:
-        provider = providers[0]
-        if provider in UNAVAILABLE:
-            raise RuntimeError(f"{provider} is not available in this build")
-        return _FakeSession(provider)
+        # Two distinct real behaviours. A missing GPU *library* does NOT raise: the
+        # session builds and quietly runs on CPU (see _FakeSession). A session that
+        # cannot be built at all — unreadable graph file, unusable CPU provider — does
+        # raise. UNSESSIONABLE models the second; UNAVAILABLE the first.
+        if providers[0] in UNSESSIONABLE:
+            raise RuntimeError(f"cannot build a session for {providers[0]}: {path} unreadable")
+        return _FakeSession(providers[0])
 
     mod.SessionOptions = _SessionOptions  # type: ignore[attr-defined]
     mod.InferenceSession = _inference_session  # type: ignore[attr-defined]
@@ -114,6 +127,7 @@ def _fake_ort_module() -> ModuleType:
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     UNAVAILABLE.clear()
+    UNSESSIONABLE.clear()
     BROKEN.clear()
     _FakeTokenizer.encoded = []
     tok_mod = ModuleType("tokenizers")
@@ -224,6 +238,29 @@ def test_falls_back_when_the_gpu_provider_is_unavailable() -> None:
     assert _both().warm() == "cpu"
 
 
+def test_a_silently_downgraded_session_is_not_reported_as_gpu() -> None:
+    """The 2026-09-01 production bug, as a test.
+
+    onnxruntime does not raise when a provider is unavailable — it falls back to CPU and
+    still returns a usable session. Reporting the REQUESTED provider rather than the
+    registered one made a CPU-served deployment look GPU-served, which in turn kept
+    memory_embed_fallbacks_total at zero and made the alert for that exact condition
+    unfireable. The embedder must believe get_providers(), not the request.
+    """
+    UNAVAILABLE.add("CUDAExecutionProvider")
+    e = _both()
+    assert e.warm() == "cpu", "a silently-downgraded CUDA session must not report as cuda"
+
+    seen: list[tuple[str, str | None]] = []
+    e2 = emb.OnnxEmbedder(
+        model_dir="/nonexistent",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        observer=lambda provider, seconds, fell_back_from: seen.append((provider, fell_back_from)),
+    )
+    e2.embed_query("served by whom?")
+    assert seen == [("cpu", None)], f"metrics must attribute this embed to cpu, got {seen}"
+
+
 def test_falls_back_when_the_gpu_provider_raises_at_inference() -> None:
     """The GPU session builds but inference fails, e.g. VRAM pressure mid-request."""
     BROKEN.add("CUDAExecutionProvider")
@@ -240,7 +277,7 @@ def test_falls_back_when_the_gpu_provider_raises_at_inference() -> None:
 
 
 def test_raises_when_every_provider_fails() -> None:
-    UNAVAILABLE.update({"CUDAExecutionProvider", "CPUExecutionProvider"})
+    UNSESSIONABLE.update({"CUDAExecutionProvider", "CPUExecutionProvider"})
     with pytest.raises(RuntimeError, match="no usable onnxruntime provider"):
         _both().embed_query("nothing can serve this")
 
@@ -302,8 +339,8 @@ def test_onnx_satisfies_the_embedder_protocol() -> None:
 
 
 def test_every_provider_maps_to_a_baked_graph() -> None:
-    """The image bakes int8 only for now; if a provider is added to the default list its
+    """The image bakes one fp16 graph; if a provider is added to the default list its
     graph must be baked too, or the pod fails at first embed rather than at build."""
     for provider in emb.ONNX_PROVIDERS_DEFAULT.split(","):
         assert provider.strip() in emb.ONNX_FILE_BY_PROVIDER
-    assert set(emb.ONNX_FILE_BY_PROVIDER.values()) == {"model_int8.onnx"}
+    assert set(emb.ONNX_FILE_BY_PROVIDER.values()) == {"model_fp16.onnx"}
