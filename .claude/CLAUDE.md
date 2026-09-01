@@ -13,8 +13,22 @@
 ```bash
 uv sync
 uv run python -m mcp.server  # Start MCP server
-uv run pytest                 # Run tests
+uv run pytest                 # Run tests -- from the MAIN checkout only, see below
 ```
+
+**In a git worktree, `uv run pytest` tests the wrong source tree.** The worktree's `.venv`
+carries no pytest (`asyncpg` and `prometheus-client` sit in the optional `api` extra that
+`uv sync` skips), so uv falls through to system python3.12, which has a user-level editable
+install pointing at the MAIN checkout's `src`. Your edits appear to do nothing and correct
+fixes keep failing their tests. Run this instead, from the worktree root:
+
+```bash
+PYTHONPATH=$PWD/src python3 -m pytest tests/ -q   # PYTHONPATH is searched before .pth
+PYTHONPATH=$PWD/src python3 -m mypy src/claude_memory/
+python3 -c "import importlib.util as u; print(u.find_spec('claude_memory.api.recall').origin)"
+```
+
+The last line is the check: the path it prints must contain `.worktrees/`.
 
 ## Architecture
 - `src/` — MCP server implementation
@@ -50,6 +64,21 @@ uv run pytest                 # Run tests
 - **`MEMORY_EMBEDDINGS_ENABLED=0` is the rollback for anything dense.** `api/recall.py`
   documents it as a true no-op to the lexical path, correct whatever the embedding column
   holds — which is what makes an in-place re-embed safe to attempt.
+- **Recall latency lives in the LEXICAL leg, not the vector search.** Profiled on the live
+  store 2026-09-01: dense pgvector HNSW over ~10,900 vectors is 3 ms, the AND-match is
+  2 ms, and the OR-broaden fallback is 200-440 ms. The broaden fires whenever the AND-match
+  returns fewer than `limit` rows, which for a long query is always, and the per-turn hook
+  sends the whole user prompt (real prompts: p50 25 terms, p90 86, max 124). ORing that
+  many terms matches 68-95% of the store, so Postgres correctly abandons the GIN index and
+  sequentially scans every row computing `ts_rank`. Before reaching for `hnsw.ef_search` or
+  anything dense, read the plan for the OR query.
+- **Anything touching the OR-broaden must be checked for row-identity, not just speed.**
+  Two changes were safe because they are provably result-preserving: the `OR_BROADEN_MIN_RANK`
+  floor is applied in Python after `ORDER BY rank DESC ... LIMIT` (a threshold on the sort
+  key, so filter-then-limit and limit-then-filter agree), and duplicate tokens are dropped
+  (`a | a` is the same tsquery as `a`). Capping the term COUNT is not in that class — it
+  changes which rows come back, and `benchmarks/data` tops out at 19 terms so the offline
+  eval cannot measure the long-prompt regime a cap would affect.
 
 ## CI/CD
 - **Build**: GitHub Actions → `ghcr.io/viktorbarzin/claude-memory-mcp` (ADR-0002, off-infra;
@@ -64,3 +93,6 @@ uv run pytest                 # Run tests
 - **`mcp` is pinned `<2`** (2.x renamed `FastMCP`) and the ruff **rule set** is pinned in
   `pyproject.toml` rather than the ruff version, so a linter upgrade cannot turn CI red on
   unchanged code. Both were latent breakages found on 2026-09-01.
+- **The gate is `ruff check` + `mypy src/claude_memory/` + `pytest tests/`, and NOT
+  `ruff format`.** Master carries 13 files `ruff format` would rewrite, so running it turns
+  an unrelated diff into a large one. Leave existing formatting alone.
