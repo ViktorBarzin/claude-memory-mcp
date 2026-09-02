@@ -17,4 +17,11 @@ steps:
     image: bitnami/kubectl:latest
     commands:
       - "kubectl -n claude-memory set image deployment/claude-memory claude-memory=${IMAGE_NAME}:${IMAGE_TAG}"
-      - "kubectl -n claude-memory rollout status deployment/claude-memory --timeout=300s"
+      # 900s, not the generated 300s. This pod is pinned to k8s-node1 by its
+      # nvidia.com/gpu request and its strategy is Recreate, so a deploy whose layers are
+      # not already on node1 pays a full cold pull before the new pod can start — measured
+      # at 6m24.561s for this image (infra/docs/plans/2026-09-02-node1-large-image-handling.md
+      # §1). 300s is shorter than that, so any deploy that reorders or rebuilds the image
+      # layers reported a timeout on a rollout that then succeeded. A genuinely stuck
+      # rollout still fails, 10 minutes later than before.
+      - "kubectl -n claude-memory rollout status deployment/claude-memory --timeout=900s"

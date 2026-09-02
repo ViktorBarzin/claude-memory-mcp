@@ -5,6 +5,20 @@ build compute off the homelab). torch, optimum and sentence-transformers are nee
 trace the graph and to produce the reference vectors; keeping them in a stage that is
 discarded is why the runtime image carries onnxruntime and a tokenizer instead.
 
+TWO MODES, and why they are separate
+------------------------------------
+``export`` traces the graph and writes the reference vectors to ``$GATE_REFERENCE``.
+``gate`` scores what ``export`` wrote and fails the build if it drifted.
+
+They are separate commands so the Dockerfile can put them in separate stages: the export
+depends only on this file, while the gate additionally needs ``claude_memory`` importable.
+Fused into one step, a one-line change under ``src/`` re-ran a 1,686 s export that could
+not have been affected by it. Split, a source-only commit re-runs the 572 s gate and
+reuses the export.
+
+The gate also now scores ``$OUT_DIR`` — the exact bytes the runtime image copies — rather
+than a staging directory assembled alongside them.
+
 THE GATE, and why it exists
 ---------------------------
 The first attempt at this shipped an int8 graph that produced vectors with cosine
@@ -14,19 +28,22 @@ norm was exactly 1.0000, the query instruction was applied, the sensitive gate h
 the latency was plausible. Only comparing against a known-good reference exposed it, and
 by then the graph was already in a deployed image.
 
-So the export now embeds a fixed probe set two ways — through sentence-transformers in
-fp32, and through the exported graph using THE PRODUCTION INFERENCE PATH
-(``claude_memory.embeddings.OnnxEmbedder``, not a reimplementation) — and fails the
-build unless every probe clears MIN_COSINE. A graph that would rank badly can no longer
-reach a registry.
+So the export embeds a fixed probe set through sentence-transformers in fp32, and the gate
+embeds the same probes through THE PRODUCTION INFERENCE PATH
+(``claude_memory.embeddings.OnnxEmbedder``, not a reimplementation), failing the build
+unless every probe clears MIN_COSINE. A graph that would rank badly can no longer reach a
+registry.
 
 Output, into $OUT_DIR:
   model.onnx            the gated graph (plus model.onnx_data when split)
   tokenizer.json        the fast tokenizer, loaded directly by `tokenizers`
+Output, into $GATE_REFERENCE:
+  the reference vectors, so the gate stage needs no torch and no second model download
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -34,6 +51,7 @@ from pathlib import Path
 
 MODEL = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/export"))
+GATE_REFERENCE = Path(os.environ.get("GATE_REFERENCE", "/gate-reference.json"))
 WORK = Path("/tmp/onnx-export")
 
 #: A faithful export reproduces the reference almost exactly. 0.99 is loose enough for
@@ -104,25 +122,8 @@ def _only_onnx(directory: Path) -> Path:
     return graphs[0]
 
 
-def _stage(src_dir: Path) -> Path:
-    """Copy the exported graph and a tokenizer into a directory the embedder can load.
-
-    Names are preserved exactly. A large export is split into ``model.onnx`` plus
-    ``model.onnx_data``, and that reference is stored INSIDE the graph by filename, so
-    renaming the graph leaves it pointing at a data file that is not there. Production
-    loads ``model.onnx`` for the same reason: no renaming anywhere in the pipeline.
-    """
-    staged = WORK / "staged"
-    staged.mkdir(parents=True, exist_ok=True)
-    for original in src_dir.glob("*.onnx*"):
-        shutil.copyfile(original, staged / original.name)
-    from transformers import AutoTokenizer
-
-    AutoTokenizer.from_pretrained(MODEL).save_pretrained(staged)
-    return staged
-
-
-def main() -> int:
+def export() -> int:
+    """Trace the model into $OUT_DIR and write the gate's reference vectors."""
     from optimum.onnxruntime import ORTModelForFeatureExtraction
     from transformers import AutoTokenizer
 
@@ -130,7 +131,8 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"[export] computing reference vectors with sentence-transformers ({MODEL})", flush=True)
-    reference = _reference()
+    GATE_REFERENCE.write_text(json.dumps(_reference()))
+    print(f"[export] reference vectors -> {GATE_REFERENCE}", flush=True)
 
     print(f"[export] tracing {MODEL} to ONNX", flush=True)
     ORTModelForFeatureExtraction.from_pretrained(MODEL, export=True).save_pretrained(fp32_dir)
@@ -142,8 +144,11 @@ def main() -> int:
     # graph that onnxruntime rejects at load ("Type parameter (T) of Optype (Add) bound to
     # different types"). A T4 runs fp32 on a 0.6B model comfortably, and this artifact is
     # the one the gate has actually accepted, so it is worth the larger image.
-    _check(_stage(fp32_dir), "fp32 export", reference)
-
+    #
+    # Names are preserved exactly. A large export is split into ``model.onnx`` plus
+    # ``model.onnx_data``, and that reference is stored INSIDE the graph by filename, so
+    # renaming the graph leaves it pointing at a data file that is not there. Production
+    # loads ``model.onnx`` for the same reason: no renaming anywhere in the pipeline.
     for produced in fp32_dir.glob("*.onnx*"):
         shutil.copyfile(produced, OUT_DIR / produced.name)
     AutoTokenizer.from_pretrained(MODEL).save_pretrained(OUT_DIR)
@@ -155,5 +160,32 @@ def main() -> int:
     return 0
 
 
+def gate() -> int:
+    """Score the graph already in $OUT_DIR against the reference the export wrote."""
+    if not GATE_REFERENCE.exists():
+        raise SystemExit(
+            f"[gate] no reference vectors at {GATE_REFERENCE}. The gate cannot score a graph "
+            "without them, and passing vacuously is the failure this gate exists to stop. "
+            "Run the export step first."
+        )
+    reference: dict[str, list[float]] = json.loads(GATE_REFERENCE.read_text())
+    missing = sorted(set(PROBES) - set(reference))
+    if missing:
+        raise SystemExit(f"[gate] reference vectors are missing probes {missing}; refusing to score partially")
+    _check(OUT_DIR, "fp32 export", reference)
+    return 0
+
+
+MODES = {"export": export, "gate": gate}
+
+
+def main(argv: list[str]) -> int:
+    # No default mode on purpose: a caller that means "export" and silently gets "gate"
+    # (or the reverse) would produce an image with an ungated graph in it.
+    if len(argv) != 2 or argv[1] not in MODES:
+        raise SystemExit(f"usage: {argv[0]} {{{'|'.join(MODES)}}}")
+    return MODES[argv[1]]()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))

@@ -79,6 +79,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
         run: echo "sha=$(echo ${{ github.sha }} | cut -c1-8)" >> "$GITHUB_OUTPUT"
+      # The image this build replaces, captured BEFORE the push overwrites :latest.
+      # Feeds the layer-delta guard below. Allowed to fail (no :latest on a first build);
+      # the guard treats an absent predecessor as "nothing to compare" and stays quiet.
+      - name: Capture the predecessor image manifest
+        continue-on-error: true
+        run: |
+          docker buildx imagetools inspect --raw \
+            ghcr.io/viktorbarzin/claude-memory-mcp:latest > /tmp/manifest-old.json
+          wc -c /tmp/manifest-old.json
       - uses: docker/build-push-action@v7
         with:
           context: .
@@ -93,6 +102,31 @@ jobs:
             ghcr.io/viktorbarzin/claude-memory-mcp:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # How many bytes does this commit make every node re-pull? docker/Dockerfile is
+      # ordered so that source-independent layers sit above source-dependent ones; before
+      # that, 3,023.8 MB of a 3,067 MB image re-shipped per commit and each cold pull wrote
+      # 9.2-12.3 GB to k8s-node1's root filesystem. A regression is a moved COPY that no
+      # test and no readable diff would catch, so it is measured on every build and FAILS
+      # when a commit that cannot have touched a source-independent layer re-ships >200 MB.
+      # Plan: infra/docs/plans/2026-09-02-node1-large-image-handling.md, Phase 1.
+      - name: Layer delta vs the image this replaces
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw \
+            ghcr.io/viktorbarzin/claude-memory-mcp:${{ steps.meta.outputs.sha }} > /tmp/manifest-new.json
+          # `github.event.before` is all-zeros on a branch's first push and absent on
+          # workflow_dispatch. An unknown diff base makes the guard report rather than
+          # enforce, which is safer than guessing the commit range.
+          BEFORE='${{ github.event.before }}'
+          : > /tmp/changed-files.txt
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            git diff --name-only "$BEFORE" '${{ github.sha }}' > /tmp/changed-files.txt
+          fi
+          echo "changed files vs $BEFORE:"; cat /tmp/changed-files.txt
+          python3 scripts/ci-layer-delta.py manifest \
+            /tmp/manifest-old.json /tmp/manifest-new.json \
+            --changed-files /tmp/changed-files.txt --max-new-mb 200
       # Keep the newest ~10 versions on ghcr (latest rides the newest one).
       - name: ghcr retention (keep 10)
         uses: actions/delete-package-versions@v5
