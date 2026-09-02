@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import sys
+from typing import cast
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar
 
@@ -109,7 +110,10 @@ def _fake_ort_module() -> ModuleType:
     class _SessionOptions:
         graph_optimization_level: object = None
 
-    def _inference_session(path: str, opts: object, providers: list[str]) -> _FakeSession:
+    def _inference_session(path: str, opts: object, providers: list[object]) -> _FakeSession:
+        # onnxruntime accepts a bare provider name or a (name, options) pair.
+        # Normalise so the fakes below only ever see the name.
+        providers = [p[0] if isinstance(p, tuple) else p for p in providers]
         # Two distinct real behaviours. A missing GPU *library* does NOT raise: the
         # session builds and quietly runs on CPU (see _FakeSession). A session that
         # cannot be built at all — unreadable graph file, unusable CPU provider — does
@@ -288,9 +292,12 @@ def test_an_unusable_provider_is_attempted_once_not_per_call() -> None:
     builds: list[str] = []
     UNAVAILABLE.add("CUDAExecutionProvider")
 
-    def _counting_session(path: str, opts: object, providers: list[str]) -> _FakeSession:
-        builds.append(providers[0])
-        return _FakeSession(providers[0])
+    def _counting_session(path: str, opts: object, providers: list[object]) -> _FakeSession:
+        # CUDA is passed as (name, options) so its arena strategy can be set;
+        # CPU stays a bare name. Count the name either way.
+        name = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
+        builds.append(cast(str, name))
+        return _FakeSession(cast(str, name))
 
     mod = sys.modules["onnxruntime"]
     mod.InferenceSession = _counting_session  # type: ignore[attr-defined]
@@ -372,3 +379,53 @@ def test_every_provider_maps_to_a_baked_graph() -> None:
     for provider in emb.ONNX_PROVIDERS_DEFAULT.split(","):
         assert provider.strip() in emb.ONNX_FILE_BY_PROVIDER
     assert set(emb.ONNX_FILE_BY_PROVIDER.values()) == {"model.onnx"}
+
+
+# --- CUDA arena growth (bead code-n3xl) --------------------------------------
+# onnxruntime's CUDA BFC arena defaults to arena_extend_strategy=kNextPowerOfTwo,
+# so it DOUBLES when it needs more and never returns it. Measured on
+# claude-memory 2026-09-02: resident VRAM sat at 3218 MiB for 18h, then stepped
+# to 7314 MiB in one hour and held flat there for six with no pod restart.
+# +4096 exactly is the arena doubling, not the model growing, and a flat line is
+# not a leak. kSameAsRequested makes the arena track what inference actually
+# asks for.
+def _recording_ort_module() -> tuple[ModuleType, list[object]]:
+    """The fake ort module, plus a list that captures each `providers` argument."""
+    mod = _fake_ort_module()
+    seen: list[object] = []
+    inner = mod.InferenceSession  # type: ignore[attr-defined]
+
+    def _recorder(path: str, opts: object, providers: list[object]) -> object:
+        seen.append(providers[0])
+        return inner(path, opts, providers)
+
+    mod.InferenceSession = _recorder  # type: ignore[attr-defined]
+    return mod, seen
+
+
+def test_cuda_provider_pins_the_arena_extend_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod, seen = _recording_ort_module()
+    monkeypatch.setitem(sys.modules, "onnxruntime", mod)
+    emb.OnnxEmbedder(model_dir="/m", providers=["CUDAExecutionProvider"]).embed_query("hi")
+
+    assert seen, "no session was built"
+    entry = seen[0]
+    assert isinstance(entry, tuple), (
+        "CUDAExecutionProvider must be passed as (name, options) so the arena "
+        f"strategy can be set; got a bare {type(entry).__name__}"
+    )
+    name, options = entry
+    assert name == "CUDAExecutionProvider"
+    assert options["arena_extend_strategy"] == "kSameAsRequested"
+
+
+def test_cpu_provider_is_still_passed_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The arena strategy is a CUDA-EP option. Attaching it to the CPU provider
+    # would be a silent no-op at best and a registration error at worst.
+    mod, seen = _recording_ort_module()
+    monkeypatch.setitem(sys.modules, "onnxruntime", mod)
+    emb.OnnxEmbedder(model_dir="/m", providers=["CPUExecutionProvider"]).embed_query("hi")
+
+    assert seen == ["CPUExecutionProvider"]

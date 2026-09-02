@@ -119,6 +119,40 @@ VOYAGE_API_KEY_ENV = "VOYAGE_API_KEY"
 VOYAGE_TIMEOUT_SECONDS = 10.0
 
 
+#: CUDA execution-provider options. Everything else is left at onnxruntime's
+#: defaults deliberately; this one is not safe to leave alone.
+#:
+#: ``arena_extend_strategy`` defaults to ``kNextPowerOfTwo``, so the CUDA BFC
+#: arena DOUBLES whenever inference asks for more than it currently holds, and
+#: an arena never gives memory back. Measured on the live pod 2026-09-02:
+#: resident VRAM sat at 3,218 MiB for eighteen hours, stepped to 7,314 MiB
+#: inside one hour, then held flat there for six more with no restart. That
+#: +4,096 is the arena doubling, not the model growing — a flat line is not a
+#: leak — and it put the pod 2,314 MiB over its declared
+#: ``viktorbarzin.me/gpumem`` seat, with no unallocated headroom left on the
+#: node to seat it honestly (bead code-n3xl).
+#:
+#: ``kSameAsRequested`` grows the arena by what was actually requested instead,
+#: so resident VRAM tracks real need. Immich's ML container already runs this
+#: way, for this reason.
+#:
+#: No ``gpu_mem_limit`` on purpose. A hard cap turns an over-large batch into an
+#: inference failure, which is worse than a large arena; the declared seat plus
+#: the gpu-vram-watchdog are what bound this tenant.
+CUDA_PROVIDER_OPTIONS: dict[str, str] = {"arena_extend_strategy": "kSameAsRequested"}
+
+
+def _provider_spec(provider: str) -> str | tuple[str, dict[str, str]]:
+    """A provider as onnxruntime wants it: a bare name, or (name, options).
+
+    Only CUDA takes options. Attaching a CUDA-EP option to the CPU provider is a
+    no-op at best and a registration error at worst.
+    """
+    if provider == "CUDAExecutionProvider":
+        return (provider, CUDA_PROVIDER_OPTIONS)
+    return provider
+
+
 def _l2_normalise(vec: list[float]) -> list[float]:
     """Return ``vec`` scaled to unit L2 norm (a zero vector is returned unchanged).
 
@@ -380,7 +414,10 @@ class OnnxEmbedder:
         path = os.path.join(self.model_dir, ONNX_FILE_BY_PROVIDER[provider])
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        session = cast(_OrtSession, ort.InferenceSession(path, opts, providers=[provider]))
+        session = cast(
+            _OrtSession,
+            ort.InferenceSession(path, opts, providers=[_provider_spec(provider)]),
+        )
         registered = session.get_providers()
         if provider not in registered:
             raise RuntimeError(
