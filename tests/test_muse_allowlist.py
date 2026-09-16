@@ -760,7 +760,13 @@ async def test_the_mcp_recall_tool_still_treats_a_blank_category_as_no_filter(ap
 # ─── the allowlist is the one source of truth ───────────────────────────────
 
 
-def test_the_allowlist_is_the_nine_operations_the_design_grants():
+def test_the_allowlist_is_exactly_what_was_granted():
+    """Pinned as a literal so widening the external key's reach is never incidental.
+
+    Nine came from the design. GET /api/auth-check is the tenth, added on review because
+    it is the only way Muse can tell a correctly-scoped key from one that landed as a
+    silent admin.
+    """
     assert EXTERNAL_ALLOWED_OPERATIONS == frozenset({
         ("POST", "/api/memories"),
         ("POST", "/api/memories/recall"),
@@ -771,4 +777,20 @@ def test_the_allowlist_is_the_nine_operations_the_design_grants():
         ("POST", "/api/memories/{memory_id}/links"),
         ("GET", "/api/tags"),
         ("GET", "/api/categories"),
+        ("GET", "/api/auth-check"),
     })
+
+
+@pytest.mark.asyncio
+async def test_the_external_key_can_self_test_and_sees_its_own_scope(api):
+    """Muse has to be able to prove its key works, and see what scope it landed as.
+
+    A key meant to be external but written in API_KEYS' flat shape is a silent admin key.
+    From outside the cluster this endpoint is the only thing that reveals it, which is why
+    it is on the allowlist rather than closed by omission like /api/stats.
+    """
+    ac, conn, app_mod = api
+    async with ac:
+        resp = await ac.get("/api/auth-check", headers=MUSE)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "user_id": "muse", "scope": "external"}

@@ -17,7 +17,7 @@ import unicodedata
 MUSE_SPEC_PATH = "/muse/openapi.json"
 
 #: Operations an "external" key may call: recall, list, get, store, update and delete,
-#: link creation, and the two vocabulary endpoints.
+#: link creation, the two vocabulary endpoints, and the key self-test.
 #:
 #: Each entry is (METHOD, path) where path is the route template exactly as FastAPI
 #: records it on the APIRoute, which is byte-identical to the key under ``paths`` in the
@@ -34,6 +34,11 @@ MUSE_SPEC_PATH = "/muse/openapi.json"
 #: the vocabulary. That job belongs to the ``enum`` every category field carries in the
 #: OpenAPI document (``models.CATEGORY_ENUM``), which lists the canonical set itself.
 #:
+#: ``GET /api/auth-check`` is granted so the key can be self-tested from Muse's side. It
+#: answers with the caller's own user id and scope, which is the only way to see from
+#: outside that a key meant to be external was written in API_KEYS' flat shape and landed
+#: as a silent admin key. It reads nothing and exposes no other user.
+#:
 #: Link DELETE is deliberately absent. The design grants link creation, so an external
 #: key can create a link it cannot remove through its own connector.
 EXTERNAL_ALLOWED_OPERATIONS: frozenset[tuple[str, str]] = frozenset({
@@ -46,6 +51,7 @@ EXTERNAL_ALLOWED_OPERATIONS: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/memories/{memory_id}/links"),
     ("GET", "/api/tags"),
     ("GET", "/api/categories"),
+    ("GET", "/api/auth-check"),
 })
 
 #: Operations that already serve the same bytes to an anonymous caller, so refusing a
