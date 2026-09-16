@@ -15,22 +15,30 @@ import asyncpg  # type: ignore[import-untyped]
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from claude_memory.api import auth as auth_module
 from claude_memory.api import metrics
-from claude_memory.api.auth import AuthUser, get_current_user, _key_to_user
+from claude_memory.api.auth import (
+    DEFAULT_SCOPE, AuthUser, get_current_user, is_restricted_scope, _key_to_user,
+)
+from claude_memory.api.auth import Scope as KeyScope
 from claude_memory.api.database import close_pool, get_pool, init_pool
 from claude_memory.api.models import (
     LINK_TYPES, LinkCreate, MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
     canonicalize_category, validate_content_bound,
 )
+from claude_memory.api.muse_spec import build_muse_openapi
 from claude_memory.api.permissions import check_memory_permission
+from claude_memory.api.scopes import (
+    MUSE_SPEC_PATH, is_allowed_for_external, stamp_origin, stamp_stored_origin,
+)
 from claude_memory.api.recall import (
     SUPERSEDES_DEPTH_CAP, _fused_recall, apply_link_semantics, embeddings_enabled,
     schedule_embedding,
@@ -47,6 +55,56 @@ logger = logging.getLogger(__name__)
 
 # Context variable for MCP SSE multi-user support
 _current_user: ContextVar[str] = ContextVar("_current_user", default="default")
+# …and the calling key's scope alongside it, so the MCP write tools can stamp an external
+# caller the same way the REST writes do (design change 4).
+_current_scope: ContextVar[KeyScope] = ContextVar("_current_scope", default=DEFAULT_SCOPE)
+
+
+def _token_of(request: Request) -> str:
+    return request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+
+
+def _scope_of_token(token: str) -> KeyScope | None:
+    """The scope of the key this token names, or None when it names no key.
+
+    Read off the auth module rather than a dict bound at import: the test suite reloads
+    ``claude_memory.api.auth`` to install a key set, which rebinds that dict.
+    """
+    return auth_module._key_to_scope.get(token)
+
+
+async def enforce_key_scope(request: Request) -> None:
+    """Refuse a restricted-scope key any operation outside the allowlist (design change 2).
+
+    Registered as an app-wide dependency, not ASGI middleware: ``request.scope["route"]``
+    is only populated once routing has matched, which happens after middleware and before
+    dependencies (MCPAuthMiddleware below has to string-match the raw path for exactly
+    this reason). Being app-wide is what makes it fail closed — a route added later is
+    absent from ``EXTERNAL_ALLOWED_OPERATIONS``, so an external key gets 403 on it until
+    someone deliberately lists it.
+
+    One measured shape does not get that 403, and does not escalate either: a new
+    SINGLE-segment literal under ``/api/memories/`` is shadowed by the allowlisted
+    ``/api/memories/{memory_id}`` template, which is registered first and matches first,
+    so the guard sees an allowed path. The request then fails int parsing with a 422 for
+    admin and external keys alike and the new handler runs for nobody. A shape the path
+    parameter cannot swallow (``POST /api/memories/{memory_id}/purge``, or any path
+    outside the subtree) is refused normally.
+
+    Which scopes are restricted is ``auth.UNRESTRICTED_SCOPES``, tested by membership
+    rather than against the string "external", so a third scope is restricted from the
+    moment it is added. Unrestricted keys, unknown tokens and unauthenticated requests
+    pass straight through; each route's own ``get_current_user`` still decides those.
+    This takes a ``Request`` rather than a ``Header`` parameter so it adds nothing to the
+    OpenAPI document.
+    """
+    scope = _scope_of_token(_token_of(request))
+    if scope is None or not is_restricted_scope(scope):
+        return
+    path = getattr(request.scope.get("route"), "path", None)
+    if isinstance(path, str) and is_allowed_for_external(request.method, path):
+        return
+    raise HTTPException(status_code=403, detail="This API key's scope does not permit this endpoint")
 
 
 def _record_embed(provider: str, seconds: float, fell_back_from: str | None) -> None:
@@ -82,8 +140,24 @@ async def _warm_embedder() -> None:
         logger.warning("embedder warmup failed; recall will degrade to lexical: %s", exc)
 
 
+def _log_key_scopes() -> None:
+    """Say at startup which scope each configured key landed with, and what was dropped.
+
+    An API_KEYS entry written in the flat shape silently gets "admin", so a muse key
+    pasted into the wrong shape is a working admin key whose writes carry no origin tag,
+    and nothing else in the running service says so. This line does, by user id only —
+    GET /api/users already lists those, and a key never goes to a log.
+    """
+    scopes = auth_module.scope_by_user()
+    if scopes:
+        logger.info("API key scopes: %s", ", ".join(f"{u}={s}" for u, s in sorted(scopes.items())))
+    for problem in auth_module.API_KEYS_PROBLEMS:
+        logger.error("%s", problem)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    _log_key_scopes()
     await init_pool()
     set_embed_observer(_record_embed)
     await _warm_embedder()
@@ -92,7 +166,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await close_pool()
 
 
-app = FastAPI(title="Claude Memory API", lifespan=lifespan)
+app = FastAPI(
+    title="Claude Memory API",
+    lifespan=lifespan,
+    dependencies=[Depends(enforce_key_scope)],
+)
 
 UI_DIR = pathlib.Path(__file__).parent.parent / "ui" / "static"
 _CACHE_BUST = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
@@ -161,10 +239,30 @@ async def metrics_endpoint() -> Response:
     return Response(content=payload, media_type=content_type)
 
 
+@app.get(MUSE_SPEC_PATH, include_in_schema=False)
+async def muse_openapi() -> JSONResponse:
+    """The curated OpenAPI document Muse's connector is pointed at (design change 3).
+
+    Unauthenticated on purpose, for two independent reasons. It is a strict subset of the
+    already-unauthenticated /openapi.json, so gating the subset while the superset is open
+    protects nothing. And a connector builder fetches the spec to learn the API's shape
+    BEFORE the user has pasted a token, so a 401 here would break the first setup step.
+
+    ``include_in_schema=False`` is load-bearing rather than cosmetic: without it this route
+    appears as an operation inside /openapi.json and inside its own output.
+    """
+    return JSONResponse(build_muse_openapi(app.openapi()))
+
+
 @app.get("/api/auth-check")
 async def auth_check(user: AuthUser = Depends(get_current_user)) -> dict[str, str]:
-    """Validate API key without doing any real work."""
-    return {"status": "ok", "user_id": user.user_id}
+    """Validate API key without doing any real work, and say what scope it carries.
+
+    The scope is echoed because it is otherwise invisible to the holder: a key meant to
+    be external but written in API_KEYS' flat shape is a silent admin key, and the only
+    other signal was this endpoint answering 403 instead of 200.
+    """
+    return {"status": "ok", "user_id": user.user_id, "scope": user.scope}
 
 
 @app.get("/api/users")
@@ -231,6 +329,9 @@ async def sync_memories(
 async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_user)) -> MemoryResponse:
     pool = await get_pool()
     is_sensitive = body.force_sensitive or _detect_sensitive(body.content)
+    # Design change 4: an external key's write carries source:<user_id>, server-side, with
+    # no way for the client to opt out or to claim a different origin.
+    tags = stamp_origin(body.tags, user.user_id) if is_restricted_scope(user.scope) else body.tags
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -242,7 +343,7 @@ async def store_memory(body: MemoryStore, user: AuthUser = Depends(get_current_u
             user.user_id,
             body.content if not is_sensitive else _redact_content(body.content),
             body.category,
-            body.tags,
+            tags,
             body.expanded_keywords,
             body.importance,
             is_sensitive,
@@ -391,7 +492,12 @@ async def list_memories(
 
 @app.get("/api/categories")
 async def list_categories(user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    """Return distinct category values across all users."""
+    """Return the category values IN USE across all users.
+
+    Not the list of legal values: a canonical category with no live rows is absent here.
+    The vocabulary a write has to come from is the ``enum`` on every category field of
+    the OpenAPI document (``models.CATEGORY_ENUM``).
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -829,6 +935,21 @@ async def update_memory(memory_id: int, body: MemoryUpdate, user: AuthUser = Dep
                 raise HTTPException(status_code=404, detail="Memory not found")
             raise HTTPException(status_code=403, detail="Write permission required")
 
+        # Design change 4: an external key's write carries source:<user_id> whether or not
+        # it sent tags, so the value is resolved here and rides the same UPDATE. Gated on
+        # the body asking for at least one change, so an empty PUT still gets its 400
+        # rather than being turned into a successful tags-only write. Tags the client did
+        # NOT send are stamped without being filtered: a write-share can put an external
+        # key on a row it does not own, and rewriting that row's tags would delete
+        # provenance the owner wrote.
+        tags = body.tags
+        if is_restricted_scope(user.scope) and body.model_dump(exclude_none=True):
+            if tags is None:
+                stored = await conn.fetchval("SELECT tags FROM memories WHERE id = $1", memory_id)
+                tags = stamp_stored_origin(stored, user.user_id)
+            else:
+                tags = stamp_origin(tags, user.user_id)
+
         updates = []
         params: list[Any] = []
         idx = 1
@@ -841,9 +962,9 @@ async def update_memory(memory_id: int, body: MemoryUpdate, user: AuthUser = Dep
             updates.append(f"category = ${idx}")
             params.append(body.category)
             idx += 1
-        if body.tags is not None:
+        if tags is not None:
             updates.append(f"tags = ${idx}")
-            params.append(body.tags)
+            params.append(tags)
             idx += 1
         if body.importance is not None:
             updates.append(f"importance = ${idx}")
@@ -975,13 +1096,14 @@ async def delete_memory_link(
     return {"unlinked": {"src_id": memory_id, "dst_id": dst_id, "link_type": link_type}}
 
 
+# Registered AFTER the literal /api/memories/* GET routes (sync, shared-with-me,
+# my-shares) so the path parameter cannot shadow them. A COMMENT rather than part of the
+# docstring below: FastAPI renders a docstring as the operation description, and
+# /muse/openapi.json is built from that document, so a routing note naming three
+# endpoints the curated document exists to withhold would ship inside it.
 @app.get("/api/memories/{memory_id}")
 async def get_memory(memory_id: int, user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    """One full memory with the caller's links, both directions (ADR-0007 ``get <id>``).
-
-    NOTE: registered AFTER the literal /api/memories/* GET routes (sync,
-    shared-with-me, my-shares) so the path parameter cannot shadow them.
-    """
+    """One full memory with the caller's links, both directions (ADR-0007 ``get <id>``)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1063,6 +1185,11 @@ async def memory_store(content: str, category: str = "facts", tags: str = "",
         return json.dumps({"error": str(exc)})
     pool = await get_pool()
     user_id = _current_user.get()
+    # Design change 4, same stamp as the REST store path. MCPAuthMiddleware refuses an
+    # external key before it can reach a tool, so this is the second of two controls
+    # rather than the only one — it keeps the invariant at the write itself.
+    if is_restricted_scope(_current_scope.get()):
+        tags = stamp_origin(tags, user_id)
 
     is_sensitive = _detect_sensitive(content)
     stored = content if not is_sensitive else _redact_content(content)
@@ -1098,6 +1225,18 @@ async def memory_recall(context: str, expanded_query: str = "",
     query_text = f"{context} {expanded_query}".strip()
     if not query_text:
         return json.dumps({"error": "context is required"})
+    # Same category canonicalization as the REST recall path, which app.py requires of
+    # these two surfaces ("the two recall surfaces must not differ in what truth they
+    # serve", below). The filter is an exact `AND category = $4` in SQL, so an unfolded
+    # 'Gotcha' matched nothing and read as "no memories". This entry point's error
+    # convention is a JSON error, the same as memory_store's.
+    if category is not None and category.strip():
+        try:
+            category = canonicalize_category(category)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+    else:
+        category = None
 
     # SAME shared retrieval helper as the REST recall_memories endpoint — the two paths
     # cannot drift. Flags off ⇒ verbatim current lexical SQL (no-op); embeddings flag adds
@@ -1302,6 +1441,16 @@ async def memory_update(id: int, content: str | None = None, tags: str | None = 
                 return json.dumps({"error": "Memory not found"})
             return json.dumps({"error": "Write permission required"})
 
+        # Design change 4, same stamp and same gate as the REST update path.
+        if is_restricted_scope(_current_scope.get()) and any(
+            field is not None for field in (content, tags, importance, expanded_keywords)
+        ):
+            if tags is None:
+                stored = await conn.fetchval("SELECT tags FROM memories WHERE id = $1", id)
+                tags = stamp_stored_origin(stored, user_id)
+            else:
+                tags = stamp_origin(tags, user_id)
+
         updates = []
         params: list[Any] = []
         idx = 1
@@ -1350,6 +1499,16 @@ class MCPAuthMiddleware:
                 response = Response(content="Unauthorized", status_code=401)
                 await response(scope, receive, send)
                 return
+            # The MCP tools duplicate the REST writes and add memory_share and the tag
+            # shares, none of which EXTERNAL_ALLOWED_OPERATIONS grants. An app-wide
+            # Depends() cannot reach here — /mcp is a Mount, not an APIRoute — so the
+            # allowlist is enforced for this transport by closing it outright, which also
+            # keeps a tool added later out of an external key's reach.
+            token_scope = _scope_of_token(token)
+            if token_scope is not None and is_restricted_scope(token_scope):
+                response = Response(content="Forbidden", status_code=403)
+                await response(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
@@ -1368,14 +1527,17 @@ class HandleStreamableHTTP:
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         user_id = "default"
+        key_scope: KeyScope = DEFAULT_SCOPE
         for name, value in scope.get("headers", []):
             if name == b"authorization":
                 token = value.decode().removeprefix("Bearer ").strip()
                 resolved = _resolve_user_from_token(token)
                 if resolved:
                     user_id = resolved
+                    key_scope = _scope_of_token(token) or DEFAULT_SCOPE
                 break
         _current_user.set(user_id)
+        _current_scope.set(key_scope)
         await streamable_session_mgr.handle_request(scope, receive, send)
 
 

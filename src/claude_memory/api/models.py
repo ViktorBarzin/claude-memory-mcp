@@ -1,6 +1,6 @@
 from typing import Any, Literal, Optional, get_args
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator
 
 # ── ADR-0007: typed Memory→Memory links ──────────────────────────────────────
 #: The closed link-type enum. Each type has defined Recall behaviour
@@ -53,6 +53,27 @@ CATEGORY_FOLD_MAP = {
 }
 
 
+#: The canonical set as a sorted list, for the JSON-Schema ``enum`` every category field
+#: carries. A closed enum is what the curated /muse/openapi.json owes a connector builder:
+#: link_type and sort_by already render as enums there, and a bare string next to them
+#: reads as an open vocabulary when the server rejects anything outside this set with a
+#: 422. The API is slightly MORE permissive than the enum — it also folds the drift twins
+#: in CATEGORY_FOLD_MAP — which is the safe direction: every value listed here is accepted.
+CATEGORY_ENUM: list[str] = sorted(CANONICAL_CATEGORIES)
+
+
+def _category_schema(*, optional: bool) -> dict[str, JsonValue]:
+    """The JSON-Schema extra that declares the closed category vocabulary on a field.
+
+    ``optional`` adds null, because a field typed ``Optional[str]`` renders as an
+    ``anyOf`` carrying null and a plain enum beside it would contradict that.
+    """
+    values: list[JsonValue] = [*CATEGORY_ENUM]
+    if optional:
+        values.append(None)
+    return {"enum": values}
+
+
 def canonicalize_category(category: str) -> str:
     """Fold a written category to its canonical form, or raise listing the allowed set.
 
@@ -70,7 +91,7 @@ def canonicalize_category(category: str) -> str:
 
 class MemoryStore(BaseModel):
     content: str
-    category: str = "facts"
+    category: str = Field(default="facts", json_schema_extra=_category_schema(optional=False))
     tags: str = Field(default="", max_length=500)
     expanded_keywords: str = Field(default="", max_length=500)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -90,7 +111,9 @@ class MemoryStore(BaseModel):
 class MemoryRecall(BaseModel):
     context: str
     expanded_query: str = ""
-    category: Optional[str] = None
+    # ``None`` is in the enum because the field is optional and omitting the filter is the
+    # common case; a plain enum beside an ``anyOf`` carrying null would contradict it.
+    category: Optional[str] = Field(default=None, json_schema_extra=_category_schema(optional=True))
     # Default flipped from "importance" to "relevance" (ADR-0005 amendment,
     # 2026-07-09): importance-sorted recall was the largest measured rediscovery
     # driver; sort_by="importance" stays available explicitly.
@@ -98,6 +121,22 @@ class MemoryRecall(BaseModel):
     # Default to a small top-N so recall returns the most relevant matches, not
     # the whole store. Ceiling stays high for callers that explicitly want more.
     limit: int = Field(default=30, ge=1, le=10000)
+
+    @field_validator("category")
+    @classmethod
+    def _category_canonical(cls, v: Optional[str]) -> Optional[str]:
+        """Fold and validate the filter exactly as the write paths fold and validate.
+
+        Recall matches the column with ``AND category = $4`` (recall.py), so an unfolded
+        ``Gotcha`` and an invented ``banana`` both returned 200 and zero rows — a filter
+        that silently matches nothing reads as "no memories" rather than as a mistake,
+        while the same two values are folded and rejected on store and update. An empty
+        or blank string keeps meaning "no filter", which is what the SQL already did with
+        it, so only a non-blank value is canonicalized.
+        """
+        if v is None or not v.strip():
+            return None
+        return canonicalize_category(v)
 
 
 class MemoryResponse(BaseModel):
@@ -140,7 +179,7 @@ class LinkCreate(BaseModel):
 
 class MemoryUpdate(BaseModel):
     content: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[str] = Field(default=None, json_schema_extra=_category_schema(optional=True))
     tags: Optional[str] = None
     importance: Optional[float] = Field(None, ge=0.0, le=1.0)
     expanded_keywords: Optional[str] = None
