@@ -20,7 +20,18 @@ uv run pytest                 # Run tests -- from the MAIN checkout only, see be
 carries no pytest (`asyncpg` and `prometheus-client` sit in the optional `api` extra that
 `uv sync` skips), so uv falls through to system python3.12, which has a user-level editable
 install pointing at the MAIN checkout's `src`. Your edits appear to do nothing and correct
-fixes keep failing their tests. Run this instead, from the worktree root:
+fixes keep failing their tests.
+
+**Simplest fix, and the one that matches CI: sync the extras.** `uv sync --extra api --extra
+dev --extra vault` in the worktree makes `uv run` resolve to the worktree's own source, so
+every `uv run` command below behaves. Skipping it produced 25 failures on 2026-09-16 that
+read as real defects and wasted an agent's work; the tell is `ModuleNotFoundError: No module
+named 'fastapi'` from a direct import. Verify with
+`uv run python -c "import claude_memory.api.auth as a; print(a.__file__)"` — the path must
+contain `.worktrees/`. Avoid `--all-extras` on the devvm: it pulls torch and the OOM killer
+took the run twice. CI has the headroom and uses `--all-extras`, so let it own that matrix.
+
+The PYTHONPATH route works too, from the worktree root:
 
 ```bash
 PYTHONPATH=$PWD/src python3 -m pytest tests/ -q   # PYTHONPATH is searched before .pth
@@ -42,6 +53,33 @@ The last line is the check: the path it prints must contain `.worktrees/`.
   Both preserved eval sets live in `~/.claude/claude-memory/benchmark-artifacts/`.
 
 ## Key Patterns
+- **An API key carries a SCOPE, and the external one is fenced by an allowlist** (2026-09-16,
+  `api/scopes.py`). `API_KEYS` parses two shapes: the flat `{"wizard": "key"}`, which means
+  scope `admin`, and `{"muse": {"key": "…", "scope": "external"}}`. An external key may call
+  only the ten `(METHOD, path)` pairs in `EXTERNAL_ALLOWED_OPERATIONS`, enforced by an
+  app-wide `Depends(enforce_key_scope)` on the `FastAPI()` constructor. It is a dependency and
+  NOT middleware because `request.scope["route"]` is unpopulated until routing has matched —
+  `MCPAuthMiddleware` string-matches the raw path for that same reason. Being app-wide is what
+  makes it fail closed: a route added later is absent from the set, so an external key gets
+  403 on it with nobody remembering to close it. `/mcp/*` is closed separately in
+  `MCPAuthMiddleware`, because the MCP tools reach `memory_share` and the REST writes and
+  would otherwise make the allowlist bypassable. One caveat is measured and harmless: a new
+  single-segment literal under `/api/memories/` is shadowed by the allowlisted
+  `/api/memories/{memory_id}` template and 422s for everyone.
+- **`EXTERNAL_ALLOWED_OPERATIONS` is read by THREE things and must stay one constant** — the
+  auth dependency, the curated `/muse/openapi.json` document, and the tests that pin both. A
+  second hand-kept list is the failure this design exists to prevent. The curated document is
+  `app.openapi()` deep-copied and filtered; `app.openapi()` caches and returns the SAME dict by
+  reference, so mutating it without a copy corrupts `/openapi.json` for every caller, and the
+  schema filter must be a transitive `$ref` closure or `HTTPValidationError` ships pointing at
+  a dropped `ValidationError`.
+- **Writes from an external key are stamped `source:<user_id>` server-side and the client
+  cannot forge one.** `scopes.stamp_origin` strips every origin claim from client-supplied tags
+  before appending the real one, comparing after NFKC normalisation, case folding, homoglyph
+  folding and whitespace removal — `source\twizard`, a non-breaking space and a Cyrillic `ѕ` all
+  survived a plain string test. `stamp_stored_origin` is the separate path for a tags value the
+  server read back, which must NOT be stripped or an importance-only update would delete
+  somebody else's provenance. There is deliberately NO importance ceiling.
 - **Non-blocking startup**: MCP server startup must not block on sync/HTTP calls (15s timeout)
 - **Suppress stderr**: Any stderr during startup causes Claude Code to reject the server
 - **NDJSON transport**: One JSON object per line, NOT Content-Length framing
@@ -111,9 +149,19 @@ The last line is the check: the path it prints must contain `.worktrees/`.
   and every commit re-ships it. Measured on the two production images either side of
   `62271e36`: **3,170.7 MB of 3,216.9 MB (98.6%) re-shipped for a source-only commit** before
   the reorder. `scripts/ci-layer-delta.py` reports the delta on every build and FAILS a
-  commit that cannot have touched a source-independent layer yet re-ships >200 MB; the paths
-  that legitimately DO change one are listed in that script's `PREFIX_INPUTS` — keep it in
-  step with the Dockerfile. Note `pip install ".[api]"` cannot be used above `COPY src/`
+  commit that cannot have touched a source-independent layer yet re-ships >200 MB.
+  **A COLD GitHub Actions cache trips this guard and looks identical to a layer-order
+  regression** (hit 2026-09-16): GHA evicts cache entries unused for 7 days, the previous build
+  was 14 days earlier, and the rebuild re-shipped 3,190 MB of 3,236 MB for an eight-file source
+  change. The guard's message only anticipates the ~1,076 MB model layer in that case, so two
+  large NEW layers read as a Dockerfile problem. Diagnose with
+  `git diff --name-only <prev> <head> | grep -v '^src/'` before touching the Dockerfile; empty
+  output means the cache, not the layer order. The image is pushed BEFORE the guard runs, so a
+  failure here skips only the deploy step, and a re-run with a warm cache passes — though it
+  passes trivially, because the predecessor is then the image the failed run already pushed,
+  so confirm no build input changed rather than treating the green re-run as the answer.
+  The paths that legitimately DO change a source-independent layer are listed in that
+  script's `PREFIX_INPUTS` — keep it in step with the Dockerfile. Note `pip install ".[api]"` cannot be used above `COPY src/`
   (hatchling builds the wheel from `src/`), which is why the dependency list is extracted
   from `pyproject.toml` with `tomllib` and the package itself is installed `--no-deps` below
   the line. Plan: `infra/docs/plans/2026-09-02-node1-large-image-handling.md` Phase 1.
