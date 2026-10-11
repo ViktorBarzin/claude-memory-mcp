@@ -275,15 +275,22 @@ class BgeEmbedder:
 
 
 class _OrtNode(Protocol):
-    """One input node of an onnxruntime graph — we only read its name."""
+    """One input node of an onnxruntime graph: its name, element type and shape."""
 
     name: str
+    type: str
+    shape: list[object]
 
 
 class _OrtSession(Protocol):
     """The minimal ``onnxruntime.InferenceSession`` surface this module uses."""
 
-    def run(self, output_names: None, input_feed: dict[str, object]) -> list[object]: ...
+    def run(
+        self,
+        output_names: list[str] | None,
+        input_feed: dict[str, object],
+        run_options: object = ...,
+    ) -> list[object]: ...
     def get_inputs(self) -> list[_OrtNode]: ...
     def get_providers(self) -> list[str]: ...
 
@@ -308,8 +315,11 @@ class _NumpyModule(Protocol):
     """
 
     int64: object
+    float16: object
+    float32: object
 
     def array(self, obj: object, dtype: object = ...) -> _NDArray: ...
+    def zeros(self, shape: tuple[int, ...], dtype: object = ...) -> _NDArray: ...
     def asarray(self, obj: object) -> _NDArray: ...
 
 
@@ -454,6 +464,24 @@ class OnnxEmbedder:
         )
 
     # ── inference ─────────────────────────────────────────────────────────────
+    def _run_options(self, session: _OrtSession) -> object | None:
+        """Shrink the CUDA arena back after each run.
+
+        The arena keeps every peak it has served. One prompt of a few thousand tokens
+        needs gigabytes of attention memory for a moment (measured 2026-10-11: +820 MiB
+        at 2,048 tokens, growing with the square of the length), and without this the
+        pod held that until it restarted. Shrinking costs about 3 ms of p50 per query.
+        """
+        if "CUDAExecutionProvider" not in session.get_providers():
+            return None
+        import importlib  # lazy by design (ADR-0002)
+
+        ort = importlib.import_module("onnxruntime")
+        run_options = ort.RunOptions()
+        run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+        options: object = run_options
+        return options
+
     def _numpy(self) -> _NumpyModule:
         import importlib  # lazy by design (ADR-0002)
 
@@ -467,9 +495,22 @@ class OnnxEmbedder:
             "input_ids": np.array([enc.ids], dtype=np.int64),
             "attention_mask": np.array([enc.attention_mask], dtype=np.int64),
         }
-        if any(node.name == "position_ids" for node in session.get_inputs()):
+        inputs = session.get_inputs()
+        if any(node.name == "position_ids" for node in inputs):
             feed["position_ids"] = np.array([list(range(token_count))], dtype=np.int64)
-        hidden = np.asarray(session.run(None, feed)[0])
+        # Decoder-style exports (onnx-community's fp16 graph) declare a KV cache per
+        # layer, shaped [batch, kv_heads, past_len, head_dim]. A fresh text has no past,
+        # so each one is fed empty, and only the hidden state is fetched: the present.*
+        # outputs would be per-layer copies nobody reads.
+        past = [node for node in inputs if node.name.startswith("past_key_values")]
+        output_names: list[str] | None = None
+        if past:
+            output_names = ["last_hidden_state"]
+            for node in past:
+                dtype = np.float16 if "float16" in node.type else np.float32
+                kv_heads, head_dim = cast(int, node.shape[1]), cast(int, node.shape[3])
+                feed[node.name] = np.zeros((1, kv_heads, 0, head_dim), dtype=dtype)
+        hidden = np.asarray(session.run(output_names, feed, self._run_options(session))[0])
         # Last-token (EOS) pooling: batch size is 1 and nothing is padded, so the final
         # ATTENDED position is the pooled one. Pooling index 0 here would be CLS pooling,
         # which this model was not trained for — it does not raise, it just ranks badly.

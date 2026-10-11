@@ -81,6 +81,9 @@ class _FakeSession:
         self.requested = requested
         self.provider = "CPUExecutionProvider" if requested in UNAVAILABLE else requested
         self.runs = 0
+        self.last_feed: dict[str, object] = {}
+        self.last_output_names: list[str] | None = None
+        self.last_run_options: object = None
 
     def get_inputs(self) -> list[SimpleNamespace]:
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="attention_mask")]
@@ -89,9 +92,17 @@ class _FakeSession:
         # Always includes the CPU fallback, as onnxruntime does.
         return [self.provider] if self.provider == "CPUExecutionProvider" else [self.provider, "CPUExecutionProvider"]
 
-    def run(self, output_names: None, input_feed: dict[str, object]) -> list[object]:
+    def run(
+        self,
+        output_names: list[str] | None,
+        input_feed: dict[str, object],
+        run_options: object = None,
+    ) -> list[object]:
         import numpy as np
 
+        self.last_feed = input_feed
+        self.last_output_names = output_names
+        self.last_run_options = run_options
         if self.provider in BROKEN:
             raise RuntimeError(f"{self.provider} failed at inference")
         self.runs += 1
@@ -110,6 +121,13 @@ def _fake_ort_module() -> ModuleType:
     class _SessionOptions:
         graph_optimization_level: object = None
 
+    class _RunOptions:
+        def __init__(self) -> None:
+            self.entries: dict[str, str] = {}
+
+        def add_run_config_entry(self, key: str, value: str) -> None:
+            self.entries[key] = value
+
     def _inference_session(path: str, opts: object, providers: list[object]) -> _FakeSession:
         # onnxruntime accepts a bare provider name or a (name, options) pair.
         # Normalise so the fakes below only ever see the name.
@@ -123,6 +141,7 @@ def _fake_ort_module() -> ModuleType:
         return _FakeSession(providers[0])
 
     mod.SessionOptions = _SessionOptions  # type: ignore[attr-defined]
+    mod.RunOptions = _RunOptions  # type: ignore[attr-defined]
     mod.InferenceSession = _inference_session  # type: ignore[attr-defined]
     mod.GraphOptimizationLevel = SimpleNamespace(ORT_ENABLE_ALL="all")  # type: ignore[attr-defined]
     return mod
@@ -429,3 +448,87 @@ def test_cpu_provider_is_still_passed_bare(monkeypatch: pytest.MonkeyPatch) -> N
     emb.OnnxEmbedder(model_dir="/m", providers=["CPUExecutionProvider"]).embed_query("hi")
 
     assert seen == ["CPUExecutionProvider"]
+
+
+# ── arena shrinkage: VRAM returns after a long input ──────────────────────────────
+
+
+def _run_entries(session: _FakeSession) -> dict[str, str]:
+    options = session.last_run_options
+    return dict(getattr(options, "entries", {}) or {})
+
+
+def test_cuda_runs_shrink_the_arena_after_each_request() -> None:
+    """The CUDA arena never hands memory back on its own. One long prompt grew it by
+    1.3 GB on 2026-10-11 and the pod kept that for its whole life; shrinking after each
+    run returns it, at about 3 ms of p50 latency."""
+    embedder = emb.OnnxEmbedder(model_dir="/m", providers=["CUDAExecutionProvider"])
+    embedder.embed_query("hi")
+    session = cast(_FakeSession, embedder._session("CUDAExecutionProvider"))
+    assert _run_entries(session).get("memory.enable_memory_arena_shrinkage") == "gpu:0"
+
+
+def test_cpu_runs_do_not_ask_for_a_gpu_arena_shrink() -> None:
+    embedder = emb.OnnxEmbedder(model_dir="/m", providers=["CPUExecutionProvider"])
+    embedder.embed_query("hi")
+    session = cast(_FakeSession, embedder._session("CPUExecutionProvider"))
+    assert "memory.enable_memory_arena_shrinkage" not in _run_entries(session)
+
+
+# ── decoder-style exports: an empty KV cache for a fresh text ─────────────────────
+
+
+class _DecoderSession(_FakeSession):
+    """The onnx-community fp16 export declares a KV cache per layer and returns
+    present.* tensors beside last_hidden_state."""
+
+    LAYERS = 2
+
+    def get_inputs(self) -> list[SimpleNamespace]:
+        names = [
+            SimpleNamespace(name="input_ids", type="tensor(int64)", shape=["batch_size", "sequence_length"]),
+            SimpleNamespace(name="attention_mask", type="tensor(int64)", shape=["batch_size", "total_sequence_length"]),
+            SimpleNamespace(name="position_ids", type="tensor(int64)", shape=["batch_size", "sequence_length"]),
+        ]
+        for i in range(self.LAYERS):
+            for kind in ("key", "value"):
+                names.append(
+                    SimpleNamespace(
+                        name=f"past_key_values.{i}.{kind}",
+                        type="tensor(float16)",
+                        shape=["batch_size", 8, "past_sequence_length", 128],
+                    )
+                )
+        return names
+
+
+def test_decoder_style_graph_gets_an_empty_kv_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    import numpy as np
+
+    mod = _fake_ort_module()
+    mod.InferenceSession = lambda path, opts, providers: _DecoderSession("CUDAExecutionProvider")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", mod)
+    embedder = emb.OnnxEmbedder(model_dir="/m", providers=["CUDAExecutionProvider"])
+    vec = embedder.embed_document("a document of some length", is_sensitive=False)
+    session = cast(_DecoderSession, embedder._session("CUDAExecutionProvider"))
+
+    feed = session.last_feed
+    past = [k for k in feed if k.startswith("past_key_values.")]
+    assert len(past) == 2 * _DecoderSession.LAYERS
+    for name in past:
+        tensor = np.asarray(feed[name])
+        assert tensor.shape == (1, 8, 0, 128)
+        assert tensor.dtype == np.float16
+    # Only the hidden state is fetched; the present.* cache would be wasted copies.
+    assert session.last_output_names == ["last_hidden_state"]
+    # Pooling is unchanged: still the last attended token.
+    seq = np.asarray(feed["input_ids"]).shape[1]
+    assert vec is not None
+    assert _pooled_index(vec) == seq
+
+
+def test_encoder_style_graph_is_fed_exactly_as_before() -> None:
+    embedder = emb.OnnxEmbedder(model_dir="/m", providers=["CPUExecutionProvider"])
+    embedder.embed_query("hi")
+    session = cast(_FakeSession, embedder._session("CPUExecutionProvider"))
+    assert set(session.last_feed) == {"input_ids", "attention_mask"}
