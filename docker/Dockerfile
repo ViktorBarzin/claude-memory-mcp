@@ -1,16 +1,16 @@
 # ── stage 1: export the model to ONNX, throw the toolchain away ──────────────────
-# torch, optimum and sentence-transformers are ~3 GB and are needed only to trace the
-# graph and to produce the reference vectors the gate compares against. They stay in this
+# torch and sentence-transformers are ~3 GB and are needed only to produce the reference
+# vectors the gate compares against; the fp16 graph itself is downloaded at a pinned revision. They stay in this
 # stage so the runtime image carries onnxruntime and a tokenizer instead of a training
 # framework. Runs on GitHub Actions per ADR-0002 (build compute is off-infra).
 #
-# THIS STAGE MUST NOT DEPEND ON src/. The export measured 1,686 s, and while the gate
+# THIS STAGE MUST NOT DEPEND ON src/. The fp32 export measured 1,686 s, and while the gate
 # lived in the same stage a one-line change under src/ re-ran all of it. The gate moved to
 # its own stage below; this one sees only docker/export_onnx.py.
 FROM python:3.12-slim AS exporter
 
 RUN pip install --no-cache-dir \
-      "optimum[onnxruntime]>=1.24" "transformers>=4.45" "torch>=2.4" \
+      "onnxruntime~=1.26.0" "huggingface_hub>=0.25" "transformers>=4.45" "torch>=2.4" \
       "sentence-transformers>=3.0" "tokenizers>=0.20" \
       --extra-index-url https://download.pytorch.org/whl/cpu
 
@@ -18,7 +18,7 @@ ENV OUT_DIR=/export \
     GATE_REFERENCE=/gate-reference.json
 
 # `touch -d @0` is load-bearing, not tidiness. A layer is a tar and tar headers carry
-# mtime, so the 1,076 MB `COPY --from=exporter` below gets a fresh digest whenever this
+# mtime, so the ~1.2 GB `COPY --from=exporter` below gets a fresh digest whenever this
 # step re-runs — even when it produces identical bytes. CI caches with
 # `type=gha,mode=max` into a 10 GB per-repo LRU that these intermediates already exceed,
 # so this step IS evicted and re-run periodically. Fixing the mtimes makes the copied
@@ -100,7 +100,7 @@ RUN pip check \
 
 # The gated graph + tokenizer, baked in: a pod start needs no network and no PVC, and the
 # model version is pinned by the image tag rather than by whatever the Hub serves. This is
-# 1,076.0 MB and depends on no source file, so it belongs above src/ — below it, this copy
+# about 1.2 GB (fp16 weights) and depends on no source file, so it belongs above src/ — below it, this copy
 # re-tarred with fresh mtimes on every commit even when the exporter stage was CACHED.
 COPY --from=exporter /export /opt/onnx-embed
 RUN chmod -R a+rX /opt/onnx-embed

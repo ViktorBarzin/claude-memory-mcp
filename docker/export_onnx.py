@@ -1,19 +1,20 @@
 """Build-time export of the dense-leg model to ONNX, with a fidelity gate.
 
 Runs in the Dockerfile's throwaway `exporter` stage on GitHub Actions (ADR-0002 keeps
-build compute off the homelab). torch, optimum and sentence-transformers are needed to
-trace the graph and to produce the reference vectors; keeping them in a stage that is
-discarded is why the runtime image carries onnxruntime and a tokenizer instead.
+build compute off the homelab). torch and sentence-transformers are needed to produce the
+reference vectors; keeping them in a stage that is discarded is why the runtime image
+carries onnxruntime and a tokenizer instead.
 
 TWO MODES, and why they are separate
 ------------------------------------
-``export`` traces the graph and writes the reference vectors to ``$GATE_REFERENCE``.
+``export`` fetches the pinned fp16 graph and writes the reference vectors to
+``$GATE_REFERENCE``.
 ``gate`` scores what ``export`` wrote and fails the build if it drifted.
 
 They are separate commands so the Dockerfile can put them in separate stages: the export
 depends only on this file, while the gate additionally needs ``claude_memory`` importable.
-Fused into one step, a one-line change under ``src/`` re-ran a 1,686 s export that could
-not have been affected by it. Split, a source-only commit re-runs the 572 s gate and
+Fused into one step, a one-line change under ``src/`` re-ran an export (1,686 s when it
+still traced the fp32 graph) that could not have been affected by it. Split, a source-only commit re-runs the 572 s gate and
 reuses the export.
 
 The gate also now scores ``$OUT_DIR`` — the exact bytes the runtime image copies — rather
@@ -50,6 +51,11 @@ import sys
 from pathlib import Path
 
 MODEL = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+#: Pinned so the image bakes the bytes the gate and the 2026-10-11 benchmark scored,
+#: not whatever the Hub serves on the day of the build.
+MODEL_REVISION = os.environ.get("EMBED_MODEL_REVISION", "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3")
+FP16_REPO = os.environ.get("EMBED_FP16_REPO", "onnx-community/Qwen3-Embedding-0.6B-ONNX")
+FP16_REVISION = os.environ.get("EMBED_FP16_REVISION", "c25a394dd583836952667c12f008335071b3f43d")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/export"))
 GATE_REFERENCE = Path(os.environ.get("GATE_REFERENCE", "/gate-reference.json"))
 WORK = Path("/tmp/onnx-export")
@@ -83,7 +89,7 @@ def _reference() -> dict[str, list[float]]:
     """Ground truth: the model as sentence-transformers runs it, fp32 on CPU."""
     from sentence_transformers import SentenceTransformer
 
-    st = SentenceTransformer(MODEL, device="cpu")
+    st = SentenceTransformer(MODEL, device="cpu", revision=MODEL_REVISION)
     out: dict[str, list[float]] = {}
     for name, (kind, text) in PROBES.items():
         kwargs = {"prompt_name": "query"} if kind == "query" else {}
@@ -115,43 +121,33 @@ def _check(model_dir: Path, label: str, reference: dict[str, list[float]]) -> No
     print(f"[gate] {label} accepted (worst {worst:.5f})", flush=True)
 
 
-def _only_onnx(directory: Path) -> Path:
-    graphs = sorted(p for p in directory.iterdir() if p.suffix == ".onnx")
-    if len(graphs) != 1:
-        raise SystemExit(f"expected exactly one .onnx in {directory}, found {[p.name for p in graphs]}")
-    return graphs[0]
-
-
 def export() -> int:
-    """Trace the model into $OUT_DIR and write the gate's reference vectors."""
-    from optimum.onnxruntime import ORTModelForFeatureExtraction
+    """Fetch the fp16 graph into $OUT_DIR and write the gate's reference vectors."""
+    from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
-    fp32_dir = WORK / "fp32"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"[export] computing reference vectors with sentence-transformers ({MODEL})", flush=True)
     GATE_REFERENCE.write_text(json.dumps(_reference()))
     print(f"[export] reference vectors -> {GATE_REFERENCE}", flush=True)
 
-    print(f"[export] tracing {MODEL} to ONNX", flush=True)
-    ORTModelForFeatureExtraction.from_pretrained(MODEL, export=True).save_pretrained(fp32_dir)
-
-    # fp32 is what ships. fp16 was attempted and abandoned on 2026-09-01: converting this
-    # graph with onnxconverter_common fails both ways round. With shape inference on it
-    # cannot serialise, because the fp32 model is ~2.4 GB and protobuf refuses past 2 GB;
-    # with inference off the converter cannot place casts and emits a type-inconsistent
-    # graph that onnxruntime rejects at load ("Type parameter (T) of Optype (Add) bound to
-    # different types"). A T4 runs fp32 on a 0.6B model comfortably, and this artifact is
-    # the one the gate has actually accepted, so it is worth the larger image.
+    # fp16 since 2026-10-11, from onnx-community's export rather than a conversion of our
+    # own. Converting the fp32 graph with onnxconverter_common failed both ways round on
+    # 2026-09-01 (protobuf's 2 GB limit with shape inference on, a type-inconsistent graph
+    # with it off). The onnx-community graph loads, and on the preserved eval sets it
+    # matched fp32: identical metrics on the 27 Cyrillic queries with 26 of 27 top-5 lists
+    # unchanged, and resident VRAM on the T4 went from ~2.6 GB to 1,272 MiB. The gate
+    # below still decides whether these bytes ship.
     #
-    # Names are preserved exactly. A large export is split into ``model.onnx`` plus
-    # ``model.onnx_data``, and that reference is stored INSIDE the graph by filename, so
-    # renaming the graph leaves it pointing at a data file that is not there. Production
-    # loads ``model.onnx`` for the same reason: no renaming anywhere in the pipeline.
-    for produced in fp32_dir.glob("*.onnx*"):
-        shutil.copyfile(produced, OUT_DIR / produced.name)
-    AutoTokenizer.from_pretrained(MODEL).save_pretrained(OUT_DIR)
+    # Its weights live in ``model_fp16.onnx_data``, and that filename is stored INSIDE the
+    # graph, so the data file keeps its name. The graph itself is saved as ``model.onnx``
+    # because that is the file production loads.
+    graph = hf_hub_download(FP16_REPO, "onnx/model_fp16.onnx", revision=FP16_REVISION, cache_dir=str(WORK))
+    data = hf_hub_download(FP16_REPO, "onnx/model_fp16.onnx_data", revision=FP16_REVISION, cache_dir=str(WORK))
+    shutil.copyfile(graph, OUT_DIR / "model.onnx")
+    shutil.copyfile(data, OUT_DIR / "model_fp16.onnx_data")
+    AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION).save_pretrained(OUT_DIR)
     if not (OUT_DIR / "tokenizer.json").exists():
         raise SystemExit(f"{MODEL} produced no fast tokenizer.json; the runtime cannot tokenise")
 
@@ -172,7 +168,7 @@ def gate() -> int:
     missing = sorted(set(PROBES) - set(reference))
     if missing:
         raise SystemExit(f"[gate] reference vectors are missing probes {missing}; refusing to score partially")
-    _check(OUT_DIR, "fp32 export", reference)
+    _check(OUT_DIR, "fp16 graph", reference)
     return 0
 
 

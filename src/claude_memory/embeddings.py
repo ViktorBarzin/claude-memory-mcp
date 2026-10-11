@@ -89,16 +89,15 @@ ONNX_PROVIDERS_DEFAULT = "CPUExecutionProvider"
 #: looking healthy. The exporter now gates fidelity at >=0.99 before a graph can be
 #: baked, so a repeat cannot reach a registry.
 #:
-#: fp16 was then attempted and abandoned the same day: converting a graph this size with
-#: onnxconverter_common fails whichever way round it is run — with shape inference on it
-#: cannot serialise (the fp32 model is ~2.4 GB, past protobuf's 2 GB ceiling), and with
-#: inference off the converter cannot place casts and emits a graph onnxruntime rejects at
-#: load. So fp32 ships. A T4 runs fp32 on a 0.6B model comfortably, and it is the artifact
-#: the fidelity gate has actually accepted, at cosine 1.00000 on every probe.
+#: fp16 conversion of our own export failed the same day: onnxconverter_common cannot
+#: handle a graph this size either way round (protobuf's 2 GB ceiling with shape inference
+#: on, a graph onnxruntime rejects at load with it off). fp16 ships since 2026-10-11 from
+#: onnx-community's export instead, pinned by revision in docker/export_onnx.py. On the
+#: preserved eval sets it matched fp32, and resident VRAM on the T4 fell from ~2.6 GB to
+#: 1,272 MiB. The fidelity gate still decides whether a given build's bytes ship.
 #:
-#: The filename is the exporter's own, unrenamed: a large export splits into
-#: ``model.onnx`` plus ``model.onnx_data`` and stores that reference inside the graph by
-#: filename, so renaming it anywhere breaks the pair.
+#: Filenames: the graph is ``model.onnx`` and its weights ``model_fp16.onnx_data``. The
+#: weights' filename is stored inside the graph, so it is never renamed.
 ONNX_FILE_BY_PROVIDER = {
     "CUDAExecutionProvider": "model.onnx",
     "CPUExecutionProvider": "model.onnx",
@@ -345,8 +344,7 @@ def short_provider(provider: str) -> str:
 class OnnxEmbedder:
     """LOCAL backend: ``Qwen/Qwen3-Embedding-0.6B`` served by onnxruntime.
 
-    One exported graph per execution provider (fp16 for CUDA, int8 for CPU), both from
-    the same weights. Providers are tried in order: the first one whose session builds
+    One fp16 graph serves every execution provider. Providers are tried in order: the first one whose session builds
     becomes the primary, and if a primary embed raises at runtime the next provider in
     the list serves that call instead. That is the plan's "CPU fallback" — it keeps dense
     recall available through a GPU outage rather than dropping to lexical.
