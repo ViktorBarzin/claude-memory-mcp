@@ -5,9 +5,14 @@
 - **Database**: SQLite (local) + PostgreSQL (remote sync)
 - **Transport**: MCP over NDJSON (stdio)
 - **Package manager**: uv
-- **Dense recall**: `Qwen/Qwen3-Embedding-0.6B` as a quantised-free fp32 ONNX graph baked
-  into the image, served by `onnxruntime-gpu` on the cluster's Tesla T4 with an in-process
-  CPU fallback. 1024-d, so it reuses the existing `halfvec(1024)` column and HNSW index.
+- **Dense recall**: `Qwen/Qwen3-Embedding-0.6B` as an fp16 ONNX graph (onnx-community's
+  export, pinned by revision) baked into the image, served by `onnxruntime-gpu` on the
+  cluster's Tesla T4 with an in-process CPU fallback. 1024-d, so it reuses the existing
+  `halfvec(1024)` column and HNSW index. fp16 since 2026-10-11; its vectors match the
+  earlier fp32 graph at cosine >= 0.99997, so rows embedded before then stay valid.
+- **The CUDA arena is shrunk after every run.** Recall embeds the whole prompt and attention
+  memory grows with the square of its length, so without the shrink one long prompt left
+  the pod at its high-water mark until restart.
 
 ## Quick Start
 ```bash
@@ -101,7 +106,7 @@ The last line is the check: the path it prints must contain `.worktrees/`.
 - **The nvidia pip wheels are not on the loader path.** They install under
   `site-packages/nvidia/<lib>/lib/`, so `ort.preload_dlls()` is required before building a
   session or the CUDA provider cannot `dlopen` and quietly downgrades to CPU.
-- **Cache provider FAILURES as well as sessions.** Building a session reads the whole ~2.4 GB
+- **Cache provider FAILURES as well as sessions.** Building a session reads the whole ~1.2 GB
   graph, so retrying a dead provider per call costs a full model load per embed.
 - **`MEMORY_EMBEDDINGS_ENABLED=0` is the rollback for anything dense.** `api/recall.py`
   documents it as a true no-op to the lexical path, correct whatever the embedding column
