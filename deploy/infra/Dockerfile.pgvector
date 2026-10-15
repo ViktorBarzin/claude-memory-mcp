@@ -55,11 +55,11 @@
 #     -t ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7 --push deploy/infra
 # (Pin the pgvector version via the build-arg below so the tag is reproducible.)
 
-# Base: CNPG's PostGIS operand image for PG18 on Debian trixie, "standard" flavour
+# Base: CNPG's PostGIS operand image for PG 18.6 / PostGIS 3.6.4 on Debian trixie, "standard" flavour
 # (the "system" flavour that bundled barman-cloud is deprecated; this cluster has no
 # object-store backup configured, so nothing here needs barman-cloud).
 ARG PG_MAJOR=18
-FROM ghcr.io/cloudnative-pg/postgis:18-3.6.4-standard-trixie
+FROM ghcr.io/cloudnative-pg/postgis:18.6-3.6.4-standard-trixie
 ARG PG_MAJOR
 
 # Pin the pgvector version so rebuilds are reproducible. 0.8.x ships the halfvec type,
