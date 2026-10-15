@@ -1,4 +1,7 @@
-# CloudNativePG-compatible PostgreSQL 16 operand image: PostGIS + GENUINE pgvector.
+# CloudNativePG-compatible PostgreSQL operand image: PostGIS + GENUINE pgvector.
+# Current build: PostgreSQL 18 (PostGIS 3.6, pgvector 0.8.7) for the pg-cluster-v18
+# blue-green upgrade of 2026-10-15. The PG16 tag (16-pgvector0.8.0) stays in ghcr
+# untouched as the rollback image of the old pg-cluster.
 # =============================================================================
 # WHY THIS IMAGE EXISTS
 # ---------------------------------------------------------------------------
@@ -49,29 +52,39 @@
 # variable to the pushed tag per the runbook. Example (CI does this; shown for clarity):
 #   docker buildx build --platform linux/amd64 \
 #     -f deploy/infra/Dockerfile.pgvector \
-#     -t ghcr.io/viktorbarzin/cnpg-postgis-pgvector:16-pgvector0.8.0 --push deploy/infra
+#     -t ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7 --push deploy/infra
 # (Pin the pgvector version via the build-arg below so the tag is reproducible.)
 
-FROM ghcr.io/cloudnative-pg/postgis:16
+# Base: CNPG's PostGIS operand image for PG18 on Debian trixie, "standard" flavour
+# (the "system" flavour that bundled barman-cloud is deprecated; this cluster has no
+# object-store backup configured, so nothing here needs barman-cloud).
+ARG PG_MAJOR=18
+FROM ghcr.io/cloudnative-pg/postgis:18-3.6.4-standard-trixie
+ARG PG_MAJOR
 
-# Pin the pgvector minor so rebuilds are reproducible. 0.8.x ships the halfvec type,
+# Pin the pgvector version so rebuilds are reproducible. 0.8.x ships the halfvec type,
 # the hnsw access method, and halfvec_cosine_ops — the exact surface migration 005
 # and recall.py depend on.
-ARG PGVECTOR_VERSION=0.8.0
+ARG PGVECTOR_VERSION=0.8.7
 
 # Install the GENUINE pgvector extension from the PostgreSQL Debian repository the
-# PostGIS operand image already trusts. `postgresql-16-pgvector` is the Debian package
-# name for pgvector on PG16 (bookworm). NOTHING about pgvecto.rs/VectorChord is added.
+# PostGIS operand image already trusts. `postgresql-<major>-pgvector` is the Debian
+# package name for pgvector (trixie-pgdg). The version gate below fails the build if
+# the repository has moved past PGVECTOR_VERSION; bump the ARG and the tag together. NOTHING about pgvecto.rs/VectorChord is added.
 # Switch to root for apt, install, then drop back to the postgres uid the base runs as.
 USER root
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends "postgresql-16-pgvector=*${PGVECTOR_VERSION}*" \
-      || apt-get install -y --no-install-recommends postgresql-16-pgvector; \
+    apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}-pgvector"; \
     rm -rf /var/lib/apt/lists/*; \
-    # Sanity-gate the build: the vector control file MUST be present, otherwise we
-    # have silently produced an image that cannot CREATE EXTENSION vector.
-    test -f "$(pg_config --sharedir)/extension/vector.control"
+    # Sanity-gate the build: the vector and postgis control files MUST be present,
+    # and the server major must match, otherwise we have silently produced an image
+    # that cannot CREATE EXTENSION vector / postgis.
+    ext=/usr/share/postgresql/${PG_MAJOR}/extension; \
+    test -f "$ext/vector.control"; \
+    test -f "$ext/postgis.control"; \
+    grep -q "default_version = '${PGVECTOR_VERSION}'" "$ext/vector.control"; \
+    /usr/lib/postgresql/${PG_MAJOR}/bin/postgres --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."
 
 # 26 == the postgres user in the CNPG operand images; matches the base image default.
 USER 26

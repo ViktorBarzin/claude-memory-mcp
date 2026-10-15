@@ -38,7 +38,7 @@ jobs:
           # Single-manifest image (no provenance/SBOM children) per ADR-0002.
           provenance: false
           tags: |
-            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:16-pgvector0.8.0
+            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7
       # The Dockerfile self-gates on vector.control being present, so a green
       # build cannot be a silent pgvector-less no-op. Runbook Phase 0 still
       # verifies the pushed image standalone before the cluster swap.
