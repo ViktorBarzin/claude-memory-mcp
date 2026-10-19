@@ -37,8 +37,15 @@ jobs:
           platforms: linux/amd64
           # Single-manifest image (no provenance/SBOM children) per ADR-0002.
           provenance: false
+          # Every rebuild gets a NEW tag. pg-cluster-v18 pulls IfNotPresent, so
+          # re-pushing the tag it runs would leave nodes on different images and
+          # a rescheduled instance on unreviewed bits. Rolling the cluster onto a
+          # new tag is a separate, deliberate change (it triggers a CNPG
+          # switchover). 18-pgvector0.8.7 = first PG18 build (2026-10-15);
+          # -20261019 = same versions on a base with libexpat1 2.9.0
+          # (CVE-2026-76956/76957).
           tags: |
-            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7
+            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7-20261019
       # The Dockerfile self-gates on vector.control being present, so a green
       # build cannot be a silent pgvector-less no-op. Runbook Phase 0 still
       # verifies the pushed image standalone before the cluster swap.

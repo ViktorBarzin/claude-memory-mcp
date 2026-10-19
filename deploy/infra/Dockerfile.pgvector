@@ -1,7 +1,9 @@
 # CloudNativePG-compatible PostgreSQL operand image: PostGIS + GENUINE pgvector.
 # Current build: PostgreSQL 18 (PostGIS 3.6, pgvector 0.8.7) for the pg-cluster-v18
 # blue-green upgrade of 2026-10-15. The PG16 tag (16-pgvector0.8.0) stays in ghcr
-# untouched as the rollback image of the old pg-cluster.
+# untouched as the rollback image of the old pg-cluster. Rebuilds publish a new
+# dated tag (18-pgvector0.8.7-20261019 picked up the base's libexpat1 2.9.0 fix)
+# and never overwrite one a cluster runs; see .github/workflows/pgvector-image.yml.
 # =============================================================================
 # WHY THIS IMAGE EXISTS
 # ---------------------------------------------------------------------------
