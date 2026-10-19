@@ -344,6 +344,45 @@ def _fuse(
     return [row_by_id[mid] for mid in ordered_ids[:limit]]
 
 
+async def _dense_leg(
+    conn: Any,
+    pool: Any,
+    *,
+    user_id: str,
+    query_text: str,
+    category: Optional[str],
+    embedder: Optional[Embedder],
+) -> list[Any]:
+    """Embed the query and run the HNSW search; ``[]`` on ANY failure.
+
+    Degrade-safe (asymmetry fix vs the write path). embed_query is a BLOCKING call — a
+    network round-trip for Voyage, a model inference for the ONNX backend — so it runs
+    OFF the event loop via to_thread (a hung hosted API or slow local model must not stall
+    recall). ANY embedder/query failure (Voyage 5xx/timeout, a model-load error, an
+    HNSW/halfvec query error, no free pooled connection) is swallowed: _fuse(lexical, [])
+    reduces to lexical order, so a dense-backend outage degrades to lexical-only — never a
+    500. Recall runs on every prompt; the lexical leg must always be returnable.
+
+    With a ``pool`` the search runs on its own pooled connection so it can overlap the
+    lexical leg (an asyncpg connection runs one query at a time); without one it uses
+    ``conn``, and the caller runs the legs in sequence.
+    """
+    try:
+        emb = embedder or select_embedder()
+        with metrics.RECALL_LEG_LATENCY.labels(leg="embed").time():
+            qvec = await asyncio.to_thread(emb.embed_query, query_text)
+        with metrics.RECALL_LEG_LATENCY.labels(leg="dense").time():
+            if pool is None:
+                return await _dense_recall(conn, user_id=user_id, qvec=qvec, category=category)
+            async with pool.acquire() as dense_conn:
+                return await _dense_recall(
+                    dense_conn, user_id=user_id, qvec=qvec, category=category
+                )
+    except Exception as exc:  # noqa: BLE001 - degrade to lexical on any dense-leg failure
+        logger.warning("dense recall leg failed, falling back to lexical: %s", exc)
+        return []
+
+
 async def _fused_recall(
     conn: Any,
     *,
@@ -352,7 +391,7 @@ async def _fused_recall(
     sort_by: str,
     category: Optional[str],
     limit: int,
-    pool: Any = None,  # noqa: ARG001 - kept for call-site symmetry / future per-leg conns
+    pool: Any = None,
     embedder: Optional[Embedder] = None,
 ) -> list[Any]:
     """The ONE recall helper both Postgres entry points call.
@@ -363,42 +402,56 @@ async def _fused_recall(
     a later slice; until then a graph-only flag still engages fusion (lexical leg only),
     which is harmless. Callers keep their own response-shaping loops; this returns the
     ordered rows.
+
+    Given a ``pool``, the dense leg (embed + HNSW search) runs CONCURRENTLY with the
+    lexical leg on a second pooled connection, so a recall waits for the slower of the two
+    rather than their sum. Both legs are read-only and fusion only starts once both have
+    finished, so the served rows are the same as running them in sequence.
     """
-    lexical_rows = await _lexical_recall(
+    if not (embeddings_enabled() and query_text):
+        lexical_rows = await _lexical_recall(
+            conn,
+            user_id=user_id,
+            query_text=query_text,
+            sort_by=sort_by,
+            category=category,
+            limit=limit,
+        )
+        if not (embeddings_enabled() or graph_enabled()):
+            # TRUE no-op: byte-identical to the current lexical recall.
+            return lexical_rows
+        # graph leg: phase-2 (MEMORY_GRAPH_ENABLED) — production graph module lands later.
+        return _fuse(lexical_rows, [], limit=limit)
+
+    dense = _dense_leg(
         conn,
+        pool,
         user_id=user_id,
         query_text=query_text,
-        sort_by=sort_by,
         category=category,
-        limit=limit,
+        embedder=embedder,
     )
+    # Without a pool there is one connection and it serves one query at a time, so the
+    # dense leg waits for the lexical one. A lexical failure still raises (the endpoint
+    # counts it as a recall error); the in-flight dense leg is cancelled with it.
+    dense_task = asyncio.ensure_future(dense) if pool is not None else None
+    try:
+        lexical_rows = await _lexical_recall(
+            conn,
+            user_id=user_id,
+            query_text=query_text,
+            sort_by=sort_by,
+            category=category,
+            limit=limit,
+        )
+    except BaseException:
+        if dense_task is not None:
+            dense_task.cancel()
+        else:
+            dense.close()
+        raise
+    dense_rows = await (dense_task if dense_task is not None else dense)
 
-    if not (embeddings_enabled() or graph_enabled()):
-        # TRUE no-op: byte-identical to the current lexical recall.
-        return lexical_rows
-
-    dense_rows: list[Any] = []
-    if embeddings_enabled() and query_text:
-        # Degrade-safe dense leg (asymmetry fix vs the write path). embed_query is a
-        # BLOCKING call — a network round-trip for Voyage, a model load+inference for bge —
-        # so it runs OFF the event loop via to_thread (a hung hosted API or slow local model
-        # must not stall recall). ANY embedder/query failure (Voyage 5xx/timeout, a
-        # sentence-transformers ImportError/model-load error, an HNSW/halfvec query error) is
-        # swallowed: lexical_rows was ALREADY fetched above, and _fuse(lexical, []) reduces to
-        # lexical order, so a dense-backend outage degrades to lexical-only — never a 500.
-        # Recall runs on every prompt; the lexical leg must always be returnable.
-        try:
-            emb = embedder or select_embedder()
-            with metrics.RECALL_LEG_LATENCY.labels(leg="embed").time():
-                qvec = await asyncio.to_thread(emb.embed_query, query_text)
-            with metrics.RECALL_LEG_LATENCY.labels(leg="dense").time():
-                dense_rows = await _dense_recall(
-                    conn, user_id=user_id, qvec=qvec, category=category
-                )
-        except Exception as exc:  # noqa: BLE001 - degrade to lexical on any dense-leg failure
-            logger.warning("dense recall leg failed, falling back to lexical: %s", exc)
-
-    # graph leg: phase-2 (MEMORY_GRAPH_ENABLED) — production graph module lands later.
     return _fuse(lexical_rows, dense_rows, limit=limit)
 
 

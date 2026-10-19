@@ -1,5 +1,6 @@
 """Tests for the Claude Memory API endpoints."""
 
+import asyncio
 import importlib
 import json
 import os
@@ -1322,6 +1323,70 @@ async def test_fused_recall_runs_embed_query_off_the_event_loop():
     # The blocking embed went through asyncio.to_thread, not a direct inline call.
     to_thread.assert_called_once()
     assert to_thread.call_args.args[0] is embedder.embed_query
+
+
+@pytest.mark.asyncio
+async def test_fused_recall_runs_dense_leg_concurrently_on_its_own_connection():
+    """With a pool, the dense leg runs on a second pooled connection WHILE the lexical leg
+    is in flight, so a recall costs max(lexical, embed+dense) rather than their sum.
+
+    The lexical fetch blocks until the dense fetch has started: a sequential
+    implementation never reaches the dense fetch and the wait times out.
+    """
+    from claude_memory.api import recall as recall_mod
+
+    dense_started = asyncio.Event()
+    lex_conn = AsyncMock()
+    dense_conn = AsyncMock()
+
+    async def lexical_fetch(*_args):
+        await asyncio.wait_for(dense_started.wait(), timeout=2)
+        return [_make_memory_row(id=1)]
+
+    async def dense_fetch(*_args):
+        dense_started.set()
+        return [_make_memory_row(id=2)]
+
+    lex_conn.fetch.side_effect = lexical_fetch
+    dense_conn.fetch.side_effect = dense_fetch
+    pool = MagicMock()
+    acm = MagicMock()
+    acm.__aenter__ = AsyncMock(return_value=dense_conn)
+    acm.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire.return_value = acm
+
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [0.0] * 1024
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}):
+        out = await recall_mod._fused_recall(
+            lex_conn, user_id="u", query_text="q", sort_by="relevance",
+            category=None, limit=30, pool=pool, embedder=embedder,
+        )
+
+    assert "<=>" in dense_conn.fetch.call_args.args[0]
+    assert all("<=>" not in c.args[0] for c in lex_conn.fetch.call_args_list)
+    assert {r["id"] for r in out} == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_fused_recall_lexical_failure_still_raises_with_concurrent_dense_leg():
+    """Running the legs concurrently must not swallow a LEXICAL failure: that one still
+    surfaces (the endpoint counts it in memory_recall_errors_total), unlike the dense
+    leg, which degrades."""
+    from claude_memory.api import recall as recall_mod
+
+    pool, conn = _mock_conn()
+    conn.fetch.side_effect = RuntimeError("lexical query failed")
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [0.0] * 1024
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}):
+        with pytest.raises(RuntimeError, match="lexical query failed"):
+            await recall_mod._fused_recall(
+                conn, user_id="u", query_text="q", sort_by="relevance",
+                category=None, limit=30, pool=pool, embedder=embedder,
+            )
 
 
 @pytest.mark.asyncio
