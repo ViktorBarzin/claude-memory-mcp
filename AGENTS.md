@@ -118,12 +118,15 @@ The last line is the check: the path it prints must contain `.worktrees/`.
   single-digit ms once their index pages were resident. pg-cluster's 2 GB shared_buffers is
   shared with tenants several GB larger, so the HNSW index (38 MB), the GIN index (15 MB)
   and the TOAST table (53 MB) get evicted between recalls, and k8s-node3's disk served each
-  missing page in 27-170 ms. Three changes address it, all result-preserving:
-  `database.keep_recall_relations_warm` re-reads the recall relations with `pg_prewarm`
-  every `MEMORY_PREWARM_INTERVAL_S` (default 60, `0` disables; ~12 ms per run when nothing
+  missing page in 27-170 ms. These changes address it, all result-preserving:
+  `database.keep_recall_relations_warm` re-reads the recall relations (memories, its TOAST,
+  both indexes, memory_links) with `pg_prewarm` every `MEMORY_PREWARM_INTERVAL_S` (default 60, `0` disables; ~12 ms per run when nothing
   was evicted, and `memory_prewarm_seconds` shows when it had to read); migration 007 turns
   off the GIN pending list, which every AND-match scanned in full (~250 pages); and the
-  dense leg runs on its own pooled connection concurrently with the lexical leg. The same
+  dense leg runs on its own pooled connection concurrently with the lexical leg. The pool
+  also keeps idle connections open (`max_inactive_connection_lifetime=0`): with recalls
+  minutes apart, asyncpg's 300 s default handed recalls fresh backends whose first plan
+  re-read evicted catalog pages (0.8-2 s measured on a fresh session vs 3 ms warm). The same
   eviction problem drove infra#86 (shared_buffers 1 GB to 2 GB, autoprewarm) on 2026-09-02;
   autoprewarm only restores what was resident at shutdown.
 - **Warm, the OR-broaden is the costliest leg.** Profiled on the live

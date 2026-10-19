@@ -15,13 +15,14 @@ PREWARM_INTERVAL_ENV = "MEMORY_PREWARM_INTERVAL_S"
 DEFAULT_PREWARM_INTERVAL_S = 60.0
 
 #: Every relation one recall reads: the memories heap, its TOAST table and that table's
-#: index (the OR-broaden detoasts every row's search_vector), the GIN index (AND-match)
-#: and the HNSW index (dense leg). On the shared pg-cluster these fall out of
-#: shared_buffers between recalls and come back one random read at a time from a disk
-#: that measured 27-170 ms per read, which is where multi-second recalls came from.
-#: pg_prewarm reads whatever is missing and bumps the usage count of what is resident,
-#: so it keeps ~130 MB hot for ~12 ms of work when nothing was evicted. to_regclass
-#: skips a relation that does not exist (no pgvector, an older schema).
+#: index (the OR-broaden detoasts every row's search_vector), the GIN index (AND-match),
+#: the HNSW index (dense leg), and memory_links with its indexes (link semantics). On the
+#: shared pg-cluster these fall out of shared_buffers between recalls and come back one
+#: random read at a time from a disk that measured 27-170 ms per read, which is where
+#: multi-second recalls came from. pg_prewarm reads whatever is missing and bumps the
+#: usage count of what is resident, so it keeps ~130 MB hot for ~12 ms of work when
+#: nothing was evicted. to_regclass skips a relation that does not exist (no pgvector,
+#: an older schema).
 PREWARM_SQL = """
 SELECT coalesce(sum(pg_prewarm(rel)), 0)::bigint
 FROM unnest(ARRAY[
@@ -30,8 +31,10 @@ FROM unnest(ARRAY[
     (SELECT i.indexrelid::regclass FROM pg_index i JOIN pg_class c ON c.reltoastrelid = i.indrelid
       WHERE c.oid = to_regclass('memories')),
     to_regclass('idx_memories_search'),
-    to_regclass('idx_memories_embedding_hnsw')
-]) AS rel
+    to_regclass('idx_memories_embedding_hnsw'),
+    to_regclass('memory_links')
+] || ARRAY(SELECT indexrelid::regclass FROM pg_index WHERE indrelid = to_regclass('memory_links')))
+    AS rel
 WHERE rel IS NOT NULL
 """
 
@@ -76,7 +79,13 @@ async def init_pool() -> asyncpg.Pool:
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            # max_inactive_connection_lifetime=0 keeps idle connections open. asyncpg's
+            # default closes them after 300 s, and recalls arrive minutes apart, so a recall
+            # often landed on a new backend with empty catalog caches whose first plan
+            # re-read evicted pg_class/pg_statistic pages (0.8-2 s measured vs 3 ms warm).
+            pool = await asyncpg.create_pool(
+                DATABASE_URL, min_size=2, max_size=10, max_inactive_connection_lifetime=0
+            )
             logger.info("Database pool initialized successfully")
             return pool
         except (asyncpg.CannotConnectNowError, OSError, ConnectionRefusedError) as e:

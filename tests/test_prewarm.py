@@ -46,7 +46,10 @@ async def test_prewarm_reads_every_recall_relation_then_waits_the_interval():
 
     sql = conn.fetchval.call_args.args[0]
     assert "pg_prewarm" in sql
-    for relation in ("'memories'", "reltoastrelid", "idx_memories_search", "idx_memories_embedding_hnsw"):
+    for relation in (
+        "'memories'", "reltoastrelid", "idx_memories_search", "idx_memories_embedding_hnsw",
+        "'memory_links'",
+    ):
         assert relation in sql, relation
     sleep.assert_awaited_once_with(120)
     assert _sample("memory_prewarm_seconds_count") == before + 1
@@ -86,3 +89,15 @@ def test_prewarm_interval_from_env(raw, expected):
         if raw is None:
             os.environ.pop("MEMORY_PREWARM_INTERVAL_S", None)
         assert database.prewarm_interval_s() == expected
+
+
+@pytest.mark.asyncio
+async def test_pool_keeps_idle_connections_open():
+    """A pooled backend that idles out is replaced by a fresh one whose catalog caches are
+    empty, and its first recall query re-reads pg_class/pg_statistic pages that the shared
+    pool has often evicted (planning measured 0.8-2 s on a fresh session vs 3 ms warm)."""
+    create_pool = AsyncMock(return_value=MagicMock())
+    with patch.object(database, "run_migrations"), \
+         patch.object(database.asyncpg, "create_pool", create_pool):
+        await database.init_pool()
+    assert create_pool.call_args.kwargs["max_inactive_connection_lifetime"] == 0
