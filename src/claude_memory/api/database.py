@@ -4,9 +4,36 @@ import os
 
 import asyncpg  # type: ignore[import-untyped]
 
+from claude_memory.api import metrics
+
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+#: Seconds between pg_prewarm runs over the recall relations; 0 turns the loop off.
+PREWARM_INTERVAL_ENV = "MEMORY_PREWARM_INTERVAL_S"
+DEFAULT_PREWARM_INTERVAL_S = 60.0
+
+#: Every relation one recall reads: the memories heap, its TOAST table and that table's
+#: index (the OR-broaden detoasts every row's search_vector), the GIN index (AND-match)
+#: and the HNSW index (dense leg). On the shared pg-cluster these fall out of
+#: shared_buffers between recalls and come back one random read at a time from a disk
+#: that measured 27-170 ms per read, which is where multi-second recalls came from.
+#: pg_prewarm reads whatever is missing and bumps the usage count of what is resident,
+#: so it keeps ~130 MB hot for ~12 ms of work when nothing was evicted. to_regclass
+#: skips a relation that does not exist (no pgvector, an older schema).
+PREWARM_SQL = """
+SELECT coalesce(sum(pg_prewarm(rel)), 0)::bigint
+FROM unnest(ARRAY[
+    to_regclass('memories'),
+    (SELECT nullif(reltoastrelid, 0)::regclass FROM pg_class WHERE oid = to_regclass('memories')),
+    (SELECT i.indexrelid::regclass FROM pg_index i JOIN pg_class c ON c.reltoastrelid = i.indrelid
+      WHERE c.oid = to_regclass('memories')),
+    to_regclass('idx_memories_search'),
+    to_regclass('idx_memories_embedding_hnsw')
+]) AS rel
+WHERE rel IS NOT NULL
+"""
 
 pool: asyncpg.Pool | None = None
 
@@ -59,6 +86,39 @@ async def init_pool() -> asyncpg.Pool:
                 await asyncio.sleep(wait)
             else:
                 raise
+
+
+def prewarm_interval_s() -> float:
+    """The keep-warm interval from the environment: default 60 s, 0 (or negative) = off."""
+    raw = os.environ.get(PREWARM_INTERVAL_ENV, "").strip()
+    if not raw:
+        return DEFAULT_PREWARM_INTERVAL_S
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %ss", PREWARM_INTERVAL_ENV, raw, DEFAULT_PREWARM_INTERVAL_S)
+        return DEFAULT_PREWARM_INTERVAL_S
+
+
+async def keep_recall_relations_warm(db_pool: asyncpg.Pool, interval_s: float) -> None:
+    """Re-read the recall relations with pg_prewarm every ``interval_s``, off the request path.
+
+    Runs until cancelled. A failed run is logged and retried next interval; a database
+    without the pg_prewarm extension stops the loop, since retrying cannot fix that.
+    memory_prewarm_seconds shows how much had been evicted: ~10 ms means nothing was,
+    seconds mean the run read pages back from disk that a recall would otherwise have.
+    """
+    while True:
+        try:
+            with metrics.PREWARM_LATENCY.time():
+                async with db_pool.acquire() as conn:
+                    await conn.fetchval(PREWARM_SQL)
+        except asyncpg.UndefinedFunctionError:
+            logger.warning("pg_prewarm is not installed; recall relations will not be kept warm")
+            return
+        except Exception as exc:  # noqa: BLE001 - keep-warm is best-effort, never fatal
+            logger.warning("prewarming the recall relations failed: %s", exc)
+        await asyncio.sleep(interval_s)
 
 
 async def close_pool() -> None:

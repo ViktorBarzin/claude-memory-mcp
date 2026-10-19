@@ -28,7 +28,13 @@ from claude_memory.api.auth import (
     DEFAULT_SCOPE, AuthUser, get_current_user, is_restricted_scope, _key_to_user,
 )
 from claude_memory.api.auth import Scope as KeyScope
-from claude_memory.api.database import close_pool, get_pool, init_pool
+from claude_memory.api.database import (
+    close_pool,
+    get_pool,
+    init_pool,
+    keep_recall_relations_warm,
+    prewarm_interval_s,
+)
 from claude_memory.api.models import (
     LINK_TYPES, LinkCreate, MemoryRecall, MemoryResponse, MemoryStore, MemoryUpdate,
     SecretResponse, ShareMemory, ShareTag, SyncResponse, UnshareTag,
@@ -158,11 +164,16 @@ def _log_key_scopes() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _log_key_scopes()
-    await init_pool()
+    pool = await init_pool()
     set_embed_observer(_record_embed)
     await _warm_embedder()
+    # Keeps the recall relations in shared_buffers (api/database.py); first run now.
+    interval = prewarm_interval_s()
+    keep_warm = asyncio.create_task(keep_recall_relations_warm(pool, interval)) if interval else None
     async with streamable_session_mgr.run():
         yield
+    if keep_warm is not None:
+        keep_warm.cancel()
     await close_pool()
 
 

@@ -111,7 +111,22 @@ The last line is the check: the path it prints must contain `.worktrees/`.
 - **`MEMORY_EMBEDDINGS_ENABLED=0` is the rollback for anything dense.** `api/recall.py`
   documents it as a true no-op to the lexical path, correct whatever the embedding column
   holds — which is what makes an in-place re-embed safe to attempt.
-- **Recall latency lives in the LEXICAL leg, not the vector search.** Profiled on the live
+- **The recall TAIL is cold Postgres pages, not query cost.** Measured 2026-10-19 with
+  `memory_recall_leg_seconds{leg}` (one series per stage: acquire, and, or, embed, dense,
+  links). Over 60 replayed real prompts the dense leg took 0.3-6.1 s and the AND-match
+  0.4-3.9 s while the same SQL ran in 3-30 ms from a fresh connection, and both dropped to
+  single-digit ms once their index pages were resident. pg-cluster's 2 GB shared_buffers is
+  shared with tenants several GB larger, so the HNSW index (38 MB), the GIN index (15 MB)
+  and the TOAST table (53 MB) get evicted between recalls, and k8s-node3's disk served each
+  missing page in 27-170 ms. Three changes address it, all result-preserving:
+  `database.keep_recall_relations_warm` re-reads the recall relations with `pg_prewarm`
+  every `MEMORY_PREWARM_INTERVAL_S` (default 60, `0` disables; ~12 ms per run when nothing
+  was evicted, and `memory_prewarm_seconds` shows when it had to read); migration 007 turns
+  off the GIN pending list, which every AND-match scanned in full (~250 pages); and the
+  dense leg runs on its own pooled connection concurrently with the lexical leg. The same
+  eviction problem drove infra#86 (shared_buffers 1 GB to 2 GB, autoprewarm) on 2026-09-02;
+  autoprewarm only restores what was resident at shutdown.
+- **Warm, the OR-broaden is the costliest leg.** Profiled on the live
   store 2026-09-01: dense pgvector HNSW over ~10,900 vectors is 3 ms, the AND-match is
   2 ms, and the OR-broaden fallback is 200-440 ms. The broaden fires whenever the AND-match
   returns fewer than `limit` rows, which for a long query is always, and the per-turn hook

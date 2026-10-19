@@ -43,6 +43,15 @@ RECALL_LEG_LATENCY = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 6.0, 10.0),
 )
 
+#: Duration of each keep-warm pg_prewarm run over the recall relations (api/database.py).
+#: Milliseconds when everything was still resident; seconds when it had to read evicted
+#: pages back, which is IO a recall would otherwise have waited on.
+PREWARM_LATENCY = Histogram(
+    "memory_prewarm_seconds",
+    "Duration of one pg_prewarm run over the recall relations",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+
 #: Dense-leg contribution — the live "is semantic recall adding value" signal.
 #: dense_candidates: recalls where the dense leg returned any candidate rows;
 #: dense_only_top5: served results in the top 5 that ONLY the dense leg found
