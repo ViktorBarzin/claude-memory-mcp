@@ -1601,6 +1601,56 @@ async def test_store_and_recall_increment_counters(client):
 
 
 @pytest.mark.asyncio
+async def test_fused_recall_times_each_leg():
+    """Every recall leg that runs lands in memory_recall_leg_seconds under its own label,
+    so a slow recall can be attributed to the leg that made it slow."""
+    from claude_memory.api import recall as recall_mod
+
+    pool, conn = _mock_conn()
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=1)],  # AND-match: sparse -> OR-broaden fires
+        [_make_memory_row(id=2)],  # OR-broaden
+        [_make_memory_row(id=3)],  # dense
+    ]
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [0.0] * 1024
+    legs = ("and", "or", "embed", "dense")
+    before = {leg: _sample("memory_recall_leg_seconds_count", {"leg": leg}) for leg in legs}
+
+    with patch.dict(os.environ, {"MEMORY_EMBEDDINGS_ENABLED": "1", "MEMORY_GRAPH_ENABLED": ""}):
+        await recall_mod._fused_recall(
+            conn, user_id="u", query_text="two words", sort_by="relevance",
+            category=None, limit=30, pool=pool, embedder=embedder,
+        )
+
+    for leg in legs:
+        assert _sample("memory_recall_leg_seconds_count", {"leg": leg}) == before[leg] + 1, leg
+
+
+@pytest.mark.asyncio
+async def test_rest_recall_times_pool_acquire_and_link_semantics(client):
+    ac, conn, app_mod = client
+    conn.fetch.side_effect = [
+        [_make_memory_row(id=41)],  # lexical AND-match (sparse -> OR-broaden fires)
+        [_make_memory_row(id=41)],  # OR-broaden result
+        [],  # memory_links batch (no links)
+    ]
+    before = {
+        leg: _sample("memory_recall_leg_seconds_count", {"leg": leg})
+        for leg in ("acquire", "links")
+    }
+    async with ac:
+        resp = await ac.post(
+            "/api/memories/recall",
+            json={"context": "metrics probe", "limit": 5},
+            headers={"Authorization": "Bearer test-key"},
+        )
+    assert resp.status_code == 200
+    for leg in ("acquire", "links"):
+        assert _sample("memory_recall_leg_seconds_count", {"leg": leg}) == before[leg] + 1, leg
+
+
+@pytest.mark.asyncio
 async def test_bound_reject_increments_counter(client):
     ac, conn, app_mod = client
     before = _sample("memory_bound_rejects_total", {"surface": "rest"})

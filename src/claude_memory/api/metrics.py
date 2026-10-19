@@ -31,6 +31,18 @@ RECALL_LATENCY = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 6.0, 10.0),
 )
 
+#: Time spent in each stage of one recall, so a slow recall can be pinned on the stage
+#: that made it slow. leg = acquire (pool checkout), and (plainto_tsquery AND-match),
+#: or (OR-broaden fallback), embed (query embedding), dense (HNSW search), links
+#: (ADR-0007 link semantics). A separate histogram rather than a label on
+#: RECALL_LATENCY, which backs the recall latency alert.
+RECALL_LEG_LATENCY = Histogram(
+    "memory_recall_leg_seconds",
+    "Latency of one recall stage",
+    ["leg"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 6.0, 10.0),
+)
+
 #: Dense-leg contribution — the live "is semantic recall adding value" signal.
 #: dense_candidates: recalls where the dense leg returned any candidate rows;
 #: dense_only_top5: served results in the top 5 that ONLY the dense leg found

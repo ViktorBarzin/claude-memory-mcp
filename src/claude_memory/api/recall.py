@@ -174,21 +174,22 @@ async def _lexical_recall(
         category_filter = "AND category = $4"
         params.append(category)
 
-    rows = await conn.fetch(
-        f"""
-        SELECT id, content, category, tags, importance, is_sensitive,
-               ts_rank(search_vector, query) AS rank,
-               created_at, updated_at, user_id AS owner,
-               CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-        FROM memories, plainto_tsquery('english', $2) query
-        WHERE deleted_at IS NULL
-          AND (search_vector @@ query OR $2 = '')
-          {category_filter}
-        ORDER BY {order_clause}
-        LIMIT $3
-        """,
-        *params,
-    )
+    with metrics.RECALL_LEG_LATENCY.labels(leg="and").time():
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, category, tags, importance, is_sensitive,
+                   ts_rank(search_vector, query) AS rank,
+                   created_at, updated_at, user_id AS owner,
+                   CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
+            FROM memories, plainto_tsquery('english', $2) query
+            WHERE deleted_at IS NULL
+              AND (search_vector @@ query OR $2 = '')
+              {category_filter}
+            ORDER BY {order_clause}
+            LIMIT $3
+            """,
+            *params,
+        )
 
     all_rows = list(rows)
 
@@ -209,21 +210,22 @@ async def _lexical_recall(
                 or_params.append(category)
             seen_ids = {r["id"] for r in all_rows}
             try:
-                or_rows = await conn.fetch(
-                    f"""
-                    SELECT id, content, category, tags, importance, is_sensitive,
-                           ts_rank(search_vector, query) AS rank,
-                           created_at, updated_at, user_id AS owner,
-                           CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
-                    FROM memories, to_tsquery('english', $2) query
-                    WHERE deleted_at IS NULL
-                      AND search_vector @@ query
-                      {or_cat_filter}
-                    ORDER BY ts_rank(search_vector, query) DESC
-                    LIMIT $3
-                    """,
-                    *or_params,
-                )
+                with metrics.RECALL_LEG_LATENCY.labels(leg="or").time():
+                    or_rows = await conn.fetch(
+                        f"""
+                        SELECT id, content, category, tags, importance, is_sensitive,
+                               ts_rank(search_vector, query) AS rank,
+                               created_at, updated_at, user_id AS owner,
+                               CASE WHEN user_id = $1 THEN NULL ELSE user_id END AS shared_by
+                        FROM memories, to_tsquery('english', $2) query
+                        WHERE deleted_at IS NULL
+                          AND search_vector @@ query
+                          {or_cat_filter}
+                        ORDER BY ts_rank(search_vector, query) DESC
+                        LIMIT $3
+                        """,
+                        *or_params,
+                    )
             except asyncpg.PostgresSyntaxError as exc:
                 logger.warning(
                     "OR-broadening tsquery %r rejected by to_tsquery, keeping AND results: %s",
@@ -387,8 +389,12 @@ async def _fused_recall(
         # Recall runs on every prompt; the lexical leg must always be returnable.
         try:
             emb = embedder or select_embedder()
-            qvec = await asyncio.to_thread(emb.embed_query, query_text)
-            dense_rows = await _dense_recall(conn, user_id=user_id, qvec=qvec, category=category)
+            with metrics.RECALL_LEG_LATENCY.labels(leg="embed").time():
+                qvec = await asyncio.to_thread(emb.embed_query, query_text)
+            with metrics.RECALL_LEG_LATENCY.labels(leg="dense").time():
+                dense_rows = await _dense_recall(
+                    conn, user_id=user_id, qvec=qvec, category=category
+                )
         except Exception as exc:  # noqa: BLE001 - degrade to lexical on any dense-leg failure
             logger.warning("dense recall leg failed, falling back to lexical: %s", exc)
 

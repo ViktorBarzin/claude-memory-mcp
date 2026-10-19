@@ -379,6 +379,7 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
     # as a post-fusion multiplier (api/recall.py).
     try:
         async with pool.acquire() as conn:
+            metrics.RECALL_LEG_LATENCY.labels(leg="acquire").observe(time.perf_counter() - t0)
             all_rows = await _fused_recall(
                 conn,
                 user_id=user.user_id,
@@ -391,7 +392,8 @@ async def recall_memories(body: MemoryRecall, user: AuthUser = Depends(get_curre
             # ADR-0007 link semantics as a POST-ranking step, so every sort mode and
             # fusion path gets it: supersedes-redirect, resolved-by auto-attach, and
             # a links summary on every result (api/recall.py).
-            linked = await apply_link_semantics(conn, user_id=user.user_id, rows=all_rows)
+            with metrics.RECALL_LEG_LATENCY.labels(leg="links").time():
+                linked = await apply_link_semantics(conn, user_id=user.user_id, rows=all_rows)
     except Exception:
         metrics.RECALL_ERRORS.labels(surface="rest").inc()
         raise
@@ -1245,6 +1247,7 @@ async def memory_recall(context: str, expanded_query: str = "",
     # links summary — the two recall surfaces must not differ in what truth they serve.
     try:
         async with pool.acquire() as conn:
+            metrics.RECALL_LEG_LATENCY.labels(leg="acquire").observe(time.perf_counter() - t0)
             all_rows = await _fused_recall(
                 conn,
                 user_id=user_id,
@@ -1254,7 +1257,8 @@ async def memory_recall(context: str, expanded_query: str = "",
                 limit=limit,
                 pool=pool,
             )
-            linked = await apply_link_semantics(conn, user_id=user_id, rows=all_rows)
+            with metrics.RECALL_LEG_LATENCY.labels(leg="links").time():
+                linked = await apply_link_semantics(conn, user_id=user_id, rows=all_rows)
     except Exception:
         metrics.RECALL_ERRORS.labels(surface="mcp").inc()
         raise
