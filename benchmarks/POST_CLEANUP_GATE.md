@@ -8,6 +8,14 @@ retrievers against a snapshot of the post-cleanup store, scored with the **prese
 (`docs/research/hybrid-build-report.md` §2, cut on the preserved 5,452-memory corpus,
 fingerprint `ca7b1d4ed22672e8`).
 
+This gate runs on demand only. A weekly scheduled run (`memory-regression-weekly`) used
+to exist on the devvm and is gone; Viktor decided on 2026-10-20 not to bring it back,
+because the gate exercises the SQLite-equivalent `fts` path and an in-process dense model,
+and nothing in it imports `src/claude_memory/api/recall.py`. It cannot show a change to the
+production Postgres recall path. For those, replay real prompts through
+`homelab memory recall --json` before and after the change and compare the returned memory
+ids.
+
 The preserved eval set (`benchmarks/data` → the benchmark-artifacts symlink) is the
 **fixed baseline reference — never modify or regenerate it**. Snapshots always go to a
 new dated dir; `snapshot_corpus.py` refuses to write into the preserved dir.
