@@ -43,9 +43,10 @@ jobs:
           # new tag is a separate, deliberate change (it triggers a CNPG
           # switchover). 18-pgvector0.8.7 = first PG18 build (2026-10-15);
           # -20261019 = same versions on a base with libexpat1 2.9.0
-          # (CVE-2026-76956/76957).
+          # (CVE-2026-76956/76957). -20261117 = vector marked trusted so a
+          # non-superuser database owner (Cloud's p_* roles) can create it.
           tags: |
-            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7-20261019
+            ghcr.io/viktorbarzin/cnpg-postgis-pgvector:18-pgvector0.8.7-20261117
       # The Dockerfile self-gates on vector.control being present, so a green
       # build cannot be a silent pgvector-less no-op. Runbook Phase 0 still
       # verifies the pushed image standalone before the cluster swap.

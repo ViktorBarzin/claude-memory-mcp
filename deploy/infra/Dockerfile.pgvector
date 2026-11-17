@@ -4,6 +4,8 @@
 # untouched as the rollback image of the old pg-cluster. Rebuilds publish a new
 # dated tag (18-pgvector0.8.7-20261019 picked up the base's libexpat1 2.9.0 fix)
 # and never overwrite one a cluster runs; see .github/workflows/pgvector-image.yml.
+# Since 18-pgvector0.8.7-20261117, `vector` is a TRUSTED extension (see "WHY
+# VECTOR IS TRUSTED" below); PostGIS stays superuser-only.
 # =============================================================================
 # WHY THIS IMAGE EXISTS
 # ---------------------------------------------------------------------------
@@ -21,6 +23,22 @@
 # NO-OPS and the dense leg can never function. This image is the operand-image swap
 # that makes `vector` AVAILABLE so a re-run of migration 005 picks up the column +
 # index. Promotion procedure: docs/runbooks/promote-pgvector-dense-recall.md.
+#
+# WHY VECTOR IS TRUSTED
+# ---------------------------------------------------------------------------
+# Cloud (viktor/cloud) gives each Project a database on the shared cluster, owned
+# by a p_* role that is NOT a superuser. PostgreSQL lets a non-superuser with
+# CREATE on the database run `CREATE EXTENSION` only for extensions whose control
+# file says `trusted = true`. Upstream pgvector does not set it, so without this a
+# Project migration running `CREATE EXTENSION vector` fails with "permission
+# denied". The build appends `trusted = true` to vector.control and fails if the
+# line is missing afterwards. The pgvector 0.8.7 install script has no CREATE OR
+# REPLACE and runs no statements at install time, only CREATE TYPE / FUNCTION /
+# OPERATOR / CAST / AGGREGATE, and PostgreSQL 18 runs it with search_path set to
+# the target schema, then pg_temp. pg_trgm and the other contrib extensions Cloud
+# needs are already trusted in the base. PostGIS stays untrusted: the build fails
+# if postgis.control ever says `trusted = true`. No SECURITY DEFINER wrapper is
+# used instead, by decision for the shared cluster.
 #
 # WHY THIS BASE
 # ---------------------------------------------------------------------------
@@ -73,11 +91,15 @@ ARG PGVECTOR_VERSION=0.8.7
 # PostGIS operand image already trusts. `postgresql-<major>-pgvector` is the Debian
 # package name for pgvector (trixie-pgdg). The version gate below fails the build if
 # the repository has moved past PGVECTOR_VERSION; bump the ARG and the tag together. NOTHING about pgvecto.rs/VectorChord is added.
+# The base already ships postgresql-18-pgvector 0.8.7 (pgdg13+1, seen 2026-11-17).
+# --no-upgrade keeps that package as it is: the newer pgdg13+2 build depends on
+# postgresql-18 (>> 18.7), so a plain install would also move the server from
+# 18.6 to 18.7, and a server minor change is its own decision, not a side effect.
 # Switch to root for apt, install, then drop back to the postgres uid the base runs as.
 USER root
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}-pgvector"; \
+    apt-get install -y --no-install-recommends --no-upgrade "postgresql-${PG_MAJOR}-pgvector"; \
     rm -rf /var/lib/apt/lists/*; \
     # Sanity-gate the build: the vector and postgis control files MUST be present,
     # and the server major must match, otherwise we have silently produced an image
@@ -86,7 +108,16 @@ RUN set -eux; \
     test -f "$ext/vector.control"; \
     test -f "$ext/postgis.control"; \
     grep -q "default_version = '${PGVECTOR_VERSION}'" "$ext/vector.control"; \
-    /usr/lib/postgresql/${PG_MAJOR}/bin/postgres --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."
+    /usr/lib/postgresql/${PG_MAJOR}/bin/postgres --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."; \
+    # Mark vector trusted (replace any existing trusted line, then append) so a
+    # non-superuser database owner can CREATE EXTENSION vector. Gate both ways:
+    # vector must say trusted = true exactly once, postgis must not be trusted.
+    sed -i '/^[[:space:]]*trusted[[:space:]]*=/d' "$ext/vector.control"; \
+    echo "trusted = true" >> "$ext/vector.control"; \
+    test "$(grep -cx 'trusted = true' "$ext/vector.control")" = 1; \
+    if grep -Eq '^[[:space:]]*trusted[[:space:]]*=[[:space:]]*true' "$ext/postgis.control"; then \
+      echo "postgis.control is trusted; PostGIS must stay superuser-only" >&2; exit 1; \
+    fi
 
 # 26 == the postgres user in the CNPG operand images; matches the base image default.
 USER 26
